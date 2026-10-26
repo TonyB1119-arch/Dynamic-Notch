@@ -18,9 +18,7 @@ It grows when something happens and quietly gets out of the way when nothing doe
 
 <table>
   <tr>
-    <td><img src="docs/images/live-activity.png" alt="Live activities: a countdown and the album art of the current track"></td>
-    <td><img src="docs/images/peek-download.png" alt="Peek: download complete, with an Open button"></td>
-    <td><img src="docs/images/peek-claude.png" alt="Peek: Claude finished, click to jump back to the terminal"></td>
+    
   </tr>
   <tr>
     <td align="center"><sub>Live activities</sub></td>
