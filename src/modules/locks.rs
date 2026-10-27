@@ -67,8 +67,12 @@ impl Module for Locks {
             if new[i] != self.state[i] && enabled[i] {
                 let (label, color) = if new[i] { ("On", palette::GREEN) } else { ("Off", palette::TEXT_DIM) };
                 cx.fx.peek(
-                    Peek::new(Icon::Keyboard, color, KEYS[i].1, "")
-                        .trailing(Trailing::Text(label.into(), color))
+                    Peek::new(Icon::Keyboard, color, "", "")
+                        .trailing(Trailing::Level {
+                            frac: if new[i] { 1.0 } else { 0.0 },
+                            color,
+                            text: Some(format!("{} · {label}", KEYS[i].1)),
+                        })
                         .key("locks")
                         .duration_ms(1300),
                 );

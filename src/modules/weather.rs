@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::{CardSize, Cx, Module, ModuleId, SystemEvent};
 use crate::bus::Bus;
+use crate::gfx::icons::{self, Sky};
 use crate::gfx::{Icon, Painter, TextStyle};
 use crate::sys::http::{self, Timeouts};
 use crate::ui::{ButtonStyle, Ui};
@@ -98,7 +99,7 @@ enum Cmd {
 
 pub struct Weather {
     tx: Option<Sender<Cmd>>,
-    data: Option<Forecast>,
+    data: Option<std::sync::Arc<Forecast>>,
     error: Option<String>,
     loading: bool,
     last_fetch: Option<Instant>,
@@ -168,7 +169,7 @@ impl Module for Weather {
         self.loading = false;
         match *m {
             WMsg::Data(d) => {
-                self.data = Some(d);
+                self.data = Some(std::sync::Arc::new(d));
                 self.error = None;
             }
             WMsg::Error(e) => self.error = Some(e),
@@ -196,6 +197,10 @@ impl Module for Weather {
             }
             _ => {}
         }
+    }
+
+    fn glance(&self) -> Option<(Icon, String)> {
+        self.data.as_ref().map(|d| (Icon::Cloud, format!("{:.0}°", d.temp)))
     }
 
     fn card(&self) -> Option<CardSize> {
@@ -229,11 +234,7 @@ impl Module for Weather {
         let tx = inner.x + isz + 8.0;
         let temp = format!("{:.0}°", d.temp);
         let (tw, _) = ui.p.measure(&temp, &TextStyle::new(14.0, palette::TEXT).semibold().display());
-        ui.p.text(
-            &temp,
-            Rect::new(tx, r.y, tw + 4.0, r.h),
-            &TextStyle::new(14.0, palette::TEXT).semibold().display(),
-        );
+        ui.p.text(&temp, Rect::new(tx, r.y, tw + 4.0, r.h), &TextStyle::new(14.0, palette::TEXT).semibold().display());
         ui.p.text(
             &format!("{} · {}", d.cond.label(), d.place),
             Rect::new(tx + tw + 8.0, r.y, (inner.right() - tx - tw - 8.0).max(0.0), r.h),
@@ -246,7 +247,7 @@ impl Module for Weather {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        176.0
+        238.0
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
@@ -268,71 +269,98 @@ impl Module for Weather {
                 }
             } else {
                 ui.empty_state(r, Icon::Cloud, "Loading weather…");
-                ui.animate();
+                ui.ticks_sweep(Rect::new(r.cx() - 50.0, r.cy() + 36.0, 100.0, 10.0), Color::white(0.9));
             }
             return;
         };
 
-        // left: now
-        let (left, right) = r.split_left((r.w * 0.40).round(), 14.0);
-        ui.card(left, false);
-        let li = left.inset_xy(16.0, 12.0);
-        draw_condition(ui.p, d.cond, Rect::new(li.x, li.y, 52.0, 52.0), d.night);
-        ui.p.text(
-            &format!("{:.0}{}", d.temp, self.unit()),
-            Rect::new(li.x + 62.0, li.y, li.w - 62.0, 40.0),
-            &TextStyle::new(34.0, palette::TEXT).semibold().display(),
-        );
+        // top: the weather now. Icon and temperature, the details beside them,
+        // humidity and wind as beam gauges on the right.
+        let top_h = 92.0;
+        let now = Rect::new(r.x, r.y, r.w, top_h);
+        let ix = now.x + 6.0;
+        draw_condition(ui.p, d.cond, Rect::new(ix, now.y + 4.0, 64.0, 64.0), d.night);
+        let temp = format!("{:.0}{}", d.temp, self.unit());
+        let tstyle = TextStyle::new(50.0, palette::TEXT).semibold().display();
+        let (tw, _) = ui.p.measure(&temp, &tstyle);
+        ui.p.text(&temp, Rect::new(ix + 80.0, now.y - 2.0, tw + 8.0, 70.0), &tstyle);
+        let dx = ix + 80.0 + tw + 28.0;
         ui.p.text(
             d.cond.label(),
-            Rect::new(li.x + 62.0, li.y + 38.0, li.w - 62.0, 18.0),
-            &TextStyle::new(12.5, palette::TEXT_DIM),
+            Rect::new(dx, now.y + 8.0, 190.0, 22.0),
+            &TextStyle::new(16.0, palette::TEXT).medium(),
         );
-        ui.p.text(&d.place, Rect::new(li.x, li.y + 62.0, li.w, 18.0), &TextStyle::new(13.0, palette::TEXT).medium());
-        let wind_unit = if d.imperial { "mph" } else { "km/h" };
+        ui.p.text(&d.place, Rect::new(dx, now.y + 32.0, 190.0, 18.0), &TextStyle::new(12.5, palette::TEXT_DIM));
         ui.p.text(
-            &format!("Feels {:.0}°  ·  {:.0}% humidity  ·  {:.0} {}", d.feels, d.humidity, d.wind, wind_unit),
-            Rect::new(li.x, li.y + 82.0, li.w, 16.0),
-            &TextStyle::new(11.0, palette::TEXT_FAINT),
+            &format!("Feels like {:.0}°", d.feels),
+            Rect::new(dx, now.y + 52.0, 190.0, 18.0),
+            &TextStyle::new(12.5, palette::TEXT_FAINT),
         );
-
-        // refresh
-        let rb = Rect::new(left.right() - 30.0, left.y + 6.0, 24.0, 24.0);
+        let wind_unit = if d.imperial { "mph" } else { "km/h" };
+        let wind_max = if d.imperial { 40.0 } else { 64.0 };
+        let gauges = [
+            ("Humidity", format!("{:.0}%", d.humidity), d.humidity / 100.0),
+            ("Wind", format!("{:.0} {}", d.wind, wind_unit), d.wind / wind_max),
+        ];
+        let gx = (now.right() - 232.0).max(dx + 196.0);
+        let gw = now.right() - 6.0 - gx;
+        for (k, (name, val, frac)) in gauges.iter().enumerate() {
+            let y = now.y + 14.0 + k as f32 * 30.0;
+            ui.p.text(name, Rect::new(gx, y, gw, 14.0), &TextStyle::new(11.0, palette::TEXT_FAINT));
+            ui.p.text(val, Rect::new(gx, y, gw, 14.0), &TextStyle::new(11.5, palette::TEXT).semibold().right());
+            ui.ticks(Rect::new(gx, y + 17.0, gw, 8.0), *frac, Color::white(0.92));
+        }
+        // refresh sits in the top corner
+        let rb = Rect::new(now.right() - 24.0, now.y - 8.0, 24.0, 24.0);
         if self.loading {
             ui.animate();
         }
-        if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_DIM)) && !self.loading {
+        if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_FAINT)) && !self.loading
+        {
             self.fetch(ui.cfg);
         }
 
-        // right: forecast
+        // below: the five-day forecast, flat columns on one hairline
+        ui.p.fill_rect(Rect::new(r.x + 4.0, now.bottom() + 6.0, r.w - 8.0, 1.0), Color::white(0.08));
+        let fc = Rect::new(r.x, now.bottom() + 12.0, r.w, r.bottom() - now.bottom() - 12.0);
         let n = d.days.len().max(1) as f32;
-        let gap = 6.0;
-        let cw = (right.w - gap * (n - 1.0)) / n;
+        let cw = fc.w / n;
+        let lo_all = d.days.iter().map(|x| x.lo).fold(f32::MAX, f32::min);
+        let hi_all = d.days.iter().map(|x| x.hi).fold(f32::MIN, f32::max);
+        let span = (hi_all - lo_all).max(1.0);
         for (i, day) in d.days.iter().enumerate() {
-            let c = Rect::new(right.x + i as f32 * (cw + gap), right.y, cw, right.h);
-            ui.card(c, false);
+            let c = Rect::new(fc.x + i as f32 * cw, fc.y, cw, fc.h);
+            if i > 0 {
+                ui.p.fill_rect(Rect::new(c.x, c.y + 6.0, 1.0, (c.h - 12.0).max(0.0)), Color::white(0.06));
+            }
+            let inner = c.inset_xy(16.0, 0.0);
             ui.p.text(
                 &day.label,
-                Rect::new(c.x, c.y + 8.0, c.w, 16.0),
-                &TextStyle::new(11.5, palette::TEXT_DIM).semibold().center(),
+                Rect::new(inner.x, c.y, inner.w, 16.0),
+                &TextStyle::new(12.0, palette::TEXT_DIM).semibold().center(),
             );
-            draw_condition(ui.p, day.cond, c.center_square(28.0).translate(0.0, -6.0), false);
-            ui.p.text(
-                &format!("{:.0}°", day.hi),
-                Rect::new(c.x, c.bottom() - 52.0, c.w, 16.0),
-                &TextStyle::new(13.0, palette::TEXT).semibold().center(),
+            draw_condition(ui.p, day.cond, Rect::centered(inner.cx(), c.y + 42.0, 30.0, 30.0), false);
+            ui.tick_range(
+                Rect::new(inner.x, c.y + 66.0, inner.w, 8.0),
+                (day.lo - lo_all) / span,
+                (day.hi - lo_all) / span,
+                Color::white(0.92),
             );
             ui.p.text(
                 &format!("{:.0}°", day.lo),
-                Rect::new(c.x, c.bottom() - 36.0, c.w, 16.0),
-                &TextStyle::new(12.0, palette::TEXT_FAINT).center(),
+                Rect::new(inner.x, c.y + 78.0, inner.w, 16.0),
+                &TextStyle::new(12.0, palette::TEXT_FAINT),
+            );
+            ui.p.text(
+                &format!("{:.0}°", day.hi),
+                Rect::new(inner.x, c.y + 78.0, inner.w, 16.0),
+                &TextStyle::new(13.0, palette::TEXT).semibold().right(),
             );
             if let Some(p) = day.rain.filter(|p| *p >= 20.0) {
                 ui.p.text(
-                    &format!("{p:.0}%"),
-                    Rect::new(c.x, c.bottom() - 20.0, c.w, 14.0),
-                    &TextStyle::new(10.5, palette::TEAL).center(),
+                    &format!("{p:.0}% rain"),
+                    Rect::new(inner.x, c.y + 98.0, inner.w, 16.0),
+                    &TextStyle::new(11.0, palette::BLUE).semibold().center(),
                 );
             }
         }
@@ -340,82 +368,21 @@ impl Module for Weather {
 }
 
 // ---------------------------------------------------------------------------
-// Condition icons (drawn as shapes, so no icon font glyphs are needed)
+// Condition icons: line art in the app's icon style (see `icons::sky`)
 // ---------------------------------------------------------------------------
 
 fn draw_condition(p: &mut Painter, cond: Cond, r: Rect, night: bool) {
-    let s = r.w.min(r.h);
-    let (cx, cy) = (r.cx(), r.cy());
-    let sun = Color::hex(0xFFD60A);
-    let moon = Color::hex(0xE6E1C8);
-    let cloud = Color::white(0.82);
-    let dark = Color::white(0.55);
-    let cloud_shape = |p: &mut Painter, ox: f32, oy: f32, k: f32, c: Color| {
-        let u = s * k;
-        p.fill_circle(cx + ox - u * 0.22, cy + oy + u * 0.02, u * 0.26, c);
-        p.fill_circle(cx + ox + u * 0.08, cy + oy - u * 0.10, u * 0.32, c);
-        p.fill_circle(cx + ox + u * 0.34, cy + oy + u * 0.06, u * 0.22, c);
-        p.fill_rounded(Rect::new(cx + ox - u * 0.46, cy + oy + u * 0.04, u * 0.92, u * 0.24), u * 0.12, c);
+    let sky = match cond {
+        Cond::Clear => Sky::Clear,
+        Cond::PartlyCloudy => Sky::PartlyCloudy,
+        Cond::Cloudy => Sky::Cloudy,
+        Cond::Fog => Sky::Fog,
+        Cond::Drizzle => Sky::Drizzle,
+        Cond::Rain => Sky::Rain,
+        Cond::Snow => Sky::Snow,
+        Cond::Storm => Sky::Storm,
     };
-    let sun_shape = |p: &mut Painter, ox: f32, oy: f32, k: f32| {
-        let u = s * k;
-        if night {
-            p.fill_circle(cx + ox, cy + oy, u * 0.30, moon);
-        } else {
-            p.fill_circle(cx + ox, cy + oy, u * 0.24, sun);
-            for i in 0..8 {
-                let a = i as f32 * std::f32::consts::FRAC_PI_4;
-                let (sn, cs) = a.sin_cos();
-                p.line(
-                    cx + ox + cs * u * 0.34,
-                    cy + oy + sn * u * 0.34,
-                    cx + ox + cs * u * 0.46,
-                    cy + oy + sn * u * 0.46,
-                    (u * 0.06).max(1.2),
-                    sun,
-                );
-            }
-        }
-    };
-    match cond {
-        Cond::Clear => sun_shape(p, 0.0, 0.0, 1.0),
-        Cond::PartlyCloudy => {
-            sun_shape(p, -s * 0.16, -s * 0.16, 0.8);
-            cloud_shape(p, s * 0.06, s * 0.12, 0.78, cloud);
-        }
-        Cond::Cloudy => {
-            cloud_shape(p, s * 0.10, -s * 0.06, 0.62, dark);
-            cloud_shape(p, -s * 0.04, s * 0.08, 0.80, cloud);
-        }
-        Cond::Fog => {
-            cloud_shape(p, 0.0, -s * 0.14, 0.74, cloud);
-            for (i, w) in [0.8, 0.6, 0.7].iter().enumerate() {
-                let y = cy + s * (0.16 + 0.12 * i as f32);
-                p.line(cx - s * w * 0.5, y, cx + s * w * 0.5, y, (s * 0.06).max(1.2), Color::white(0.45));
-            }
-        }
-        Cond::Drizzle | Cond::Rain => {
-            cloud_shape(p, 0.0, -s * 0.12, 0.78, dark);
-            let n = if cond == Cond::Rain { 3 } else { 2 };
-            for i in 0..n {
-                let x = cx + s * (-0.2 + 0.2 * i as f32 + if n == 2 { 0.1 } else { 0.0 });
-                p.line(x, cy + s * 0.22, x - s * 0.06, cy + s * 0.40, (s * 0.07).max(1.2), palette::TEAL);
-            }
-        }
-        Cond::Snow => {
-            cloud_shape(p, 0.0, -s * 0.12, 0.78, dark);
-            for i in 0..3 {
-                let x = cx + s * (-0.2 + 0.2 * i as f32);
-                p.fill_circle(x, cy + s * (0.30 + if i == 1 { 0.06 } else { 0.0 }), (s * 0.05).max(1.2), Color::white(0.95));
-            }
-        }
-        Cond::Storm => {
-            cloud_shape(p, 0.0, -s * 0.14, 0.78, dark);
-            p.line(cx + s * 0.04, cy + s * 0.14, cx - s * 0.08, cy + s * 0.30, (s * 0.08).max(1.4), sun);
-            p.line(cx - s * 0.08, cy + s * 0.30, cx + s * 0.08, cy + s * 0.30, (s * 0.08).max(1.4), sun);
-            p.line(cx + s * 0.08, cy + s * 0.30, cx - s * 0.02, cy + s * 0.46, (s * 0.08).max(1.4), sun);
-        }
-    }
+    icons::sky(p, sky, r, night, Color::white(0.92), palette::BLUE);
 }
 
 // ---------------------------------------------------------------------------

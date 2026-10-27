@@ -8,27 +8,26 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::{json, Value};
 
 use super::widgets::TextField;
 use super::{Cx, Key, Module, ModuleId, SystemEvent};
-use crate::anim::ease_out;
 use crate::bus::Bus;
 use crate::config::GeminiCfg;
 use crate::gfx::{Icon, TextStyle};
 use crate::sys::{clip, dotenv, http, shell_open};
-use crate::ui::{ButtonStyle, Ui};
+use crate::ui::{gkey, ButtonStyle, Ui};
 use crate::util::{palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "gemini";
 pub const KEY_VAR: &str = "GEMINI_API_KEY";
-const INPUT_H: f32 = 40.0;
-const FOOTER_H: f32 = 24.0;
-const MAX_RESPONSE_H: f32 = 230.0;
-const KEY_PAGE_H: f32 = 150.0;
-const BLUE: Color = Color::hex(0x4285F4);
+/// The message line at the bottom: the text, with a rule of beams under it.
+const INPUT_H: f32 = 38.0;
+/// The conversation area grows with the chat between these heights, then scrolls.
+const LOG_MIN_H: f32 = 96.0;
+const LOG_MAX_H: f32 = 290.0;
+const KEY_PAGE_H: f32 = 170.0;
 
 /// Sent by the settings page after it saved or removed the API key.
 pub struct KeyChanged;
@@ -61,7 +60,6 @@ pub struct Gemini {
     scroll: f32,
     stick_bottom: bool,
     text_h: f32,
-    asked_at: Instant,
     hwnd: SendHwnd,
     bus: Option<Bus>,
     cfg: GeminiCfg,
@@ -70,8 +68,8 @@ pub struct Gemini {
 impl Gemini {
     pub fn new() -> Self {
         Self {
-            input: TextField::new(4000),
-            key_field: TextField::new(200).masked(),
+            input: TextField::new(4000).flat(),
+            key_field: TextField::new(200).masked().flat(),
             has_key: false,
             editing_key: false,
             key_error: None,
@@ -84,7 +82,6 @@ impl Gemini {
             scroll: 0.0,
             stick_bottom: true,
             text_h: 0.0,
-            asked_at: Instant::now(),
             hwnd: SendHwnd(0),
             bus: None,
             cfg: GeminiCfg::default(),
@@ -132,6 +129,7 @@ impl Gemini {
         self.current = None;
         self.error = None;
         self.scroll = 0.0;
+        self.stick_bottom = true;
     }
 
     fn submit(&mut self) {
@@ -151,9 +149,7 @@ impl Gemini {
         self.input.clear();
         self.gen += 1;
         self.streaming = true;
-        self.scroll = 0.0;
         self.stick_bottom = true;
-        self.asked_at = Instant::now();
 
         let mut contents = Vec::new();
         for t in self.history.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
@@ -324,12 +320,7 @@ impl Module for Gemini {
         if self.key_form() {
             return KEY_PAGE_H;
         }
-        let body = if self.response().is_some() || self.error.is_some() {
-            self.text_h.clamp(24.0, MAX_RESPONSE_H) + 30.0
-        } else {
-            34.0
-        };
-        INPUT_H + 10.0 + body + FOOTER_H
+        self.text_h.clamp(LOG_MIN_H, LOG_MAX_H) + 12.0 + INPUT_H
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -370,157 +361,250 @@ impl Module for Gemini {
 
 impl Gemini {
     fn draw_key_form(&mut self, ui: &mut Ui, r: Rect) {
-        ui.p.icon(Icon::Chat, Rect::new(r.x + 2.0, r.y + 4.0, 20.0, 20.0), BLUE);
         ui.p.text(
             "Connect Gemini",
-            Rect::new(r.x + 30.0, r.y, r.w - 30.0, 28.0),
-            &TextStyle::new(15.0, palette::TEXT).semibold(),
+            Rect::new(r.x + 6.0, r.y, r.w - 12.0, 26.0),
+            &TextStyle::new(18.0, palette::TEXT).semibold(),
         );
         ui.p.text(
-            "Paste your API key. It is stored only on this PC, in your DynamicNotch folder.",
-            Rect::new(r.x, r.y + 32.0, r.w, 18.0),
-            &TextStyle::new(12.0, palette::TEXT_DIM),
+            "Paste your API key. It stays on this PC, in your DynamicNotch folder.",
+            Rect::new(r.x + 6.0, r.y + 28.0, r.w - 12.0, 18.0),
+            &TextStyle::new(12.0, palette::TEXT_FAINT),
         );
-        let field = Rect::new(r.x, r.y + 58.0, r.w - 84.0, 38.0);
-        let save = Rect::new(field.right() + 8.0, field.y + 4.0, 76.0, 30.0);
-        if self.key_field.draw(ui, field, "AIza…", BLUE, true) {
+        // one line to type on, with a rule of beams under it
+        let row = Rect::new(r.x + 6.0, r.y + 64.0, r.w - 12.0, 30.0);
+        let save = Rect::new(row.right() - 64.0, row.y, 64.0, 28.0);
+        let field = Rect::new(row.x, row.y, row.w - 76.0, 28.0);
+        if self.key_field.draw_bare(ui, field, "AIza…", true, 15.0) {
             ui.fx.keyboard_focus = Some(true);
         }
         let can = !self.key_field.is_empty();
-        let style = if can {
-            ButtonStyle::filled(BLUE.with_a(0.9)).fg(Color::white(1.0))
-        } else {
-            ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT)
-        };
+        ui.ticks(Rect::new(row.x, row.bottom() + 2.0, row.w, 6.0), if can { 1.0 } else { 0.0 }, Color::white(0.9));
+        let style = if can { ButtonStyle::inverted() } else { ButtonStyle::default().fg(palette::TEXT_FAINT) };
         if ui.pill_button(save, "Save", None, style) && can && self.save_key() {
             ui.fx.layout_changed = true;
         }
         if let Some(e) = &self.key_error {
-            ui.p.text(e, Rect::new(r.x, r.y + 100.0, r.w, 16.0), &TextStyle::new(12.0, palette::RED));
+            ui.p.text(e, Rect::new(row.x, row.bottom() + 14.0, row.w, 16.0), &TextStyle::new(12.0, palette::RED));
         }
-        let get = Rect::new(r.x, r.bottom() - 28.0, 170.0, 26.0);
-        if ui.pill_button(get, "Get a free key", Some(Icon::Link), ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)) {
+        let quiet = ButtonStyle::default().fg(palette::TEXT_DIM);
+        if ui.pill_button(
+            Rect::new(r.x + 2.0, r.bottom() - 26.0, 150.0, 26.0),
+            "Get a free key",
+            Some(Icon::Link),
+            quiet,
+        ) {
             shell_open("https://aistudio.google.com/apikey");
         }
-        if self.has_key {
-            let back = Rect::new(r.right() - 90.0, r.bottom() - 28.0, 90.0, 26.0);
-            if ui.pill_button(back, "Cancel", None, ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)) {
-                self.editing_key = false;
-                self.key_field.clear();
-                ui.fx.layout_changed = true;
-            }
-        }
-    }
-
-    fn draw_chat(&mut self, ui: &mut Ui, r: Rect) {
-        // --- input ----------------------------------------------------------
-        let field = Rect::new(r.x, r.y, r.w, INPUT_H);
-        let btn = Rect::new(field.right() - 34.0, field.cy() - 14.0, 28.0, 28.0);
-        let inner = Rect::new(field.x, field.y, field.w - 40.0, field.h);
-        let hint = if self.streaming { "Answering…" } else { "Ask Gemini…" };
-        if self.input.draw(ui, inner, hint, BLUE, true) {
-            ui.fx.keyboard_focus = Some(true);
-        }
-        if self.streaming {
-            if ui.icon_button(btn, Icon::Stop, ButtonStyle::filled(Color::white(0.14)).scale(0.5)) {
-                self.stop_stream();
-            }
-        } else {
-            let can = !self.input.is_empty();
-            let style = if can {
-                ButtonStyle::filled(BLUE.with_a(0.9))
-            } else {
-                ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT)
-            };
-            if ui.icon_button(btn, Icon::Send, style.scale(0.48)) && can {
-                self.submit();
-            }
-        }
-
-        // --- response ---------------------------------------------------------
-        let body_top = field.bottom() + 10.0;
-        let footer = Rect::new(r.x, r.bottom() - FOOTER_H, r.w, FOOTER_H);
-        let area = Rect::new(r.x, body_top, r.w, (footer.y - body_top - 4.0).max(0.0));
-        if let Some(err) = self.error.clone() {
-            let es = TextStyle::new(12.5, palette::RED).wrap().top();
-            self.text_h = ui.p.measure_wrapped(&err, &es, area.w - 8.0);
-            ui.p.text(&err, Rect::new(area.x + 4.0, area.y + 4.0, area.w - 8.0, area.h), &es);
-        } else if let Some(turn) = self.response().cloned() {
-            let reveal = ease_out(ui.now.saturating_duration_since(self.asked_at).as_secs_f32() / 0.3);
-            let alpha = ui.p.alpha;
-            ui.p.alpha = alpha * reveal;
-            let q = TextStyle::new(12.0, palette::TEXT_FAINT);
-            ui.p.text(&format!("› {}", turn.user), Rect::new(area.x + 4.0, area.y, area.w - 8.0, 18.0), &q);
-            let resp = Rect::new(area.x + 4.0, area.y + 24.0, area.w - 8.0, (area.h - 24.0).max(0.0));
-            if turn.assistant.is_empty() && self.streaming {
-                self.text_h = 20.0;
-                ui.p.text("Thinking…", Rect::new(resp.x, resp.y, resp.w, 20.0), &TextStyle::new(13.0, palette::TEXT_DIM));
-                ui.animate();
-            } else {
-                let rs = TextStyle::new(13.5, palette::TEXT).wrap().top();
-                let layout = ui.p.layout(&turn.assistant, &rs, resp.w, 100_000.0);
-                let h = layout.as_ref().map_or(0.0, |l| l.height);
-                self.text_h = h;
-                let max_scroll = (h - resp.h).max(0.0);
-                let wheel = ui.wheel(resp);
-                if wheel != 0.0 {
-                    self.scroll -= wheel * 40.0;
-                    self.stick_bottom = self.scroll >= max_scroll - 1.0;
-                }
-                if self.stick_bottom && self.streaming {
-                    self.scroll = max_scroll;
-                }
-                self.scroll = self.scroll.clamp(0.0, max_scroll);
-                ui.p.push_clip(resp);
-                if let Some(l) = &layout {
-                    ui.p.draw_layout(l, resp.x, resp.y - self.scroll, rs.color);
-                }
-                ui.p.pop_clip();
-                if max_scroll > 0.0 {
-                    let th = (resp.h * resp.h / h).max(16.0);
-                    let ty = resp.y + (resp.h - th) * (self.scroll / max_scroll);
-                    ui.p.fill_rounded(Rect::new(resp.right() + 1.0, ty, 3.0, th), 1.5, Color::white(0.25));
-                }
-            }
-            ui.p.alpha = alpha;
-            if reveal < 1.0 {
-                ui.animate();
-            }
-        } else {
-            self.text_h = 0.0;
-            ui.p.text(
-                "Enter to send · Esc to close · Ctrl+V to paste",
-                Rect::new(area.x + 4.0, area.y, area.w, 22.0),
-                &TextStyle::new(12.0, palette::TEXT_FAINT),
-            );
-        }
-
-        // --- footer -----------------------------------------------------------
-        let fs = TextStyle::new(11.0, palette::TEXT_FAINT);
-        ui.p.text(&self.cfg.model, Rect::new(footer.x + 4.0, footer.y, footer.w * 0.3, footer.h), &fs);
-        let mut x = footer.right();
-        let key_btn = Rect::new(x - 92.0, footer.y, 92.0, footer.h);
-        if ui.pill_button(key_btn, "Change key", Some(Icon::Lock), ButtonStyle::filled(Color::white(0.06)).fg(palette::TEXT_FAINT)) {
-            self.editing_key = true;
+        if self.has_key
+            && ui.pill_button(Rect::new(r.right() - 80.0, r.bottom() - 26.0, 78.0, 26.0), "Cancel", None, quiet)
+        {
+            self.editing_key = false;
             self.key_field.clear();
             ui.fx.layout_changed = true;
         }
-        x = key_btn.x - 6.0;
+    }
+
+    /// Chat with no boxes at all: the conversation as plain text, and one line to
+    /// type on. The rule of beams under that line is the only decoration.
+    fn draw_chat(&mut self, ui: &mut Ui, r: Rect) {
+        let input = Rect::new(r.x + 6.0, r.bottom() - INPUT_H, r.w - 12.0, INPUT_H);
+        let log = Rect::new(r.x, r.y, r.w, (input.y - 12.0 - r.y).max(0.0));
+        self.draw_log(ui, log);
+
+        // icons at the right end of the line, right to left: send/stop, new chat, copy, key
+        let sz = 28.0;
+        let cy = input.y + 14.0;
+        let mut x = input.right() - sz;
+        let can = !self.input.is_empty();
+        let at = |x: f32| Rect::new(x, cy - sz * 0.5, sz, sz);
+        if self.streaming {
+            if ui.icon_button(at(x), Icon::Stop, ButtonStyle::default().scale(0.55).fg(palette::TEXT)) {
+                self.stop_stream();
+            }
+        } else {
+            let fg = if can { palette::TEXT } else { palette::TEXT_FAINT };
+            if ui.icon_button(at(x), Icon::Send, ButtonStyle::default().scale(0.55).fg(fg)) && can {
+                self.submit();
+            }
+        }
+        let quiet = ButtonStyle::default().scale(0.55).fg(Color::white(0.38));
         if self.response().is_some() {
-            let nb = Rect::new(x - 92.0, footer.y, 92.0, footer.h);
-            if ui.pill_button(nb, "New chat", Some(Icon::Refresh), ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)) {
+            x -= sz;
+            if ui.icon_button(at(x), Icon::Refresh, quiet) {
                 self.new_chat();
                 ui.fx.layout_changed = true;
             }
             if let Some(t) = self.response() {
                 if !t.assistant.is_empty() && !self.streaming {
-                    let cb = Rect::new(nb.x - 28.0, footer.y, footer.h, footer.h);
+                    x -= sz;
                     let text = t.assistant.clone();
-                    if ui.icon_button(cb, Icon::Copy, ButtonStyle::default().scale(0.62).fg(palette::TEXT_DIM)) {
+                    if ui.icon_button(at(x), Icon::Copy, quiet) {
                         clip::set_text(self.hwnd.hwnd(), &text);
                     }
                 }
             }
+        }
+        x -= sz;
+        if ui.icon_button(at(x), Icon::Lock, quiet) {
+            self.editing_key = true;
+            self.key_field.clear();
+            ui.fx.layout_changed = true;
+        }
+
+        let hint = if self.streaming { "Answering…" } else { "Ask anything" };
+        let field = Rect::new(input.x, input.y, (x - 6.0 - input.x).max(80.0), 28.0);
+        if self.input.draw_bare(ui, field, hint, true, 15.0) {
+            ui.fx.keyboard_focus = Some(true);
+        }
+
+        // the rule of beams under the line: sweeps while Gemini answers, fills as you type,
+        // and otherwise shows how much of the chat Gemini can see
+        let rail = Rect::new(input.x, input.bottom() - 7.0, input.w, 6.0);
+        if self.streaming {
+            ui.ticks_sweep(rail, Color::white(0.9));
+        } else if can {
+            // the beams end exactly under the last character you typed
+            let text = self.input.text();
+            let (tw, _) = ui.p.measure(&text, &TextStyle::new(15.0, palette::TEXT));
+            let end = (tw + 2.0).min(field.w).max(0.0);
+            let frac = ui.glide(gkey("gem-rail", 0), end / rail.w.max(1.0));
+            ui.ticks(rail, frac, Color::white(0.9));
+        } else {
+            let turns = self.history.len() + usize::from(self.current.is_some());
+            ui.ticks(rail, (turns as f32 / 8.0).min(1.0), Color::white(0.9));
+        }
+    }
+
+    /// The conversation as plain text on black. What you asked is small and dim with a
+    /// thin beam beside it; Gemini's answer is larger and bright. No bubbles, no dividers.
+    /// Scrolls, and sticks to the newest message until you scroll up.
+    fn draw_log(&mut self, ui: &mut Ui, area: Rect) {
+        #[derive(PartialEq, Clone, Copy)]
+        enum Kind {
+            User,
+            Bot,
+            Error,
+            Working,
+        }
+
+        let ask = TextStyle::new(12.5, palette::TEXT_DIM).wrap().top();
+        let answer = TextStyle::new(14.5, palette::TEXT).wrap().top();
+        let col_x = area.x + 16.0;
+        let col_w = (area.w - 40.0).max(160.0);
+        let gap_small = 6.0;
+        let gap_turn = 20.0;
+
+        // what to show, oldest first: (kind, which turn); the texts stay where they are
+        let n_hist = self.history.len();
+        let mut msgs: Vec<(Kind, usize)> = Vec::new();
+        for i in 0..n_hist + usize::from(self.current.is_some()) {
+            let t = if i < n_hist { &self.history[i] } else { self.current.as_ref().unwrap() };
+            msgs.push((Kind::User, i));
+            if !t.assistant.is_empty() {
+                msgs.push((Kind::Bot, i));
+            }
+            if self.streaming && i >= n_hist {
+                msgs.push((Kind::Working, i));
+            }
+        }
+        if self.error.is_some() {
+            msgs.push((Kind::Error, 0));
+        }
+
+        if msgs.is_empty() {
+            self.text_h = 0.0;
+            ui.p.text(
+                "Ask anything",
+                Rect::new(area.x, area.cy() - 22.0, area.w, 30.0),
+                &TextStyle::new(22.0, Color::white(0.30)).semibold().display().center(),
+            );
+            ui.p.text(
+                "Enter to send",
+                Rect::new(area.x, area.cy() + 10.0, area.w, 18.0),
+                &TextStyle::new(12.0, palette::TEXT_FAINT).center(),
+            );
+            return;
+        }
+
+        // heights (the layouts are cached, so this is cheap after the first frame)
+        let mut heights: Vec<f32> = Vec::with_capacity(msgs.len());
+        for &(kind, i) in &msgs {
+            let h = match kind {
+                Kind::User => {
+                    let t = if i < n_hist { &self.history[i] } else { self.current.as_ref().unwrap() };
+                    ui.p.measure_wrapped(&t.user, &ask, col_w - 14.0) + 2.0
+                }
+                Kind::Bot => {
+                    let t = if i < n_hist { &self.history[i] } else { self.current.as_ref().unwrap() };
+                    ui.p.measure_wrapped(&t.assistant, &answer, col_w) + 2.0
+                }
+                Kind::Error => ui.p.measure_wrapped(self.error.as_deref().unwrap_or(""), &answer, col_w) + 2.0,
+                Kind::Working => 12.0,
+            };
+            heights.push(h);
+        }
+        // a question and its answer sit close; a new question starts a new turn
+        let gap_after = |k: usize| match msgs.get(k + 1) {
+            Some((Kind::User, _)) => gap_turn,
+            Some(_) => gap_small,
+            None => 0.0,
+        };
+        let total: f32 = heights.iter().enumerate().map(|(k, h)| h + gap_after(k)).sum();
+        self.text_h = total + 12.0;
+
+        let max_scroll = (total - area.h).max(0.0);
+        let wheel = ui.wheel(area);
+        if wheel != 0.0 {
+            self.scroll -= wheel * 40.0;
+            self.stick_bottom = self.scroll >= max_scroll - 1.0;
+        }
+        if self.stick_bottom {
+            self.scroll = max_scroll;
+        }
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        if self.scroll >= max_scroll - 1.0 {
+            self.stick_bottom = true;
+        }
+
+        ui.p.push_clip(area);
+        let mut y = area.y - self.scroll;
+        for (k, &(kind, i)) in msgs.iter().enumerate() {
+            let h = heights[k];
+            if y + h >= area.y && y <= area.bottom() {
+                let t = if i < n_hist { self.history.get(i) } else { self.current.as_ref() };
+                match kind {
+                    Kind::User => {
+                        ui.p.fill_rounded(
+                            Rect::new(area.x + 4.0, y + 1.0, 2.4, (h - 2.0).max(4.0)),
+                            1.2,
+                            Color::white(0.32),
+                        );
+                        if let Some(t) = t {
+                            ui.p.text(&t.user, Rect::new(col_x, y, col_w - 14.0, h), &ask);
+                        }
+                    }
+                    Kind::Bot => {
+                        if let Some(t) = t {
+                            ui.p.text(&t.assistant, Rect::new(col_x, y, col_w, h), &answer);
+                        }
+                    }
+                    Kind::Error => {
+                        if let Some(e) = &self.error {
+                            ui.p.text(e, Rect::new(col_x, y, col_w, h), &answer.color(palette::RED));
+                        }
+                    }
+                    Kind::Working => ui.ticks_sweep(Rect::new(col_x, y + 2.0, 90.0, 8.0), Color::white(0.9)),
+                }
+            }
+            y += h + gap_after(k);
+        }
+        ui.p.pop_clip();
+
+        if max_scroll > 0.0 {
+            let th = (area.h * area.h / total).max(18.0);
+            let ty = area.y + (area.h - th) * (self.scroll / max_scroll);
+            ui.p.fill_rounded(Rect::new(area.right() - 4.0, ty, 2.0, th), 1.0, Color::white(0.22));
         }
     }
 }

@@ -8,6 +8,13 @@
 //! keystrokes cost nothing extra. While a peek couldn't be seen (notch
 //! hidden, fullscreen, or already open) the keys are released to Windows.
 //!
+//! Output switch: hovering the speaker icon of the volume peek for a moment
+//! moves the default output to the next playback device (a short script sets
+//! it, since Windows has no public call for that).
+//!
+//! Microphone: the default input's mute state is watched the same way and a
+//! peek shows when it is muted or unmuted.
+//!
 //! Brightness: WMI raises WmiMonitorBrightnessEvent for the built-in panel;
 //! a worker blocks on that event query. External monitors (DDC/CI) don't
 //! report changes. Brightness keys are handled by the firmware, so Windows
@@ -24,13 +31,13 @@ use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-    IMMNotificationClient_Impl, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
+    eCapture, eConsole, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+    IMMNotificationClient_Impl, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-    EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoTaskMemFree, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
+    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, STGM_READ,
 };
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_I4, VT_LPWSTR, VT_UI1, VT_UI4};
 use windows::Win32::System::Wmi::{
@@ -70,13 +77,32 @@ enum OsdMsg {
         forced: bool,
     },
     Brightness(u8),
+    /// The hover on the speaker icon asked for the next output device.
+    NextDevice,
+    /// A new default output was set (or not): its name.
+    Switched {
+        name: String,
+        ok: bool,
+    },
+    /// Microphone mute state right after (re)binding: remembered, no peek.
+    MicState(bool),
+    /// Microphone mute changed.
+    Mic(bool),
 }
 
 enum Cmd {
     Step(i32),
     ToggleMute,
     Rebind,
+    RebindMic,
+    NextDevice,
     Quit,
+}
+
+/// Ask the volume module to move to the next output device (called by the
+/// shell when the speaker icon of the volume peek has been hovered).
+pub fn request_next_output(bus: &Bus) {
+    bus.to_module(ID, OsdMsg::NextDevice);
 }
 
 pub struct Osd {
@@ -87,11 +113,23 @@ pub struct Osd {
     level: f32,
     muted: bool,
     brightness: Option<u8>,
+    mic_muted: Option<bool>,
+    /// When the last output switch started (they take a moment, so no stacking).
+    switching: Option<std::time::Instant>,
 }
 
 impl Osd {
     pub fn new() -> Self {
-        Self { tx: None, keys: None, device: String::new(), level: 0.0, muted: false, brightness: None }
+        Self {
+            tx: None,
+            keys: None,
+            device: String::new(),
+            level: 0.0,
+            muted: false,
+            brightness: None,
+            mic_muted: None,
+            switching: None,
+        }
     }
 
     /// Take the volume keys while a peek can be seen, give them back otherwise.
@@ -128,7 +166,7 @@ impl Osd {
 
     fn volume_peek(&self) -> Peek {
         let silent = self.muted || self.level < 0.005;
-        let (icon, color) = if silent { (Icon::Mute, palette::TEXT_DIM) } else { (Icon::Volume, Color::white(0.92)) };
+        let (icon, color) = if silent { (Icon::Mute, palette::TEXT_DIM) } else { (Icon::Volume, Color::white(0.96)) };
         Peek::new(icon, color, "Volume", short_device(&self.device))
             .trailing(Trailing::Level { frac: self.level, color, text: self.muted.then(|| "Muted".to_string()) })
             .key("osd-volume")
@@ -208,6 +246,41 @@ impl Module for Osd {
                     cx.fx.peek(self.volume_peek());
                 }
             }
+            OsdMsg::NextDevice => {
+                let free = self.switching.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(4));
+                if free {
+                    if let Some(tx) = &self.tx {
+                        self.switching = Some(std::time::Instant::now());
+                        let _ = tx.send(Cmd::NextDevice);
+                    }
+                }
+            }
+            OsdMsg::Switched { name, ok } => {
+                self.switching = None;
+                let (title, sub) = if ok {
+                    ("Output", short_device(&name))
+                } else if name.is_empty() {
+                    ("Output", "No other device to switch to".to_string())
+                } else {
+                    ("Output", "Couldn't switch device".to_string())
+                };
+                let color = if ok { palette::BLUE } else { palette::ORANGE };
+                cx.fx
+                    .peek(Peek::new(Icon::Headphones, color, title, sub).key("osd-device").duration_ms(2400).instant());
+            }
+            OsdMsg::MicState(muted) => self.mic_muted = Some(muted),
+            OsdMsg::Mic(muted) => {
+                if self.mic_muted != Some(muted) {
+                    let first = self.mic_muted.is_none();
+                    self.mic_muted = Some(muted);
+                    if !first && cx.cfg.osd.volume {
+                        let (color, text) = if muted { (palette::PINK, "Muted") } else { (palette::BLUE, "On") };
+                        cx.fx.peek(
+                            Peek::new(Icon::Mic, color, "Microphone", text).key("osd-mic").duration_ms(1800).instant(),
+                        );
+                    }
+                }
+            }
             OsdMsg::Brightness(b) => {
                 let changed = self.brightness != Some(b);
                 self.brightness = Some(b);
@@ -260,6 +333,20 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeEvents_Impl {
     }
 }
 
+#[implement(IAudioEndpointVolumeCallback)]
+struct MicEvents {
+    bus: Bus,
+}
+
+impl IAudioEndpointVolumeCallback_Impl for MicEvents_Impl {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        if let Some(d) = unsafe { data.as_ref() } {
+            self.bus.to_module(ID, OsdMsg::Mic(d.bMuted.as_bool()));
+        }
+        Ok(())
+    }
+}
+
 #[implement(IMMNotificationClient)]
 struct DeviceEvents {
     tx: Mutex<Sender<Cmd>>,
@@ -276,9 +363,9 @@ impl IMMNotificationClient_Impl for DeviceEvents_Impl {
         Ok(())
     }
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _id: &PCWSTR) -> windows::core::Result<()> {
-        if flow == eRender && role == eConsole {
+        if role == eConsole && (flow == eRender || flow == eCapture) {
             if let Ok(tx) = self.tx.lock() {
-                let _ = tx.send(Cmd::Rebind);
+                let _ = tx.send(if flow == eRender { Cmd::Rebind } else { Cmd::RebindMic });
             }
         }
         Ok(())
@@ -302,6 +389,8 @@ fn volume_worker(rx: Receiver<Cmd>, tx: Sender<Cmd>, bus: Bus) {
         let _ = enumerator.RegisterEndpointNotificationCallback(&devices);
         let events: IAudioEndpointVolumeCallback = VolumeEvents { bus: bus.clone() }.into();
         let mut ep = bind(&enumerator, &events, &bus);
+        let mic_events: IAudioEndpointVolumeCallback = MicEvents { bus: bus.clone() }.into();
+        let mut mic = bind_mic(&enumerator, &mic_events, &bus);
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
@@ -312,6 +401,13 @@ fn volume_worker(rx: Receiver<Cmd>, tx: Sender<Cmd>, bus: Bus) {
                     }
                     ep = bind(&enumerator, &events, &bus);
                 }
+                Cmd::RebindMic => {
+                    if let Some(v) = mic.take() {
+                        let _ = v.UnregisterControlChangeNotify(&mic_events);
+                    }
+                    mic = bind_mic(&enumerator, &mic_events, &bus);
+                }
+                Cmd::NextDevice => next_output(&enumerator, &bus),
                 Cmd::Step(dir) => {
                     if let Some(v) = &ep {
                         let level = v.GetMasterVolumeLevelScalar().unwrap_or(0.0);
@@ -333,6 +429,9 @@ fn volume_worker(rx: Receiver<Cmd>, tx: Sender<Cmd>, bus: Bus) {
         }
         if let Some(v) = ep {
             let _ = v.UnregisterControlChangeNotify(&events);
+        }
+        if let Some(v) = mic {
+            let _ = v.UnregisterControlChangeNotify(&mic_events);
         }
         let _ = enumerator.UnregisterEndpointNotificationCallback(&devices);
     }
@@ -362,6 +461,101 @@ unsafe fn bind(
         },
     );
     Some(vol)
+}
+
+/// Subscribe to the default microphone's mute state.
+unsafe fn bind_mic(
+    en: &IMMDeviceEnumerator,
+    events: &IAudioEndpointVolumeCallback,
+    bus: &Bus,
+) -> Option<IAudioEndpointVolume> {
+    let dev = en.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+    let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
+    vol.RegisterControlChangeNotify(events).ok()?;
+    bus.to_module(ID, OsdMsg::MicState(vol.GetMute().is_ok_and(|m| m.as_bool())));
+    Some(vol)
+}
+
+unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
+    let p = dev.GetId().ok()?;
+    let id = p.to_string().ok();
+    CoTaskMemFree(Some(p.0 as *const std::ffi::c_void));
+    id
+}
+
+/// Pick the playback device after the current default and make it the default.
+unsafe fn next_output(en: &IMMDeviceEnumerator, bus: &Bus) {
+    let mut devs: Vec<(String, String)> = Vec::new();
+    if let Ok(list) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+        for i in 0..list.GetCount().unwrap_or(0) {
+            if let Ok(d) = list.Item(i) {
+                if let Some(id) = device_id(&d) {
+                    devs.push((id, device_name(&d)));
+                }
+            }
+        }
+    }
+    if devs.len() < 2 {
+        bus.to_module(ID, OsdMsg::Switched { name: String::new(), ok: false });
+        return;
+    }
+    let cur = en.GetDefaultAudioEndpoint(eRender, eConsole).ok().and_then(|d| device_id(&d));
+    let pos = devs.iter().position(|(id, _)| Some(id) == cur.as_ref()).unwrap_or(devs.len() - 1);
+    let (id, name) = devs[(pos + 1) % devs.len()].clone();
+    let bus = bus.clone();
+    let _ = std::thread::Builder::new().name("osd-switch".into()).spawn(move || {
+        let ok = set_default_output(&id);
+        bus.to_module(ID, OsdMsg::Switched { name, ok });
+    });
+}
+
+/// Windows has no public API for changing the default playback device; this
+/// uses the same COM object the Sound control panel does, through PowerShell.
+const SWITCH_SCRIPT: &str = r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+[Guid("f8679f50-850a-41cf-9c72-430f290290c8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IPolicyConfig {
+  [PreserveSig] int GetMixFormat(IntPtr a, IntPtr b);
+  [PreserveSig] int GetDeviceFormat(IntPtr a, int b, IntPtr c);
+  [PreserveSig] int ResetDeviceFormat(IntPtr a);
+  [PreserveSig] int SetDeviceFormat(IntPtr a, IntPtr b, IntPtr c);
+  [PreserveSig] int GetProcessingPeriod(IntPtr a, int b, IntPtr c, IntPtr d);
+  [PreserveSig] int SetProcessingPeriod(IntPtr a, IntPtr b);
+  [PreserveSig] int GetShareMode(IntPtr a, IntPtr b);
+  [PreserveSig] int SetShareMode(IntPtr a, IntPtr b);
+  [PreserveSig] int GetPropertyValue(IntPtr a, IntPtr b, IntPtr c);
+  [PreserveSig] int SetPropertyValue(IntPtr a, IntPtr b, IntPtr c);
+  [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role);
+  [PreserveSig] int SetEndpointVisibility(IntPtr a, int b);
+}
+[ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")] public class PolicyConfigClient {}
+public static class DnAudio {
+  public static int Set(string id) {
+    var p = (IPolicyConfig)new PolicyConfigClient();
+    int r = 0;
+    for (int role = 0; role < 3; role++) r |= p.SetDefaultEndpoint(id, role);
+    return r;
+  }
+}
+'@
+exit ([DnAudio]::Set($env:DN_AUDIO_ID))
+"#;
+
+fn set_default_output(id: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    let path = std::env::temp_dir().join("dynamic-notch-audio-switch.ps1");
+    if std::fs::write(&path, SWITCH_SCRIPT).is_err() {
+        return false;
+    }
+    std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&path)
+        .env("DN_AUDIO_ID", id)
+        .creation_flags(0x0800_0000)
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 unsafe fn device_name(dev: &IMMDevice) -> String {

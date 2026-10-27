@@ -21,6 +21,7 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows_future::IAsyncOperation;
 
 use super::{Activity, CardSize, Cx, Module, ModuleId, Peek, Slot, SystemEvent};
+use crate::anim::smoothstep;
 use crate::bus::Bus;
 use crate::gfx::{image, Icon, ImageData, TextStyle};
 use crate::ui::{ButtonStyle, Ui};
@@ -63,7 +64,21 @@ pub struct Media {
     first: bool,
     /// Optimistic UI state after a click, until the worker confirms.
     pending_playing: Option<(bool, Instant)>,
+    /// Rotation of the vinyl shown when there is no artwork (radians).
+    spin: f32,
+    spin_at: Instant,
+    /// When the player card was last drawn: ticks only run while it is on screen.
+    last_draw: Option<Instant>,
+    /// The first track change of a listening session gets a peek; after that
+    /// the visible peek and the player card just animate to the next track.
+    peeked: bool,
+    /// The track that was playing before the last change, and when it changed.
+    prev: Option<(String, String, Option<ImageData>)>,
+    changed_at: Option<Instant>,
 }
+
+/// How long the switch to the next track animates (seconds).
+const SWITCH_SECS: f32 = 0.7;
 
 impl Media {
     pub fn new() -> Self {
@@ -76,6 +91,12 @@ impl Media {
             linger: Duration::from_secs(20),
             first: true,
             pending_playing: None,
+            spin: 0.5,
+            spin_at: Instant::now(),
+            last_draw: None,
+            peeked: false,
+            prev: None,
+            changed_at: None,
         }
     }
 
@@ -118,6 +139,13 @@ impl Media {
     }
 }
 
+impl Media {
+    fn draw_titles(&self, ui: &mut Ui, col: Rect, title: &str, sub: &str, dy: f32) {
+        ui.p.text(title, Rect::new(col.x, col.y + dy, col.w, 20.0), &TextStyle::new(15.5, palette::TEXT).semibold());
+        ui.p.text(sub, Rect::new(col.x, col.y + 19.0 + dy, col.w, 18.0), &TextStyle::new(12.5, palette::TEXT_DIM));
+    }
+}
+
 impl Module for Media {
     fn id(&self) -> ModuleId {
         ID
@@ -148,6 +176,13 @@ impl Module for Media {
         let Ok(s) = msg.downcast::<Snapshot>() else { return };
         let s = *s;
         let track_changed = s.title != self.snap.title || s.artist != self.snap.artist;
+        if track_changed && !self.snap.title.is_empty() && !s.title.is_empty() {
+            self.prev = Some((self.snap.title.clone(), self.snap.artist.clone(), self.snap.art.clone()));
+            self.changed_at = Some(Instant::now());
+        }
+        if !s.active {
+            self.peeked = false; // the next time something plays, it gets its peek again
+        }
         if self.snap.playing && !s.playing {
             self.paused_at = Some(Instant::now());
         }
@@ -171,7 +206,13 @@ impl Module for Media {
             .image(s.art.clone())
             .key("media")
             .duration_ms(3000);
-            cx.fx.peek(p);
+            if self.peeked {
+                // later tracks: the open peek just animates to the new one
+                cx.fx.peek(p.quiet());
+            } else {
+                self.peeked = true;
+                cx.fx.peek(p);
+            }
         }
         self.first = false;
         // Keep the optimistic play/pause icon until the player confirms the
@@ -204,8 +245,15 @@ impl Module for Media {
     }
 
     fn next_tick(&self) -> Option<Instant> {
-        if self.expanded && self.snap.active && self.snap.playing {
-            return Some(Instant::now() + Duration::from_millis(500));
+        // the record and the progress bar only need frames while the card is on screen
+        let seen = self.last_draw.is_some_and(|t| t.elapsed() < Duration::from_millis(900));
+        if self.expanded && self.snap.active && seen {
+            if self.playing() {
+                return Some(Instant::now() + Duration::from_millis(40));
+            }
+            if self.snap.playing {
+                return Some(Instant::now() + Duration::from_millis(500));
+            }
         }
         // when the paused linger expires the activity disappears
         self.paused_at.map(|t| t + self.linger).filter(|t| *t > Instant::now())
@@ -219,10 +267,7 @@ impl Module for Media {
         if !self.visible() {
             return None;
         }
-        let left = match &self.snap.art {
-            Some(img) => Slot::Image(img.clone()),
-            None => Slot::Icon(Icon::Music, self.accent()),
-        };
+        let left = Slot::Vinyl { color: self.accent(), angle: self.spin, art: self.snap.art.clone() };
         Some(Activity {
             priority: if self.playing() { 50 } else { 10 },
             left,
@@ -245,35 +290,69 @@ impl Module for Media {
         let pad = 12.0;
         let art_s = (r.h - 2.0 * pad).min(r.w * 0.42);
         let art = Rect::new(r.x + pad, r.y + pad, art_s, art_s);
-        match &self.snap.art {
-            Some(img) => ui.p.image(img, art, 14.0, 1.0),
-            None => {
-                ui.p.fill_rounded(art, 14.0, Color::white(0.08));
-                ui.p.icon(Icon::Music, art.center_square(art_s * 0.4), palette::TEXT_FAINT);
-            }
+        // a black record that turns while the music plays, the cover as its label
+        let dt = ui.now.saturating_duration_since(self.spin_at).as_secs_f32().min(0.1);
+        self.spin_at = ui.now;
+        self.last_draw = Some(ui.now);
+        if self.playing() {
+            // one slow, calm turn every 16 seconds
+            self.spin = (self.spin + dt * std::f32::consts::TAU / 16.0) % std::f32::consts::TAU;
         }
-        let col = Rect::new(art.right() + 14.0, r.y + pad, r.right() - art.right() - 14.0 - pad, r.h - 2.0 * pad);
-        let title = if self.snap.title.is_empty() { "Unknown title" } else { &self.snap.title };
-        ui.p.text(title, Rect::new(col.x, col.y + 2.0, col.w, 20.0), &TextStyle::new(14.5, palette::TEXT).semibold());
-        let sub = if !self.snap.artist.is_empty() {
-            self.snap.artist.clone()
-        } else if self.snap.app != title {
-            self.snap.app.clone()
-        } else {
-            String::new()
+        // switching tracks: the record dips and the label changes at the bottom of the dip,
+        // the old title drifts up and fades while the new one rises in
+        let t = self
+            .changed_at
+            .map(|at| ui.now.saturating_duration_since(at).as_secs_f32() / SWITCH_SECS)
+            .filter(|t| *t < 1.0);
+        let (dip, old_a, new_a, old_dy, new_dy) = match t {
+            Some(t) => {
+                ui.animate();
+                let out = smoothstep(0.0, 0.5, t);
+                let inn = smoothstep(0.4, 1.0, t);
+                ((t * std::f32::consts::PI).sin(), 1.0 - out, inn, -10.0 * out, 10.0 * (1.0 - inn))
+            }
+            None => (0.0, 0.0, 1.0, 0.0, 0.0),
         };
-        ui.p.text(&sub, Rect::new(col.x, col.y + 22.0, col.w, 18.0), &TextStyle::new(12.5, palette::TEXT_DIM));
+        let showing_old = t.is_some_and(|t| t < 0.5);
+        let art_img = match (&self.prev, showing_old) {
+            (Some((_, _, a)), true) => a.as_ref(),
+            _ => self.snap.art.as_ref(),
+        };
+        ui.vinyl(art.inset(art.w * 0.07 * dip), self.spin + dip * 0.9, self.accent(), art_img);
+        let col = Rect::new(art.right() + 14.0, r.y + pad, r.right() - art.right() - 14.0 - pad, r.h - 2.0 * pad);
+        let sub_of = |title: &str, artist: &str, app: &str| {
+            if !artist.is_empty() {
+                artist.to_string()
+            } else if app != title {
+                app.to_string()
+            } else {
+                String::new()
+            }
+        };
+        let cur_title = if self.snap.title.is_empty() { "Unknown title" } else { &self.snap.title };
+        let cur_sub = sub_of(cur_title, &self.snap.artist, &self.snap.app);
+        let head = Rect::new(col.x, col.y - 2.0, col.w, 42.0);
+        let a0 = ui.p.alpha;
+        ui.p.push_clip(head);
+        if let (Some((pt, pa, _)), true) = (&self.prev, t.is_some()) {
+            ui.p.alpha = a0 * old_a;
+            let psub = sub_of(pt, pa, &self.snap.app);
+            self.draw_titles(ui, col, pt, &psub, old_dy);
+        }
+        ui.p.alpha = a0 * new_a;
+        self.draw_titles(ui, col, cur_title, &cur_sub, new_dy);
+        ui.p.alpha = a0;
+        ui.p.pop_clip();
 
         // progress
-        let bar_y = col.y + 50.0;
+        let bar_y = col.y + 41.0;
         let pos = self.position();
         let dur = self.snap.duration;
-        let bar = Rect::new(col.x, bar_y, col.w, 4.0);
+        let bar = Rect::new(col.x + 4.0, bar_y, col.w - 8.0, 6.0);
         let frac = if dur > 0.0 { (pos / dur) as f32 } else { 0.0 };
-        let hit = bar.inset_xy(0.0, -8.0);
+        let hit = bar.inset_xy(-4.0, -9.0);
         let hover = self.snap.can_seek && dur > 0.0 && ui.hovered(hit);
-        let bar_draw = if hover { Rect::new(bar.x, bar.y - 1.0, bar.w, 6.0) } else { bar };
-        ui.progress(bar_draw, frac, Color::white(0.85));
+        ui.scrubber(bar, frac, hover);
         if self.snap.can_seek && dur > 0.0 {
             if let Some(f) = ui.clicked_at(hit) {
                 let target = f as f64 * dur;
@@ -282,20 +361,21 @@ impl Module for Media {
                 self.send(Cmd::Seek(target));
             }
         }
+        // transport row: times on the sides, controls in the middle (below the scrubber)
+        let cy = col.bottom() - 17.0;
         if dur > 0.0 {
             let ts = TextStyle::new(10.5, palette::TEXT_FAINT).display();
-            ui.p.text(&format_duration(pos), Rect::new(col.x, bar_y + 7.0, 60.0, 14.0), &ts);
+            ui.p.text(&format_duration(pos), Rect::new(col.x, cy - 7.0, 60.0, 14.0), &ts);
             ui.p.text(
                 &format!("-{}", format_duration(dur - pos)),
-                Rect::new(col.right() - 60.0, bar_y + 7.0, 60.0, 14.0),
+                Rect::new(col.right() - 60.0, cy - 7.0, 60.0, 14.0),
                 &ts.right(),
             );
         }
 
         // transport controls
-        let cy = col.bottom() - 17.0;
-        let big = 36.0;
-        let small = 30.0;
+        let big = 34.0;
+        let small = 28.0;
         let cx = col.cx();
         let style = ButtonStyle::default().scale(0.5);
         let prev = Rect::centered(cx - big * 0.5 - 14.0 - small * 0.5, cy, small, small);
@@ -306,7 +386,7 @@ impl Module for Media {
             self.send(Cmd::Prev);
         }
         let pp = if self.playing() { Icon::Pause } else { Icon::Play };
-        if ui.icon_button(play, pp, ButtonStyle::default().scale(0.56)) {
+        if ui.icon_button(play, pp, ButtonStyle::inverted().scale(0.5)) {
             self.toggle();
         }
         if ui.icon_button(next, Icon::Next, style.fg(dim(self.snap.can_next))) {

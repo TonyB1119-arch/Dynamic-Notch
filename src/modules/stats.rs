@@ -23,12 +23,14 @@ use windows::Win32::System::Threading::GetSystemTimes;
 use super::{CardSize, Cx, Module, ModuleId, SystemEvent};
 use crate::bus::Bus;
 use crate::gfx::{Icon, TextStyle};
-use crate::ui::Ui;
+use crate::ui::{gkey, Ui};
 use crate::util::{palette, Color, Rect};
 
 const ID: ModuleId = "stats";
 const INTERVAL: Duration = Duration::from_secs(1);
 /// First reading after opening: rates need two samples, keep the gap short.
+/// Readings kept for the tick graphs on the stats page.
+const HISTORY: usize = 20;
 const FIRST: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,11 +48,13 @@ enum Cmd {
 pub struct Stats {
     tx: Option<Sender<Cmd>>,
     sample: Option<Sample>,
+    /// Recent readings per gauge (CPU, RAM, GPU) for the tick graphs.
+    history: [Vec<f32>; 3],
 }
 
 impl Stats {
     pub fn new() -> Self {
-        Self { tx: None, sample: None }
+        Self { tx: None, sample: None, history: Default::default() }
     }
 }
 
@@ -86,6 +90,13 @@ impl Module for Stats {
 
     fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
         if let Ok(s) = msg.downcast::<Sample>() {
+            let vals = [s.cpu, s.ram, s.gpu.unwrap_or(0.0)];
+            for (h, v) in self.history.iter_mut().zip(vals) {
+                if h.len() >= HISTORY {
+                    h.remove(0);
+                }
+                h.push(v);
+            }
             self.sample = Some(*s);
             cx.fx.redraw = true;
         }
@@ -95,8 +106,55 @@ impl Module for Stats {
         Some(CardSize::Small)
     }
 
+    fn has_page(&self) -> bool {
+        true
+    }
+
+    fn page_height(&self, _w: f32) -> f32 {
+        158.0
+    }
+
+    /// Three big tick rings with a short history graph of ticks under each.
+    fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        let s = self.sample;
+        let gauges: [(&str, Option<f32>); 3] =
+            [("CPU", s.map(|s| s.cpu)), ("RAM", s.map(|s| s.ram)), ("GPU", s.and_then(|s| s.gpu))];
+        let slot = r.w / 3.0;
+        let d = 68.0;
+        let top = r.y + (r.h - (d + 64.0)).max(0.0) * 0.5;
+        for (i, (name, frac)) in gauges.iter().enumerate() {
+            let cx = r.x + slot * (i as f32 + 0.5);
+            let cy = top + d * 0.5;
+            let f = ui.glide(gkey("stats-page", i), frac.unwrap_or(0.0));
+            let shown = frac.map(|_| f);
+            ui.ring(cx, cy, d, 6.0, frac.unwrap_or(0.0), load_color(f));
+            ui.p.text(
+                &pct(shown),
+                Rect::new(cx - d * 0.5, cy - 11.0, d, 22.0),
+                &TextStyle::new(15.0, palette::TEXT).semibold().display().center(),
+            );
+            ui.p.text(
+                name,
+                Rect::new(cx - slot * 0.5, top + d + 6.0, slot, 15.0),
+                &TextStyle::new(12.0, palette::TEXT).semibold().center(),
+            );
+            let g = Rect::new(cx - slot * 0.36, top + d + 26.0, slot * 0.72, 18.0);
+            if self.history[i].is_empty() {
+                ui.tick_rule(Rect::new(g.x, g.bottom() - 2.0, g.w, 2.0), 0.10);
+            } else {
+                let c = load_color(f);
+                // pad with empty ticks on the left so the graph keeps its width
+                let mut v = vec![0.0; HISTORY - self.history[i].len()];
+                v.extend_from_slice(&self.history[i]);
+                ui.tick_graph(g, &v, c);
+            }
+        }
+    }
+
     fn draw_card(&mut self, ui: &mut Ui, r: Rect) {
-        ui.card(r, false);
+        if ui.card(r, true) {
+            ui.fx.open_page = Some(ID);
+        }
         let s = self.sample;
         let cols: [(&str, Option<f32>, String); 3] = [
             ("CPU", s.map(|s| s.cpu), pct(s.map(|s| s.cpu))),
@@ -104,16 +162,22 @@ impl Module for Stats {
             ("GPU", s.and_then(|s| s.gpu), pct(s.and_then(|s| s.gpu))),
         ];
         let inner = r.inset_xy(12.0, 0.0);
-        let gap = 12.0;
-        let cw = (inner.w - 2.0 * gap) / 3.0;
+        let cw = inner.w / 3.0;
+        // ring on the left of each slot, name and value stacked beside it
+        let d = (r.h - 12.0).clamp(22.0, 40.0);
+        let stroke = (d * 0.13).clamp(2.2, 4.0);
         let label = TextStyle::new(10.5, palette::TEXT_FAINT).semibold();
-        let value = TextStyle::new(12.0, palette::TEXT).semibold().display().right();
-        let top = r.cy() - 11.0;
+        let value = TextStyle::new(12.5, palette::TEXT).semibold().display();
         for (i, (name, frac, text)) in cols.iter().enumerate() {
-            let x = inner.x + i as f32 * (cw + gap);
-            ui.p.text(name, Rect::new(x, top, cw, 14.0), &label);
-            ui.p.text(text, Rect::new(x, top, cw, 14.0), &value);
-            ui.progress(Rect::new(x, top + 17.0, cw, 3.0), frac.unwrap_or(0.0), load_color(frac.unwrap_or(0.0)));
+            let x = inner.x + i as f32 * cw;
+            let (cx, cy) = (x + d * 0.5, r.cy());
+            let f = ui.glide(gkey("stats-card", i), frac.unwrap_or(0.0));
+            let text = if frac.is_some() { pct(Some(f)) } else { text.clone() };
+            ui.ring(cx, cy, d, stroke, frac.unwrap_or(0.0), load_color(f));
+            let tx = x + d + 7.0;
+            let tw = (cw - d - 9.0).max(0.0);
+            ui.p.text(name, Rect::new(tx, cy - 14.0, tw, 14.0), &label);
+            ui.p.text(&text, Rect::new(tx, cy, tw, 15.0), &value);
         }
     }
 }
@@ -123,12 +187,10 @@ fn pct(v: Option<f32>) -> String {
 }
 
 fn load_color(v: f32) -> Color {
-    if v >= 0.9 {
+    if v >= 0.85 {
         palette::RED
-    } else if v >= 0.75 {
-        palette::ORANGE
     } else {
-        palette::TEAL
+        palette::BLUE
     }
 }
 

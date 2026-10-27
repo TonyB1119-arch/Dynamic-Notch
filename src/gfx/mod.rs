@@ -44,6 +44,8 @@ pub struct FontNames {
     pub display: Vec<u16>,
     pub icons: Vec<u16>,
     pub mono: Vec<u16>,
+    /// Handwriting face for the unlock "Hello".
+    pub script: Vec<u16>,
 }
 
 impl Gfx {
@@ -144,10 +146,11 @@ fn pick_fonts(dwrite: &IDWriteFactory) -> FontNames {
         wide(cands[cands.len() - 1])
     };
     FontNames {
-        text: first(&["Segoe UI Variable Text", "Segoe UI"]),
-        display: first(&["Segoe UI Variable Display", "Segoe UI"]),
+        text: first(&["Inter", "Segoe UI Variable Text", "Segoe UI"]),
+        display: first(&["Inter", "Segoe UI Variable Display", "Segoe UI"]),
         icons: first(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]),
         mono: first(&["Cascadia Mono", "Consolas"]),
+        script: first(&["Segoe Script", "Ink Free", "Lucida Handwriting", "Brush Script MT", "Segoe UI"]),
     }
 }
 
@@ -161,6 +164,9 @@ pub enum Font {
     Display,
     Icons,
     Mono,
+    Script,
+    /// The hello's font: `[greeting] font` when set (see `set_hello_font`).
+    Hello,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -203,6 +209,14 @@ impl TextStyle {
         self.font = Font::Mono;
         self
     }
+    pub fn hello_font(mut self) -> Self {
+        self.font = Font::Hello;
+        self
+    }
+    pub fn script(mut self) -> Self {
+        self.font = Font::Script;
+        self
+    }
     pub fn center(mut self) -> Self {
         self.align = Align::Center;
         self
@@ -228,8 +242,23 @@ impl TextStyle {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FmtKey {
     font: Font,
+    /// Hash of the chosen family for `Font::Hello` (0 otherwise), so a changed setting gets a new format.
+    family: u64,
     size_x100: u32,
     weight: u16,
+}
+
+/// Cache key of a finished text layout: the text (hashed), the font and the box it was laid out in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LKey {
+    text: u64,
+    len: u32,
+    fmt: FmtKey,
+    w: i32,
+    h: i32,
+    align: u8,
+    valign: u8,
+    wrap: bool,
 }
 
 struct Fmt {
@@ -252,6 +281,9 @@ pub struct Res {
     dc: ID2D1DeviceContext,
     brush: ID2D1SolidColorBrush,
     formats: HashMap<FmtKey, Fmt>,
+    /// Finished text layouts with (width, height, last frame used): the same text in the same
+    /// box is laid out once, not on every frame.
+    layouts: HashMap<LKey, (IDWriteTextLayout, f32, f32, u64)>,
     bitmaps: HashMap<u64, CachedBitmap>,
     tnum: Option<IDWriteTypography>,
     shadow: Option<ID2D1Bitmap1>,
@@ -288,6 +320,7 @@ impl Res {
                 dc,
                 brush,
                 formats: HashMap::new(),
+                layouts: HashMap::new(),
                 bitmaps: HashMap::new(),
                 tnum,
                 shadow: None,
@@ -299,6 +332,9 @@ impl Res {
 
     /// Drop cached bitmaps that are not used right now (they are re-uploaded on demand).
     pub fn trim_bitmaps(&mut self) {
+        // after a while with nothing on screen, give back everything that can be rebuilt on demand
+        self.layouts.clear();
+        self.realizations.borrow_mut().clear();
         let f = self.frame;
         self.bitmaps.retain(|_, b| f.saturating_sub(b.last_used) < 2);
     }
@@ -308,8 +344,9 @@ impl Res {
         self.frame += 1;
         let f = self.frame;
         if f.is_multiple_of(120) {
-            self.bitmaps.retain(|_, b| f - b.last_used < 600);
-            self.realizations.borrow_mut().retain(|_, r| f - r.1 < 600);
+            self.bitmaps.retain(|_, b| f - b.last_used < 300);
+            self.layouts.retain(|_, l| f - l.3 < 120);
+            self.realizations.borrow_mut().retain(|_, r| f - r.1 < 300);
         }
     }
 
@@ -318,7 +355,8 @@ impl Res {
         if !(1.0..2000.0).contains(&size) {
             return None;
         }
-        let key = FmtKey { font, size_x100: (size * 100.0) as u32, weight };
+        let family = if font == Font::Hello { hello_font_hash() } else { 0 };
+        let key = FmtKey { font, family, size_x100: (size * 100.0) as u32, weight };
         if let std::collections::hash_map::Entry::Vacant(e) = self.formats.entry(key) {
             let fmt = unsafe { Self::create_format(gfx, font, size, weight) }?;
             e.insert(fmt);
@@ -328,11 +366,21 @@ impl Res {
 
     unsafe fn create_format(gfx: &Gfx, font: Font, size: f32, weight: u16) -> Option<Fmt> {
         {
+            let hello;
             let family = match font {
                 Font::Text => &gfx.fonts.text,
                 Font::Display => &gfx.fonts.display,
                 Font::Icons => &gfx.fonts.icons,
                 Font::Mono => &gfx.fonts.mono,
+                Font::Script => &gfx.fonts.script,
+                Font::Hello => {
+                    hello = HELLO_FONT.lock().map(|g| g.clone()).unwrap_or_default();
+                    if hello.is_empty() {
+                        &gfx.fonts.script
+                    } else {
+                        &hello
+                    }
+                }
             };
             let format = gfx
                 .dwrite
@@ -349,6 +397,47 @@ impl Res {
             let ellipsis = gfx.dwrite.CreateEllipsisTrimmingSign(&format).ok();
             Some(Fmt { format, ellipsis })
         }
+    }
+}
+
+static HELLO_FONT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+/// Choose the family `Font::Hello` text is drawn with.
+pub fn set_hello_font(name: &str) {
+    let w = wide(name);
+    if let Ok(mut g) = HELLO_FONT.lock() {
+        if *g != w {
+            *g = w;
+        }
+    }
+}
+
+fn hello_font_hash() -> u64 {
+    HELLO_FONT.lock().map(|g| g.iter().fold(7u64, |h, c| h.wrapping_mul(31).wrapping_add(*c as u64))).unwrap_or(0)
+}
+
+thread_local! {
+    static FAMILIES: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
+}
+
+impl Gfx {
+    /// Whether a font family with this name is installed (remembered per name).
+    pub fn font_installed(&self, name: &str) -> bool {
+        if let Some(v) = FAMILIES.with(|m| m.borrow().get(name).copied()) {
+            return v;
+        }
+        let found = unsafe {
+            let mut coll = None;
+            let mut idx = 0u32;
+            let mut found = BOOL(0);
+            let w = wide(name);
+            self.dwrite.GetSystemFontCollection(&mut coll, false).is_ok()
+                && coll.is_some_and(|c| {
+                    c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut found).is_ok() && found.as_bool()
+                })
+        };
+        FAMILIES.with(|m| m.borrow_mut().insert(name.to_string(), found));
+        found
     }
 }
 
@@ -427,6 +516,25 @@ impl<'a> Painter<'a> {
         self.local = Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: cx - s * cx + dx, M32: cy - s * cy + dy };
         let m = self.local * self.base;
         unsafe { self.dc.SetTransform(&m) }
+    }
+
+    /// Squash everything drawn next vertically around the line `py` (a flap
+    /// folding). Returns the previous transform for `pop_local`; it stacks on
+    /// top of any transform set with `set_local`.
+    pub fn push_scale_y(&mut self, sy: f32, py: f32) -> Matrix3x2 {
+        let prev = self.local;
+        let sy = sy.max(0.001);
+        let m = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: sy, M31: 0.0, M32: py - sy * py };
+        self.local = m * prev;
+        let t = self.local * self.base;
+        unsafe { self.dc.SetTransform(&t) }
+        prev
+    }
+
+    pub fn pop_local(&mut self, prev: Matrix3x2) {
+        self.local = prev;
+        let t = prev * self.base;
+        unsafe { self.dc.SetTransform(&t) }
     }
 
     pub fn reset_local(&mut self) {
@@ -636,11 +744,37 @@ impl<'a> Painter<'a> {
 
     pub fn layout(&mut self, s: &str, style: &TextStyle, max_w: f32, max_h: f32) -> Option<TextLayout> {
         let gfx = self.gfx;
-        let fmt = self.res.format(gfx, style.font, style.size, style.weight)?;
-        let text = utf16(s);
         if !(max_w.is_finite() && max_h.is_finite()) {
             return None;
         }
+        // the same text in the same box and font: reuse the finished layout
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut h);
+            LKey {
+                text: h.finish(),
+                len: s.len() as u32,
+                fmt: FmtKey {
+                    font: style.font,
+                    family: if style.font == Font::Hello { hello_font_hash() } else { 0 },
+                    size_x100: (style.size * 100.0) as u32,
+                    weight: style.weight,
+                },
+                w: q(max_w.max(1.0)),
+                h: q(max_h.max(1.0)),
+                align: style.align as u8,
+                valign: style.valign as u8,
+                wrap: style.wrap,
+            }
+        };
+        let frame = self.res.frame;
+        if let Some(e) = self.res.layouts.get_mut(&key) {
+            e.3 = frame;
+            return Some(TextLayout { layout: e.0.clone(), width: e.1, height: e.2 });
+        }
+        let fmt = self.res.format(gfx, style.font, style.size, style.weight)?;
+        let text = utf16(s);
         unsafe {
             let layout = gfx.dwrite.CreateTextLayout(&text, &fmt.format, max_w.max(1.0), max_h.max(1.0)).ok()?;
             let _ = layout.SetTextAlignment(match style.align {
@@ -673,7 +807,16 @@ impl<'a> Painter<'a> {
             }
             let mut m = DWRITE_TEXT_METRICS::default();
             let _ = layout.GetMetrics(&mut m);
-            Some(TextLayout { layout, width: m.widthIncludingTrailingWhitespace, height: m.height })
+            let (width, height) = (m.widthIncludingTrailingWhitespace, m.height);
+            // animations produce a new box every frame: keep the cache from growing without bound
+            if self.res.layouts.len() >= 300 {
+                self.res.layouts.retain(|_, l| frame.saturating_sub(l.3) < 30);
+                if self.res.layouts.len() >= 300 {
+                    self.res.layouts.clear();
+                }
+            }
+            self.res.layouts.insert(key, (layout.clone(), width, height, frame));
+            Some(TextLayout { layout, width, height })
         }
     }
 
@@ -803,7 +946,50 @@ impl<'a> Painter<'a> {
     // -- images -------------------------------------------------------------
 
     /// Draw an image "aspect fill" into `r` with rounded corners.
+    /// Drop the GPU copy of an image that will not be drawn again (live camera frames).
+    pub fn forget_image(&mut self, id: u64) {
+        self.res.bitmaps.remove(&id);
+    }
+
+    /// Draw an image as a circle of radius `rad` around (cx, cy), turned by `angle` radians.
+    pub fn image_disc(&mut self, img: &ImageData, cx: f32, cy: f32, rad: f32, angle: f32) {
+        if rad <= 0.5 {
+            return;
+        }
+        let frame = self.res.frame;
+        if !self.res.bitmaps.contains_key(&img.id) {
+            let Some(cb) = self.create_bitmap(img) else { return };
+            self.res.bitmaps.insert(img.id, cb);
+        }
+        let cb = self.res.bitmaps.get_mut(&img.id).unwrap();
+        cb.last_used = frame;
+        let (iw, ih) = (cb.w as f32, cb.h as f32);
+        let s = (2.0 * rad / iw).max(2.0 * rad / ih);
+        let (sn, cs) = (angle.sin() * s, angle.cos() * s);
+        // image centre lands on (cx, cy); the whole picture turns with the record
+        let m = Matrix3x2 {
+            M11: cs,
+            M12: sn,
+            M21: -sn,
+            M22: cs,
+            M31: cx - cs * iw * 0.5 + sn * ih * 0.5,
+            M32: cy - sn * iw * 0.5 - cs * ih * 0.5,
+        };
+        unsafe {
+            cb.brush.SetTransform(&m);
+            cb.brush.SetOpacity(self.alpha);
+            let el = D2D1_ELLIPSE { point: v2(cx, cy), radiusX: rad, radiusY: rad };
+            self.dc.FillEllipse(&el, &cb.brush);
+        }
+    }
+
     pub fn image(&mut self, img: &ImageData, r: Rect, radius: f32, opacity: f32) {
+        self.image_zoom(img, r, radius, opacity, 1.0);
+    }
+
+    /// Like `image`, but `zoom` picks how much of the picture is shown: 1.0 fills the box (the
+    /// edges are cropped), 0.0 shows the whole picture (dark bars may remain), values between mix.
+    pub fn image_zoom(&mut self, img: &ImageData, r: Rect, radius: f32, opacity: f32, zoom: f32) {
         if r.w <= 0.5 || r.h <= 0.5 {
             return;
         }
@@ -815,16 +1001,26 @@ impl<'a> Painter<'a> {
         let cb = self.res.bitmaps.get_mut(&img.id).unwrap();
         cb.last_used = frame;
         let (iw, ih) = (cb.w as f32, cb.h as f32);
-        // cover: scale so the image fills r, centered
-        let s = (r.w / iw).max(r.h / ih);
+        // centered; zoom 1 = cover (fills r), zoom 0 = contain (the whole picture)
+        let (cover, contain) = ((r.w / iw).max(r.h / ih), (r.w / iw).min(r.h / ih));
+        let s = contain + (cover - contain) * zoom.clamp(0.0, 1.0);
         let ox = r.x + (r.w - iw * s) * 0.5;
         let oy = r.y + (r.h - ih * s) * 0.5;
+        // only the part of the box the picture really covers is filled
+        let x0 = r.x.max(ox);
+        let y0 = r.y.max(oy);
+        let x1 = r.right().min(ox + iw * s);
+        let y1 = r.bottom().min(oy + ih * s);
+        if x1 - x0 <= 0.5 || y1 - y0 <= 0.5 {
+            return;
+        }
+        let area = Rect::new(x0, y0, x1 - x0, y1 - y0);
         let m = Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: ox, M32: oy };
         unsafe {
             cb.brush.SetTransform(&m);
             cb.brush.SetOpacity(opacity * self.alpha);
-            let rad = radius.min(r.w * 0.5).min(r.h * 0.5);
-            let rr = D2D1_ROUNDED_RECT { rect: rf(r), radiusX: rad, radiusY: rad };
+            let rad = radius.min(area.w * 0.5).min(area.h * 0.5);
+            let rr = D2D1_ROUNDED_RECT { rect: rf(area), radiusX: rad, radiusY: rad };
             self.dc.FillRoundedRectangle(&rr, &cb.brush);
         }
     }
@@ -858,6 +1054,100 @@ impl<'a> Painter<'a> {
             };
             let brush = self.res.dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
             Some(CachedBitmap { brush, w: img.width, h: img.height, last_used: self.res.frame })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots: a finished piece of UI kept as one GPU picture
+// ---------------------------------------------------------------------------
+
+/// A piece of UI drawn once into an off-screen picture. While the notch opens, closes or
+/// switches pages, the content does not change, so it is drawn once and then only moved and
+/// faded (one rectangle fill per frame) instead of being laid out and drawn again every frame.
+pub struct Snapshot {
+    brush: ID2D1BitmapBrush1,
+    /// Where the picture sits, in logical units (snapped to whole device pixels).
+    pub rect: Rect,
+    pub key: u64,
+    pub born: std::time::Instant,
+}
+
+impl Res {
+    /// Draw `draw` into a new picture covering `region` (logical units). Everything is painted
+    /// with the same coordinates as on screen. Returns None if the picture could not be made
+    /// (the caller then simply draws live).
+    pub fn render_snapshot(
+        &mut self,
+        gfx: &Gfx,
+        scale: f32,
+        region: Rect,
+        key: u64,
+        draw: impl FnOnce(&mut Painter),
+    ) -> Option<Snapshot> {
+        let x0 = (region.x * scale).floor();
+        let y0 = (region.y * scale).floor();
+        let x1 = ((region.x + region.w) * scale).ceil();
+        let y1 = ((region.y + region.h) * scale).ceil();
+        let (w, h) = ((x1 - x0).max(0.0) as u32, (y1 - y0).max(0.0) as u32);
+        if w < 2 || h < 2 || w > 4096 || h > 4096 {
+            return None;
+        }
+        let dc = self.dc.clone();
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+            colorContext: ManuallyDrop::new(None),
+        };
+        unsafe {
+            let bmp = dc.CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props).ok()?;
+            dc.SetTarget(&bmp);
+            dc.BeginDraw();
+            {
+                let mut p = Painter::new(dc.clone(), gfx, &mut *self, scale, -x0, -y0);
+                p.clear();
+                draw(&mut p);
+            }
+            let ok = dc.EndDraw(None, None).is_ok();
+            dc.SetTarget(None);
+            if !ok {
+                return None;
+            }
+            let bprops = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
+            };
+            let brush = dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
+            Some(Snapshot {
+                brush,
+                rect: Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale),
+                key,
+                born: std::time::Instant::now(),
+            })
+        }
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Draw a snapshot, shifted by (`dx`, `dy`), with the painter's alpha times `opacity`.
+    pub fn snapshot(&self, s: &Snapshot, dx: f32, dy: f32, opacity: f32) {
+        let a = opacity * self.alpha;
+        if a <= 0.002 {
+            return;
+        }
+        let (x, y) = (s.rect.x + dx, s.rect.y + dy);
+        let k = 1.0 / self.scale;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x, M32: y };
+        unsafe {
+            s.brush.SetTransform(&m);
+            s.brush.SetOpacity(a);
+            self.dc.FillRectangle(&rf(Rect::new(x, y, s.rect.w, s.rect.h)), &s.brush);
         }
     }
 }

@@ -34,6 +34,8 @@ const ID: ModuleId = "ports";
 const ROW_H: f32 = 42.0;
 const MAX_ROWS: usize = 6;
 const SCAN_EVERY: Duration = Duration::from_secs(3);
+/// The slowest the scan gets while nothing changes.
+const SCAN_IDLE: Duration = Duration::from_secs(10);
 /// A port that comes back within this window is a restart, not a new server.
 const RESTART_GRACE: Duration = Duration::from_secs(120);
 
@@ -284,12 +286,14 @@ impl Module for Ports {
             ui.empty_state(body, Icon::Globe, "Local dev servers show up here");
             return;
         }
+        let load = self.servers.len() as f32 / MAX_ROWS as f32;
+        ui.ticks(Rect::new(head.right() - 72.0, head.cy() - 5.0, 72.0, 10.0), load, palette::TEAL);
         let copied = self.copied.filter(|c| c.1.elapsed() < Duration::from_millis(1500)).map(|c| c.0);
         let mut copy = None;
         let mut y = body.y;
         for s in self.servers.iter().take(MAX_ROWS) {
             let row = Rect::new(body.x, y, body.w, ROW_H);
-            ui.p.fill_rounded(row, 10.0, palette::CARD);
+            ui.row_bg(row, false, None);
             ui.p.icon(Icon::Globe, Rect::new(row.x + 11.0, row.cy() - 9.0, 18.0, 18.0), palette::TEAL);
             let open = Rect::new(row.right() - 72.0, row.cy() - 13.0, 64.0, 26.0);
             let cb = Rect::new(open.x - 32.0, row.cy() - 13.0, 26.0, 26.0);
@@ -364,6 +368,8 @@ fn html_title(html: &str) -> Option<String> {
 fn worker(bus: Bus) {
     let mut names: HashMap<u32, (String, String)> = HashMap::new();
     let mut last: Option<Vec<Listener>> = None;
+    // look often while things change, and back off while nothing does
+    let mut wait = SCAN_EVERY;
     loop {
         let rows = listeners();
         names.retain(|pid, _| rows.iter().any(|r| r.1 == *pid));
@@ -387,8 +393,11 @@ fn worker(bus: Bus) {
         if last.as_ref() != Some(&out) {
             bus.to_module(ID, PortsMsg::Snapshot(out.clone()));
             last = Some(out);
+            wait = SCAN_EVERY;
+        } else {
+            wait = (wait + wait / 2).min(SCAN_IDLE);
         }
-        std::thread::sleep(SCAN_EVERY);
+        std::thread::sleep(wait);
     }
 }
 

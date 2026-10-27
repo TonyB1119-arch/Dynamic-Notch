@@ -243,6 +243,7 @@ impl Module for Shelf {
             let zone = Rect::new(body.x, body.y, body.w, body.h - GAP * 0.5);
             ui.p.fill_rounded(zone, 14.0, accent.with_a(0.08));
             ui.p.stroke_rounded(zone.inset(0.75), 14.0, 1.5, accent.with_a(0.7));
+            ui.ticks_sweep(Rect::new(zone.x + 16.0, zone.bottom() - 18.0, zone.w - 32.0, 10.0), accent);
         }
         if self.items.is_empty() {
             let msg =
@@ -260,6 +261,9 @@ impl Module for Shelf {
             ui.fx.layout_changed = true;
             return;
         }
+        let fill = self.items.len() as f32 / MAX_ITEMS as f32;
+        let meter_right = if self.items.len() > 1 { clear.x - 96.0 - 10.0 } else { clear.x - 10.0 };
+        ui.ticks(Rect::new(meter_right - 72.0, head.cy() - 5.0, 72.0, 10.0), fill, accent);
         if self.items.len() > 1 {
             let all = Rect::new(clear.x - 96.0, head.y + 1.0, 90.0, 22.0);
             if drag_started(ui, all) {

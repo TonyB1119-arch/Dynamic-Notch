@@ -502,7 +502,8 @@ impl Module for Voice {
         let mut y = top + 28.0;
         for (i, e) in self.history.iter().enumerate().take(MAX_ROWS) {
             let row = Rect::new(r.x, y, r.w, ROW_H);
-            ui.p.fill_rounded(row, 10.0, palette::CARD);
+            let rh = ui.hovered(row);
+            ui.row_bg(row, rh, None);
             let paste = Rect::new(row.right() - 34.0, row.cy() - 13.0, 26.0, 26.0);
             let copy = Rect::new(paste.x - 30.0, row.cy() - 13.0, 26.0, 26.0);
             let age = Rect::new(copy.x - 44.0, row.y, 38.0, row.h);
@@ -545,6 +546,8 @@ pub fn draw_wave(ui: &mut Ui, r: Rect, levels: &[f32], color: Color) {
     let shown = &levels[start..];
     let x0 = r.right() - shown.len() as f32 * (bw + gap) + gap;
     for (i, &l) in shown.iter().enumerate() {
+        // each slot eases towards its new level so the meter flows instead of jumping
+        let l = ui.glide(crate::ui::gkey("wave", shown.len() - 1 - i), l);
         let h = (r.h * (0.12 + 0.88 * l)).max(2.4);
         let x = x0 + i as f32 * (bw + gap);
         ui.p.fill_rounded(Rect::new(x, r.cy() - h * 0.5, bw, h), bw * 0.5, color);

@@ -43,13 +43,14 @@ use crate::gfx::Gfx;
 use crate::util::{Color, Rect};
 
 pub struct Host {
-    _dq: DispatcherQueueController,
+    _dq: Option<DispatcherQueueController>,
     pub compositor: Compositor,
     _target: DesktopWindowTarget,
     _root: ContainerVisual,
     backdrop: SpriteVisual,
     backdrop_geom: CompositionRoundedRectangleGeometry,
     backdrop_visible: bool,
+    backdrop_last: [f32; 5],
     _content: SpriteVisual,
     sbrush: CompositionSurfaceBrush,
     swapchain: IDXGISwapChain1,
@@ -64,13 +65,22 @@ fn v2(x: f32, y: f32) -> Vector2 {
 
 impl Host {
     pub fn new(hwnd: HWND, gfx: &Gfx, w: i32, h: i32) -> Result<Self> {
+        Self::build(hwnd, gfx, w, h, None)
+    }
+
+    fn build(hwnd: HWND, gfx: &Gfx, w: i32, h: i32, shared: Option<Compositor>) -> Result<Self> {
         unsafe {
-            let dq = CreateDispatcherQueueController(DispatcherQueueOptions {
-                dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
-                threadType: DQTYPE_THREAD_CURRENT,
-                apartmentType: DQTAT_COM_NONE,
-            })?;
-            let compositor = Compositor::new()?;
+            let (dq, compositor) = match shared {
+                Some(c) => (None, c),
+                None => {
+                    let dq = CreateDispatcherQueueController(DispatcherQueueOptions {
+                        dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+                        threadType: DQTYPE_THREAD_CURRENT,
+                        apartmentType: DQTAT_COM_NONE,
+                    })?;
+                    (Some(dq), Compositor::new()?)
+                }
+            };
             let desktop: ICompositorDesktopInterop = compositor.cast()?;
             let target = desktop.CreateDesktopWindowTarget(hwnd, true)?;
             let root = compositor.CreateContainerVisual()?;
@@ -113,6 +123,7 @@ impl Host {
                 backdrop,
                 backdrop_geom,
                 backdrop_visible: false,
+                backdrop_last: [f32::NAN; 5],
                 _content: content,
                 sbrush,
                 swapchain,
@@ -200,6 +211,11 @@ impl Host {
             return;
         }
         let r = radius_px.max(0.0);
+        let now = [body_px.x, body_px.y, body_px.w, body_px.h, r + opacity * 1000.0];
+        if now == self.backdrop_last {
+            return;
+        }
+        self.backdrop_last = now;
         let _ = self.backdrop_geom.SetOffset(v2(body_px.x, body_px.y - r));
         let _ = self.backdrop_geom.SetSize(v2(body_px.w, body_px.h + r));
         let _ = self.backdrop_geom.SetCornerRadius(v2(r, r));

@@ -161,17 +161,20 @@ impl Color {
 #[allow(dead_code)]
 pub mod palette {
     use super::Color;
-    pub const TEXT: Color = Color::white(0.96);
-    pub const TEXT_DIM: Color = Color::white(0.58);
-    pub const TEXT_FAINT: Color = Color::white(0.36);
-    pub const CARD: Color = Color::white(0.065);
-    pub const CARD_HOVER: Color = Color::white(0.11);
-    pub const STROKE: Color = Color::white(0.08);
+    pub const TEXT: Color = Color::white(1.0);
+    pub const TEXT_DIM: Color = Color::white(0.62);
+    pub const TEXT_FAINT: Color = Color::white(0.40);
+    /// Dark text/icons on a white ("active") control.
+    pub const INK: Color = Color::hex(0x0E0E10);
+    #[allow(dead_code)]
+    pub const CARD: Color = Color::white(0.05);
+    pub const CARD_HOVER: Color = Color::white(0.09);
+    pub const STROKE: Color = Color::white(0.10);
     pub const GREEN: Color = Color::hex(0x34C759);
     pub const ORANGE: Color = Color::hex(0xFF9F0A);
     pub const RED: Color = Color::hex(0xFF453A);
     pub const YELLOW: Color = Color::hex(0xFFD60A);
-    pub const BLUE: Color = Color::hex(0x0A84FF);
+    pub const BLUE: Color = Color::hex(0x007AFF);
     pub const TEAL: Color = Color::hex(0x64D2FF);
     pub const PURPLE: Color = Color::hex(0xBF5AF2);
     pub const PINK: Color = Color::hex(0xFF375F);
@@ -316,3 +319,6 @@ pub fn log_line(args: std::fmt::Arguments) {
 macro_rules! log {
     ($($t:tt)*) => { $crate::util::log_line(format_args!($($t)*)) };
 }
+
+/// English weekday names, Sunday first (index = `SYSTEMTIME::wDayOfWeek`).
+pub const WEEKDAY_NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];

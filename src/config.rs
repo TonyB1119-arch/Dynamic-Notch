@@ -32,6 +32,9 @@ pub struct Config {
     pub home: HomeCfg,
     pub weather: WeatherCfg,
     pub gemini: GeminiCfg,
+    pub greeting: GreetingCfg,
+    pub notch: NotchCfg,
+    pub tabs: TabsCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,6 +84,13 @@ pub struct Appearance {
     pub animation_speed: f32,
     /// "auto" (from album art) or "#RRGGBB".
     pub accent: String,
+    /// false = blue beams with a hint of white (default), true = white beams with a hint of blue.
+    pub white_beams: bool,
+    /// Home clock: "roll" (digits slide up and are replaced from below) or "flip" (flip-clock tiles).
+    pub clock_style: String,
+    /// Draw the content once and only move/fade the picture while the notch opens, closes or
+    /// switches pages (much less work per frame).
+    pub motion_cache: bool,
     /// Extra UI scale on top of the monitor DPI.
     pub scale: f32,
 }
@@ -90,14 +100,17 @@ impl Default for Appearance {
         Self {
             notch_width: 188.0,
             notch_height: 32.0,
-            expanded_width: 600.0,
+            expanded_width: 720.0,
             collapsed_opacity: 1.0,
-            expanded_opacity: 0.82,
+            expanded_opacity: 1.0,
             blur: true,
             shadow: false,
             bounce: 0.3,
             animation_speed: 1.0,
             accent: "auto".into(),
+            white_beams: false,
+            clock_style: "roll".into(),
+            motion_cache: true,
             scale: 1.0,
         }
     }
@@ -149,6 +162,11 @@ pub struct Modules {
     pub wifi: bool,
     pub gemini: bool,
     pub notes: bool,
+    pub greeting: bool,
+    pub control: bool,
+    pub notifications: bool,
+    pub mirror: bool,
+    pub devices: bool,
 }
 
 impl Default for Modules {
@@ -172,6 +190,11 @@ impl Default for Modules {
             wifi: true,
             gemini: true,
             notes: true,
+            greeting: true,
+            control: true,
+            notifications: true,
+            mirror: true,
+            devices: true,
         }
     }
 }
@@ -197,6 +220,11 @@ impl Modules {
             "wifi" => self.wifi,
             "gemini" => self.gemini,
             "notes" => self.notes,
+            "greeting" => self.greeting,
+            "control" => self.control,
+            "notifications" => self.notifications,
+            "mirror" => self.mirror,
+            "devices" => self.devices,
             _ => true,
         }
     }
@@ -421,13 +449,13 @@ impl Default for BluetoothCfg {
 #[serde(default)]
 pub struct HomeCfg {
     /// Up to four widgets for the right-hand column of the home page, top to bottom.
-    /// Ids: weather, stats, timer, wifi, bluetooth, notes, clock, clipboard, downloads, shelf, ports.
+    /// Ids: weather, stats, timer, control (Wi-Fi & Bluetooth), notes, clipboard, downloads, shelf, ports.
     pub widgets: Vec<String>,
 }
 
 impl Default for HomeCfg {
     fn default() -> Self {
-        Self { widgets: ["weather", "stats", "timer", "wifi"].iter().map(|s| s.to_string()).collect() }
+        Self { widgets: ["weather", "stats", "timer", "control"].iter().map(|s| s.to_string()).collect() }
     }
 }
 
@@ -470,6 +498,43 @@ impl Default for GeminiCfg {
                 .into(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GreetingCfg {
+    /// Name to say hello to ("Hello Sam"). Empty = just "Hello".
+    pub name: String,
+    /// Name of an installed handwriting font for the hello (e.g. "Sacramento"). Empty = Yellowtail when installed, else the built-in pen drawing.
+    pub font: String,
+}
+
+impl GreetingCfg {
+    /// The font to write the hello with: the configured one, or Yellowtail when nothing is set
+    /// (used only if it is installed; otherwise the built-in pen drawing is used).
+    pub fn font_name(&self) -> &str {
+        let f = self.font.trim();
+        if f.is_empty() {
+            "Yellowtail"
+        } else {
+            f
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotchCfg {
+    /// Up to three small widgets on the closed notch: clock, date, battery, weather, wifi, bluetooth, notes.
+    pub widgets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabsCfg {
+    /// Order of the tabs in the header (module ids). Home always comes first;
+    /// tabs not listed follow in the default order. Change it in Settings → Tabs.
+    pub order: Vec<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -553,6 +618,7 @@ impl Config {
         self.bluetooth.low_battery = self.bluetooth.low_battery.min(100);
         self.weather.refresh_minutes = self.weather.refresh_minutes.clamp(5, 360);
         self.home.widgets.truncate(4);
+        self.notch.widgets.truncate(3);
         self
     }
 }
@@ -574,14 +640,20 @@ start_with_windows = false
 [appearance]
 notch_width = 188
 notch_height = 32
-expanded_width = 600
+expanded_width = 720
 collapsed_opacity = 1.0
-expanded_opacity = 0.82
+expanded_opacity = 1.0
 blur = true
 shadow = false
 # 0 = no overshoot ... 1 = very bouncy
 bounce = 0.3
 animation_speed = 1.0
+# false = blue beams with a hint of white, true = white beams with a hint of blue
+white_beams = false
+# "roll" (digits slide up, the next one rises in) or "flip" (flip-clock tiles)
+clock_style = "roll"
+# Draw content once and only move/fade it while opening, closing and switching pages
+motion_cache = true
 # "auto" picks the accent from album art, or use "#RRGGBB"
 accent = "auto"
 scale = 1.0
@@ -611,12 +683,16 @@ shelf = true
 ports = true
 locks = true
 osd = true
-bluetooth = true
 stats = true
 weather = true
-wifi = true
+control = true            # Wi-Fi & Bluetooth in one tab
+notifications = true      # Windows notifications in the notch
+mirror = true             # Mirror tab (the camera only runs while you press its button)
+devices = true            # peeks when a USB drive or a display is connected
 gemini = true
 notes = true
+# greet you when you unlock the PC
+greeting = true
 
 [media]
 visualizer = true
@@ -708,8 +784,8 @@ low_battery = 15
 
 [home]
 # Widgets on the right of the home page (max 4, top to bottom). You can also pick them in Settings → Home.
-# weather, stats, timer, wifi, bluetooth, notes, clock, clipboard, downloads, shelf, ports
-widgets = ["weather", "stats", "timer", "wifi"]
+# weather, stats, timer, control (Wi-Fi & Bluetooth), notes, clipboard, downloads, shelf, ports
+widgets = ["weather", "stats", "timer", "control"]
 
 [weather]
 # Weather comes from open-meteo.com (no account or key). Example: "Berlin" or "Springfield, IL"
@@ -726,6 +802,25 @@ model = "gemini-2.5-flash"
 endpoint = "https://generativelanguage.googleapis.com/v1beta"
 max_tokens = 2048
 system_prompt = "You are a helpful assistant living in a small desktop notch. Keep answers short and clear. Plain text, no markdown headings."
+
+[greeting]
+# On unlock the notch scans, then writes "Hello" in handwriting (switch it off with greeting = false under [modules]).
+# Name to add after it ("Hello Sam"); empty = just "Hello". Also in Settings → General.
+name = ""
+# Optional: the name of an installed handwriting font to write the hello with (e.g. "Sacramento", "Yellowtail").
+# Empty = Yellowtail if it is installed, otherwise the built-in pen drawing. Also in Settings → General ("Script Regular" needs that font installed).
+font = ""
+
+[tabs]
+# Order of the header tabs (Settings → Tabs). Empty = default order.
+# ids: timer, stats, voice, clipboard, downloads, shelf, ports, ai, gemini, weather, control, notes, notifications, mirror
+order = []
+
+[notch]
+# Up to 3 small widgets on the closed notch (Settings → Notch):
+# clock, date, battery, weather, wifi, bluetooth, notes
+widgets = []
+
 "##;
 
 #[cfg(test)]
@@ -754,7 +849,17 @@ mod tests {
         assert_eq!(c.home.widgets, d.home.widgets);
         assert_eq!(c.weather.units, d.weather.units);
         assert_eq!(c.gemini.model, d.gemini.model);
-        assert!(c.modules.weather && c.modules.wifi && c.modules.gemini && c.modules.notes);
+        assert!(
+            c.modules.weather
+                && c.modules.control
+                && c.modules.notifications
+                && c.modules.gemini
+                && c.modules.notes
+                && c.modules.greeting
+        );
+        assert_eq!(c.greeting.name, d.greeting.name);
+        assert_eq!(c.notch.widgets, d.notch.widgets);
+        assert_eq!(c.tabs.order, d.tabs.order);
     }
 
     #[test]

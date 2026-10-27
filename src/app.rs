@@ -9,13 +9,16 @@ use std::time::{Duration, Instant};
 
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, DATE_LONGDATE, DATE_SHORTDATE, TIME_NOSECONDS};
+use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS};
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, SetWindowRgn, HDC,
     HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::System::Power::RegisterPowerSettingNotification;
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::SystemServices::{GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -28,10 +31,10 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::anim::{lerp, Spring};
+use crate::anim::{lerp, smoothstep, Spring};
 use crate::bus::{Bus, Msg};
 use crate::config::{self, Config, LoadResult};
-use crate::gfx::{self, icons, Gfx, Icon, Painter, Res, TextStyle};
+use crate::gfx::{self, icons, Gfx, Icon, Painter, Res, Snapshot, TextStyle};
 use crate::host::Host;
 use crate::hotkeys::{self, Action};
 use crate::modules::{
@@ -40,7 +43,7 @@ use crate::modules::{
 use crate::pacer::Pacer;
 use crate::sys::dragdrop::{self, DropEvent};
 use crate::tray::{self, MenuState, Tray};
-use crate::ui::{ButtonStyle, Input, Ui};
+use crate::ui::{gkey, ButtonStyle, Input, Ui};
 use crate::util::{palette, Color, Rect, SendHwnd};
 use crate::window::{WM_APP_BUS, WM_APP_DRAG, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_TRAY};
 use crate::{ipc, log, sys};
@@ -49,19 +52,28 @@ use windows::Win32::UI::Input::{
     RID_INPUT, RIM_TYPEKEYBOARD,
 };
 
-const HEADER_H: f32 = 42.0;
-const PAD: f32 = 20.0;
-const BOTTOM_PAD: f32 = 18.0;
+const HEADER_H: f32 = 54.0;
+const PAD: f32 = 28.0;
+const BOTTOM_PAD: f32 = 28.0;
 const MARGIN: f32 = 48.0;
-const WIN_H: f32 = 520.0;
+const WIN_H: f32 = 600.0;
 const HOME: ModuleId = "home";
 const TIMER_WAKE: usize = 1;
-const HOME_HEIGHT: f32 = 128.0;
+const HOME_HEIGHT: f32 = 176.0;
 /// With four tiles in the right column the home page grows a little.
-const HOME_HEIGHT_TALL: f32 = 152.0;
+const HOME_HEIGHT_TALL: f32 = 200.0;
 const HOME_TILES: usize = 4;
+
+thread_local! {
+    /// When the wheel last flipped a tab (a touchpad would otherwise race through all of them).
+    static WHEEL_FLIP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+/// Height of the clock strip under the media player on the home page.
+const CLOCK_STRIP_H: f32 = 52.0;
 /// Quiet time before GPU caches are released.
-const TRIM_DELAY: Duration = Duration::from_secs(3);
+/// How long the notch must be idle before GPU scratch memory is handed back.
+/// Trimming right after every burst made the next open re-allocate everything.
+const TRIM_DELAY: Duration = Duration::from_secs(10);
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// A peek would be visible right now (not hidden, not expanded).
@@ -83,7 +95,17 @@ enum Mode {
 struct ActivePeek {
     peek: Peek,
     until: Instant,
+    /// The content that was showing before a quiet follow-up swapped it, and when that happened.
+    swap: Option<(Instant, Box<Peek>)>,
 }
+
+/// How long a quiet peek swap (next track) takes to play.
+const SWAP_SECS: f32 = 0.55;
+
+/// Spring response of the notch body when it grows (seconds); it shrinks a bit faster.
+const BODY_RESPONSE: f32 = 0.42;
+/// How long the body waits for the content to fade before it shrinks (seconds).
+const CLOSE_HOLD: f32 = 0.09;
 
 struct Anim {
     w: Spring,
@@ -97,6 +119,8 @@ struct Anim {
     shown: Spring,
     /// Secondary live-activity bubble (0 hidden .. 1 fully out).
     sec: Spring,
+    /// Page switch progress 0..1 (slow and soft on purpose).
+    page: Spring,
 }
 
 impl Anim {
@@ -112,6 +136,7 @@ impl Anim {
             exp: Spring::unit(0.0, 0.22, 1.0),
             shown: Spring::unit(0.0, 0.5, 0.8),
             sec: Spring::unit(0.0, 0.45, 0.8),
+            page: Spring::unit(1.0, 0.46, 1.0),
         }
         .with_h(h)
     }
@@ -132,11 +157,22 @@ impl Anim {
             &mut self.exp,
             &mut self.shown,
             &mut self.sec,
+            &mut self.page,
         ] {
             m |= s.step(dt);
         }
         m
     }
+}
+
+/// The few look settings the drawing code reads every frame, copied out so no text is cloned.
+#[derive(Clone, Copy)]
+struct Look {
+    shadow: bool,
+    blur: bool,
+    expanded_opacity: f32,
+    collapsed_opacity: f32,
+    notch_height: f32,
 }
 
 struct Targets {
@@ -158,6 +194,10 @@ pub struct App {
     gfx: Gfx,
     res: Res,
     host: Host,
+    /// The open notch drawn once while it fades in or out (see `prepare_snapshots`).
+    snap_all: Option<Snapshot>,
+    /// The old and the new page, drawn once while the page slide runs.
+    snap_pages: Option<(Snapshot, Snapshot)>,
     pacer: Pacer,
     bus: Bus,
     rx: Receiver<Msg>,
@@ -175,6 +215,8 @@ pub struct App {
 
     mode: Mode,
     page: ModuleId,
+    /// Page being faded out while the next one slides in, and the slide direction.
+    page_from: Option<(ModuleId, f32)>,
     peek: Option<ActivePeek>,
     peek_queue: VecDeque<Peek>,
 
@@ -193,6 +235,8 @@ pub struct App {
     dirty: bool,
     /// When to release GPU caches (set when a frame burst ends).
     trim_at: Option<Instant>,
+    /// No spring is moving: the backdrop blur may be shown.
+    settled: bool,
     region: Option<(i32, i32, i32, i32)>,
     region_anim: Option<Rect>,
     fs_hidden: bool,
@@ -209,6 +253,7 @@ pub struct App {
     activity: Option<Activity>,
     secondary: Option<Activity>,
     indicators: Vec<Indicator>,
+    /// Second shown on the home flip clock when it was last drawn.
     clock_min: u16,
     /// Virtual key of the dictation hotkey (its release ends push-to-talk).
     dictate_vk: u16,
@@ -235,12 +280,15 @@ impl App {
         let modules = modules::all();
         let n = modules.len();
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Release);
+        crate::ui::set_white_beams(cfg.appearance.white_beams);
         let anim = Anim::new(cfg.appearance.notch_width, cfg.appearance.notch_height);
         Ok(Box::new(App {
             hwnd,
             gfx,
             res,
             host,
+            snap_all: None,
+            snap_pages: None,
             pacer,
             bus,
             rx,
@@ -254,6 +302,7 @@ impl App {
             win_px: (0, 0, 0, 0),
             mode: Mode::Idle,
             page: HOME,
+            page_from: None,
             peek: None,
             peek_queue: VecDeque::new(),
             hovering: false,
@@ -268,6 +317,7 @@ impl App {
             last_frame: Instant::now(),
             dirty: true,
             trim_at: None,
+            settled: true,
             region: None,
             region_anim: None,
             fs_hidden: false,
@@ -301,6 +351,8 @@ impl App {
         self.register_hotkeys();
         unsafe {
             let _ = AddClipboardFormatListener(self.hwnd);
+            // tells us when the PC is locked / unlocked (the greeting)
+            let _ = WTSRegisterSessionNotification(self.hwnd, NOTIFY_FOR_THIS_SESSION);
             let h = HANDLE(self.hwnd.0);
             let _ = RegisterPowerSettingNotification(h, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_WINDOW_HANDLE);
             let _ =
@@ -357,6 +409,9 @@ impl App {
             }
         }
         hotkeys::unregister_all(self.hwnd);
+        unsafe {
+            let _ = WTSUnRegisterSessionNotification(self.hwnd);
+        }
         dragdrop::revoke_target(self.hwnd);
         self.tray = None;
         self.pacer.stop();
@@ -382,6 +437,13 @@ impl App {
                     let _ = KillTimer(Some(self.hwnd), TIMER_WAKE);
                 }
                 self.on_wake();
+                Some(LRESULT(0))
+            }
+            // WM_WTSSESSION_CHANGE: wParam 8 = WTS_SESSION_UNLOCK
+            0x02B1 => {
+                if wp.0 == 8 {
+                    self.broadcast(SystemEvent::Command { verb: "unlocked".into(), args: vec![] });
+                }
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
@@ -446,6 +508,13 @@ impl App {
             }
             WM_POWERBROADCAST => {
                 self.broadcast(SystemEvent::PowerChanged);
+                Some(LRESULT(1))
+            }
+            0x0219 => {
+                // WM_DEVICECHANGE: a drive letter appeared or went away
+                if let Some(args) = usb_event(wp.0 as u32, lp.0) {
+                    self.broadcast(SystemEvent::Command { verb: "usb".into(), args });
+                }
                 Some(LRESULT(1))
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
@@ -728,6 +797,39 @@ impl App {
         page == HOME || self.modules.iter().enumerate().any(|(i, m)| self.started[i] && m.id() == page && m.has_page())
     }
 
+    /// Change the open page with a soft slide and cross-fade.
+    fn switch_page(&mut self, new: ModuleId) {
+        if new == self.page {
+            return;
+        }
+        // later tabs slide in from the right, earlier ones from the left
+        // (by the order of the header tabs, which the user can rearrange; settings sits last)
+        let order = &self.cfg.tabs.order;
+        let pos = |id: ModuleId| -> i32 {
+            if id == HOME {
+                return -1;
+            }
+            if id == "settings" {
+                return 10_000;
+            }
+            match order.iter().position(|o| o == id) {
+                Some(i) => i as i32,
+                None => 1_000 + self.module_index(id).map_or(0, |i| i as i32),
+            }
+        };
+        let dir = if pos(new) >= pos(self.page) { 1.0 } else { -1.0 };
+        self.page_from = Some((self.page, dir));
+        self.page = new;
+        self.anim.page.snap(0.0);
+        self.anim.page.set_target(1.0);
+        self.request_frame();
+    }
+
+    /// Whether the hello is written with an installed font (`[greeting] font`) instead of the pen drawing.
+    fn hello_custom(&self) -> bool {
+        self.gfx.font_installed(self.cfg.greeting.font_name())
+    }
+
     fn module_index(&self, id: ModuleId) -> Option<usize> {
         self.modules.iter().position(|m| m.id() == id)
     }
@@ -785,10 +887,19 @@ impl App {
             self.res.trim_bitmaps();
             self.host.reset_dc(&self.gfx);
             self.gfx.trim();
+            // hand the freed pages back to Windows (Task Manager shows the real footprint)
+            unsafe {
+                let _ = windows::Win32::System::Memory::SetProcessWorkingSetSizeEx(
+                    windows::Win32::System::Threading::GetCurrentProcess(),
+                    usize::MAX,
+                    usize::MAX,
+                    windows::Win32::System::Memory::SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+                );
+            }
         }
         if self.mode == Mode::Expanded && self.page == HOME {
             let st = unsafe { GetLocalTime() };
-            if st.wMinute != self.clock_min {
+            if st.wSecond != self.clock_min {
                 self.request_frame();
             }
         }
@@ -829,7 +940,9 @@ impl App {
             consider(t);
         }
         if self.mode == Mode::Expanded && self.page == HOME {
-            consider(now + Duration::from_secs(15));
+            // the flip clock shows seconds: wake at the next full second
+            let ms = 1000 - (unsafe { GetLocalTime() }.wMilliseconds as u64).min(999);
+            consider(now + Duration::from_millis(ms + 2));
         }
         unsafe {
             match next {
@@ -882,7 +995,12 @@ impl App {
             }
         });
         let was = self.mode;
-        self.page = target;
+        if was == Mode::Expanded {
+            self.switch_page(target);
+        } else {
+            self.page = target;
+            self.page_from = None;
+        }
         self.mode = Mode::Expanded;
         self.peek = None;
         self.leave_since = None;
@@ -929,8 +1047,21 @@ impl App {
         if self.mode == Mode::Expanded {
             return; // the user is already looking at the notch
         }
+        if p.quiet {
+            // a follow-up (the next track): swap the visible peek with an animation, never pop a new one
+            if let (Some(k), Some(cur)) = (p.key, self.peek.as_mut()) {
+                if cur.peek.key == Some(k) {
+                    let old = std::mem::replace(&mut cur.peek, p);
+                    cur.swap = Some((Instant::now(), Box::new(old)));
+                    self.request_frame();
+                    self.schedule_wake();
+                }
+            }
+            return;
+        }
         if let (Some(k), Some(cur)) = (p.key, self.peek.as_mut()) {
             if cur.peek.key == Some(k) {
+                cur.swap = None;
                 cur.until = Instant::now() + p.duration;
                 cur.peek = p;
                 self.request_frame();
@@ -953,7 +1084,7 @@ impl App {
             }
             self.peek_queue.push_back(p);
         } else {
-            self.peek = Some(ActivePeek { until: Instant::now() + p.duration, peek: p });
+            self.peek = Some(ActivePeek { until: Instant::now() + p.duration, peek: p, swap: None });
             self.mode = Mode::Peek;
         }
         self.request_frame();
@@ -966,7 +1097,7 @@ impl App {
         }
         match self.peek_queue.pop_front() {
             Some(p) => {
-                self.peek = Some(ActivePeek { until: Instant::now() + p.duration, peek: p });
+                self.peek = Some(ActivePeek { until: Instant::now() + p.duration, peek: p, swap: None });
                 self.mode = Mode::Peek;
             }
             None => {
@@ -1016,6 +1147,37 @@ impl App {
             }
         }
         self.request_frame();
+    }
+
+    /// What the selected closed-notch widgets show right now.
+    fn idle_glances(&self) -> Vec<Glance> {
+        let mut out = Vec::new();
+        if self.mode != Mode::Idle {
+            return out;
+        }
+        for id in self.cfg.notch.widgets.iter().take(3) {
+            match id.as_str() {
+                "clock" => out.push((None, clock_text(), palette::TEXT, None)),
+                "date" => out.push((None, date_text(), palette::TEXT, None)),
+                "battery" => {
+                    if let Some((level, charging)) = self.indicators.iter().find_map(|i| i.battery) {
+                        let icon = if charging { Some(Icon::Bolt) } else { None };
+                        out.push((icon, format!("{:.0}%", level * 100.0), battery_color(level, charging), Some(level)));
+                    }
+                }
+                other => {
+                    let module = if matches!(other, "wifi" | "bluetooth") { "control" } else { other };
+                    if let Some(i) = self.modules.iter().position(|m| m.id() == module) {
+                        if self.started[i] {
+                            if let Some((icon, text)) = self.modules[i].glance_for(other) {
+                                out.push((Some(icon), text, palette::TEXT, None));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn quit(&mut self) {
@@ -1270,6 +1432,7 @@ impl App {
             LoadResult::Ok(c) => {
                 let autostart_changed = c.general.start_with_windows != self.cfg.general.start_with_windows;
                 self.cfg = c;
+                crate::ui::set_white_beams(self.cfg.appearance.white_beams);
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
                 }
@@ -1438,8 +1601,8 @@ impl App {
         let mut t = Targets {
             w: base_w,
             h: base_h,
-            r: (base_h * 0.36).min(13.0),
-            ear: (base_h * 0.22).clamp(4.0, 8.0),
+            r: (base_h * 0.56).min(18.0),
+            ear: (base_h * 0.26).clamp(5.0, 9.0),
             glass: 0.0,
             compact: false,
             peek: false,
@@ -1466,15 +1629,48 @@ impl App {
                 t.w = ap.expanded_width;
                 t.h = HEADER_H + content_h + BOTTOM_PAD;
                 t.r = 34.0;
-                t.ear = 12.0;
+                t.ear = 14.0;
                 t.glass = 1.0;
                 t.exp = true;
             }
             Mode::Peek => {
-                t.w = (base_w + 150.0).max(360.0).min(ap.expanded_width);
-                t.h = base_h + 46.0;
-                t.r = 26.0;
-                t.ear = 10.0;
+                let pk = self.peek.as_ref().map(|a| &a.peek);
+                if pk.is_some_and(|p| p.scan) {
+                    // unlock scan: the notch grows into a small square stage, then
+                    // settles into a smaller one for the handwritten hello
+                    let prog = self.peek.as_ref().map_or(0.0, |a| {
+                        1.0 - a.until.saturating_duration_since(Instant::now()).as_secs_f32()
+                            / a.peek.duration.as_secs_f32().max(0.1)
+                    });
+                    if prog > SCAN_HELLO_AT {
+                        let title = pk.map_or("", |p| p.title.as_str());
+                        let (w, h) = hello_stage(title, self.hello_custom());
+                        t.w = w.min(ap.expanded_width);
+                        t.h = h;
+                    } else {
+                        t.w = 230.0_f32.min(ap.expanded_width);
+                        t.h = 168.0;
+                    }
+                    t.r = 34.0;
+                    t.ear = 14.0;
+                } else if pk.is_some_and(|p| p.is_hud()) {
+                    // volume / brightness: one row, icon + beams + value
+                    t.w = 300.0_f32.min(ap.expanded_width);
+                    t.h = base_h + 34.0;
+                    t.r = 26.0;
+                    t.ear = 12.0;
+                } else if pk.is_some_and(|p| p.is_compact()) {
+                    // icon-only pill, like the unlock animation
+                    t.w = (base_w + 70.0).max(250.0).min(ap.expanded_width);
+                    t.h = base_h + 10.0;
+                    t.r = 21.0;
+                    t.ear = 10.0;
+                } else {
+                    t.w = (base_w + 150.0).max(360.0).min(ap.expanded_width);
+                    t.h = base_h + 44.0;
+                    t.r = 24.0;
+                    t.ear = 11.0;
+                }
                 t.glass = 0.55;
                 t.peek = true;
             }
@@ -1495,6 +1691,13 @@ impl App {
                         _ => {}
                     }
                 }
+                if self.activity.is_none() && !self.cfg.notch.widgets.is_empty() {
+                    let shows = !matches!(self.cfg.general.idle_style.as_str(), "pill" | "hidden") || self.hovering;
+                    if shows {
+                        let n = self.cfg.notch.widgets.len().min(3) as f32;
+                        t.w = t.w.max(26.0 + 66.0 * n);
+                    }
+                }
                 if self.hovering && !self.user_hidden {
                     t.w += 14.0;
                     t.h += 4.0;
@@ -1512,14 +1715,24 @@ impl App {
         let bounce = ap.bounce;
         let a = &mut self.anim;
         let grow = t.w > a.w.value + 0.5 || t.h > a.h.value + 0.5;
-        let (resp, damp) = if grow { (0.5 / speed, 1.0 - 0.6 * bounce) } else { (0.3 / speed, 1.0 - 0.15 * bounce) };
-        for s in [&mut a.w, &mut a.h, &mut a.r] {
+        // One spring character for the whole body (size, corner radius and ears move as one
+        // object): a little softer on the way out, snappier on the way back in.
+        let (resp, damp) = if grow {
+            (BODY_RESPONSE / speed, 1.0 - 0.45 * bounce)
+        } else {
+            (BODY_RESPONSE * 0.7 / speed, 1.0 - 0.1 * bounce)
+        };
+        for s in [&mut a.w, &mut a.h, &mut a.r, &mut a.ear] {
             s.set_params(resp, damp);
         }
-        a.w.set_target(t.w);
-        a.h.set_target(t.h);
-        a.r.set_target(t.r);
-        a.ear.set_target(t.ear);
+        // Staged like the Mac apps: when closing, the content fades first and the body only then
+        // shrinks around the empty space; when opening, the body leads and the content follows.
+        let closing = !grow && !t.exp && a.exp.value > 0.05;
+        let hold = if closing { CLOSE_HOLD / speed } else { 0.0 };
+        a.w.set_target_delayed(t.w, hold);
+        a.h.set_target_delayed(t.h, hold);
+        a.r.set_target_delayed(t.r, hold);
+        a.ear.set_target_delayed(t.ear, hold);
         a.glass.set_target(t.glass);
         a.shown.set_params(0.5 / speed, 1.0 - 0.5 * bounce);
         a.shown.set_target(if t.shown { 1.0 } else { 0.0 });
@@ -1534,13 +1747,18 @@ impl App {
                 s.set_target(0.0);
             }
         };
-        fade(&mut a.compact, t.compact, 0.05);
-        fade(&mut a.peek, t.peek, 0.08);
+        fade(&mut a.compact, t.compact, 0.03);
+        fade(&mut a.peek, t.peek, 0.04);
         fade(&mut a.exp, t.exp, 0.09);
     }
 
     fn frame(&mut self) {
         let now = Instant::now();
+        // Ambient animation only (a sweeping beam, the record turning): nothing is being moved by a
+        // spring and nobody touched anything, so ~30 frames a second look the same for half the work.
+        if !self.dirty && self.settled && now.duration_since(self.last_frame) < Duration::from_millis(20) {
+            return;
+        }
         let dt = (now - self.last_frame).as_secs_f32().min(1.0 / 20.0);
         self.last_frame = now;
         self.dirty = false;
@@ -1553,6 +1771,10 @@ impl App {
         self.refresh_activity();
         self.retarget();
         let moving = self.anim.step(dt);
+        if self.page_from.is_some() && self.anim.page.value > 0.998 && self.anim.page.target >= 1.0 {
+            self.page_from = None;
+        }
+        self.settled = !moving;
         let fx = self.render(now);
         let animate = fx.animate;
         self.apply_effects(fx);
@@ -1639,8 +1861,143 @@ impl App {
         }
     }
 
+    /// The header tabs in the user's order (Home first).
+    fn tab_list(&self) -> Vec<(ModuleId, Icon, String)> {
+        let mut tabs: Vec<(ModuleId, Icon, String)> = std::iter::once((HOME, Icon::Home, String::new()))
+            .chain(
+                self.modules
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| self.started[*i] && m.has_page() && m.id() != "settings")
+                    .map(|(_, m)| (m.id(), m.icon(), String::new())),
+            )
+            .collect();
+        // the user's tab order (Home stays first; unlisted tabs keep their place at the end)
+        if !self.cfg.tabs.order.is_empty() && tabs.len() > 1 {
+            let order = &self.cfg.tabs.order;
+            tabs[1..].sort_by_key(|t| order.iter().position(|o| o == t.0).unwrap_or(usize::MAX));
+        }
+        tabs
+    }
+
+    /// While the notch opens or closes, and while a page slides in, the content itself does not
+    /// change: it is only moved and faded. So it is drawn once into a picture and the frames of the
+    /// animation just place that picture (one rectangle fill instead of laying out and drawing
+    /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
+    fn prepare_snapshots(&mut self, now: Instant) {
+        let a_exp = self.anim.exp.value;
+        let paging = self.page_from.is_some();
+        let on = self.cfg.appearance.motion_cache;
+        // the live view takes over a little before the end, so clicks work as soon as they used to
+        let want_all = on && a_exp > 0.003 && a_exp < 0.88 && !paging;
+        let want_pages = on && paging && a_exp >= 0.998;
+        if !want_all {
+            self.snap_all = None;
+        }
+        if !want_pages {
+            self.snap_pages = None;
+        }
+        if !(want_all || want_pages) {
+            return;
+        }
+        let scale = self.scale;
+        let tw = self.cfg.appearance.expanded_width;
+        let body = self.body_rect();
+        let target_h = self.targets().h;
+        let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, target_h.max(body.h));
+        let page = self.page;
+        let accent = self.accent;
+        let input = Input::default();
+        let mut scratch = Effects::default();
+        // keep the pictures inside the window
+        let clamp = |r: Rect| {
+            let (x0, y0) = (r.x.max(0.0), r.y.max(0.0));
+            let (x1, y1) = (r.right().min(self.win_w), r.bottom().min(self.win_h));
+            Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+        };
+        let hash = |parts: &[i32]| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(parts, &mut h);
+            std::hash::Hasher::finish(&h)
+        };
+        let page_id = |id: ModuleId| id.bytes().fold(0i32, |a, b| a.wrapping_mul(31).wrapping_add(b as i32));
+        let sc = (scale * 100.0) as i32;
+
+        if want_all {
+            // the height is left out of the key: it changes every frame while closing
+            let key = hash(&[page_id(page), full.x.round() as i32, full.y.round() as i32, full.w.round() as i32, sc]);
+            let fresh =
+                self.snap_all.as_ref().is_some_and(|s| s.key == key && s.born.elapsed() < Duration::from_millis(900));
+            if !fresh {
+                let tabs = self.tab_list();
+                let region = clamp(full);
+                self.snap_all = self.res.render_snapshot(&self.gfx, scale, region, key, |p| {
+                    let mut ui = Ui {
+                        p,
+                        input: &input,
+                        fx: &mut scratch,
+                        cfg: &self.cfg,
+                        bus: &self.bus,
+                        now,
+                        accent,
+                        hot: false,
+                        interactive: false,
+                    };
+                    draw_expanded(
+                        &mut ui,
+                        full,
+                        &mut self.modules,
+                        &self.started,
+                        &tabs,
+                        page,
+                        None,
+                        &self.indicators,
+                        None,
+                    );
+                });
+            }
+        }
+
+        if want_pages {
+            let Some((from, _)) = self.page_from else { return };
+            let content =
+                Rect::new(full.x + PAD, full.y + HEADER_H, full.w - 2.0 * PAD, full.h - HEADER_H - BOTTOM_PAD);
+            let region = clamp(Rect::new(full.x, content.y - 4.0, full.w, content.h + 8.0));
+            let base = [full.x.round() as i32, full.y.round() as i32, full.w.round() as i32, full.h.round() as i32, sc];
+            let key_of = |id: ModuleId| hash(&[page_id(id), base[0], base[1], base[2], base[3], base[4]]);
+            let (kf, kt) = (key_of(from), key_of(page));
+            let fresh = self
+                .snap_pages
+                .as_ref()
+                .is_some_and(|(a, b)| a.key == kf && b.key == kt && a.born.elapsed() < Duration::from_millis(1500));
+            if !fresh {
+                let mut shots: Vec<Option<Snapshot>> = Vec::with_capacity(2);
+                for (id, key) in [(from, kf), (page, kt)] {
+                    let snap = self.res.render_snapshot(&self.gfx, scale, region, key, |p| {
+                        let mut ui = Ui {
+                            p,
+                            input: &input,
+                            fx: &mut scratch,
+                            cfg: &self.cfg,
+                            bus: &self.bus,
+                            now,
+                            accent,
+                            hot: false,
+                            interactive: false,
+                        };
+                        draw_body(&mut ui, content, &mut self.modules, &self.started, id);
+                    });
+                    shots.push(snap);
+                }
+                let (b, a) = (shots.pop().flatten(), shots.pop().flatten());
+                self.snap_pages = a.zip(b);
+            }
+        }
+    }
+
     fn render(&mut self, now: Instant) -> Effects {
         let mut fx = Effects::default();
+        self.prepare_snapshots(now);
         let (dc, off) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(e) => {
@@ -1651,7 +2008,18 @@ impl App {
         };
         let body = self.body_rect();
         let scale = self.scale;
-        let ap = self.cfg.appearance.clone();
+        let ap = {
+            let a = &self.cfg.appearance;
+            Look {
+                shadow: a.shadow,
+                blur: a.blur,
+                expanded_opacity: a.expanded_opacity,
+                collapsed_opacity: a.collapsed_opacity,
+                notch_height: a.notch_height,
+            }
+        };
+        let settled = self.settled;
+        let see_through = ap.expanded_opacity < 0.97 || ap.collapsed_opacity < 0.97;
         let a_glass = self.anim.glass.value;
         let a_r = self.anim.r.value;
         let a_ear = self.anim.ear.value;
@@ -1661,16 +2029,13 @@ impl App {
         let target_h = self.targets().h;
         let bubble = self.bubble_rect();
         let secondary = self.secondary.clone();
+        let glances = self.idle_glances();
         let mut bars: Option<(Rect, Color, bool)> = None;
-        let tabs: Vec<(ModuleId, Icon, String)> = std::iter::once((HOME, Icon::Home, "Home".to_string()))
-            .chain(
-                self.modules
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, m)| self.started[*i] && m.has_page())
-                    .map(|(_, m)| (m.id(), m.icon(), m.title().to_string())),
-            )
-            .collect();
+        let tabs: Vec<(ModuleId, Icon, String)> = if a_exp <= 0.003 || self.snap_all.is_some() {
+            Vec::new() // nothing to draw (or one picture covers it): skip the per-frame allocations
+        } else {
+            self.tab_list()
+        };
 
         {
             let mut p = Painter::new(dc.clone(), &self.gfx, &mut self.res, scale, off.x as f32, off.y as f32);
@@ -1711,6 +2076,8 @@ impl App {
                 }
                 let opaque = if ap.blur { ap.expanded_opacity } else { ap.expanded_opacity.max(0.95) };
                 let bg_alpha = lerp(ap.collapsed_opacity, opaque, a_glass);
+                // no blur while moving: stay a little more solid so it doesn't flash
+                let bg_alpha = if ap.blur && see_through && !settled { bg_alpha.max(0.94) } else { bg_alpha };
                 if let Some(g) = gfx::notch_path(&p, body, a_r, a_ear) {
                     p.fill_geometry(&g, Color::black(bg_alpha));
                 }
@@ -1734,6 +2101,9 @@ impl App {
                 if a_compact > 0.003 || self.mode == Mode::Idle {
                     ui.p.alpha = if self.activity.is_some() { a_compact } else { 1.0 - a_peek.max(a_exp) };
                     draw_compact(&mut ui, body, self.activity.as_ref(), &self.indicators, ap.notch_height, &mut bars);
+                    if self.activity.is_none() && !glances.is_empty() {
+                        draw_idle_widgets(&mut ui, body, &glances, ap.notch_height);
+                    }
                 }
                 // peek banner
                 if a_peek > 0.003 {
@@ -1742,7 +2112,13 @@ impl App {
                         let s = 0.92 + 0.08 * a_peek;
                         ui.p.set_local(s, body.cx(), 0.0, 0.0, 0.0);
                         ui.interactive = a_peek > 0.9;
-                        draw_peek(&mut ui, body, &pk.peek);
+                        let left = pk.until.saturating_duration_since(now).as_secs_f32()
+                            / pk.peek.duration.as_secs_f32().max(0.1);
+                        let swap = pk.swap.as_ref().and_then(|(at, old)| {
+                            let t = now.saturating_duration_since(*at).as_secs_f32() / SWAP_SECS;
+                            (t < 1.0).then_some((t, &**old))
+                        });
+                        draw_peek(&mut ui, body, &pk.peek, left.clamp(0.0, 1.0), swap);
                         ui.p.reset_local();
                     }
                 }
@@ -1754,7 +2130,29 @@ impl App {
                     ui.interactive = a_exp > 0.85 && self.mode == Mode::Expanded;
                     let tw = self.cfg.appearance.expanded_width;
                     let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, target_h.max(body.h));
-                    draw_expanded(&mut ui, full, &mut self.modules, &self.started, &tabs, self.page, &self.indicators);
+                    match &self.snap_all {
+                        // opening or closing: the finished picture is only faded and scaled
+                        Some(snap) => {
+                            ui.interactive = false;
+                            ui.p.snapshot(snap, 0.0, 0.0, 1.0);
+                        }
+                        None => {
+                            let trans =
+                                self.page_from.map(|(from, dir)| (from, dir, self.anim.page.value.clamp(0.0, 1.0)));
+                            let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
+                            draw_expanded(
+                                &mut ui,
+                                full,
+                                &mut self.modules,
+                                &self.started,
+                                &tabs,
+                                self.page,
+                                trans,
+                                &self.indicators,
+                                pages,
+                            );
+                        }
+                    }
                     ui.p.reset_local();
                 }
                 ui.p.alpha = 1.0;
@@ -1781,13 +2179,15 @@ impl App {
         // blur behind the notch body
         let s = self.scale;
         let bp = Rect::new(body.x * s, body.y * s, body.w * s, body.h.max(0.0) * s);
-        let blur = if ap.blur { a_glass } else { 0.0 };
+        // The live blur is the costliest thing the compositor does for us:
+        // skip it while the panel is opaque anyway and while it is still moving.
+        let blur = if ap.blur && see_through && settled { a_glass } else { 0.0 };
         self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value);
 
         if let Some(page) = fx.open_page.take() {
             if self.mode == Mode::Expanded && self.page_available(page) {
                 if self.page != page {
-                    self.page = page;
+                    self.switch_page(page);
                     self.set_keyboard(page == "ai");
                 }
             } else {
@@ -1796,7 +2196,7 @@ impl App {
         }
         if self.mode == Mode::Expanded && self.page == HOME {
             let st = unsafe { GetLocalTime() };
-            self.clock_min = st.wMinute;
+            self.clock_min = st.wSecond;
         }
         fx
     }
@@ -1804,6 +2204,8 @@ impl App {
     fn recover_device(&mut self) {
         if self.gfx.recreate_devices().is_ok() {
             let _ = self.host.set_rendering_device(&self.gfx);
+            self.snap_all = None;
+            self.snap_pages = None;
             if let Ok(r) = Res::new(&self.gfx) {
                 self.res = r;
             }
@@ -1846,6 +2248,62 @@ fn draw_compact(
     }
 }
 
+/// Up to three small widgets inside the closed notch, side by side.
+/// One closed-notch widget: icon, text, colour and an optional 0..1 tick gauge.
+type Glance = (Option<Icon>, String, Color, Option<f32>);
+
+fn draw_idle_widgets(ui: &mut Ui, body: Rect, items: &[Glance], base_h: f32) {
+    // fades in as the pill grows into a notch
+    let k = ((body.h - 8.0) / (base_h - 8.0).max(1.0)).clamp(0.0, 1.0);
+    if k < 0.05 || items.is_empty() {
+        return;
+    }
+    let alpha = ui.p.alpha;
+    ui.p.alpha = alpha * k;
+    let h = body.h.min(base_h + 6.0);
+    let cy = body.y + h * 0.5;
+    let n = items.len().min(3);
+    let slot_w = ((body.w - 20.0) / n as f32).min(86.0);
+    let x0 = body.cx() - slot_w * n as f32 * 0.5;
+    let base = TextStyle::new((base_h * 0.42).clamp(11.0, 14.0), palette::TEXT).semibold().display();
+    for (i, (icon, text, color, gauge)) in items.iter().take(3).enumerate() {
+        let st = base.color(*color);
+        let slot = Rect::new(x0 + i as f32 * slot_w, body.y, slot_w, h);
+        // a single faint tick between neighbours
+        if i > 0 {
+            ui.p.fill_rounded(Rect::new(slot.x - 0.75, cy - 5.0, 1.5, 10.0), 0.75, Color::white(0.16));
+        }
+        let isz = 13.0;
+        let (iw, gap) = if icon.is_some() { (isz, 4.0) } else { (0.0, 0.0) };
+        let (tw, _) = ui.p.measure(text, &st);
+        let gw = if gauge.is_some() { 30.0 } else { 0.0 };
+        let gg = if gauge.is_some() { 6.0 } else { 0.0 };
+        let tw = tw.min((slot_w - iw - gap - gw - gg - 6.0).max(0.0));
+        let x = slot.cx() - (iw + gap + tw + gg + gw) * 0.5;
+        if let Some(ic) = icon {
+            ui.p.icon(*ic, Rect::new(x, cy - isz * 0.5, isz, isz), color.with_a(0.9));
+        }
+        ui.p.text(text, Rect::new(x + iw + gap, body.y, tw + 2.0, h), &st);
+        if let Some(g) = gauge {
+            ui.ticks(Rect::new(x + iw + gap + tw + gg, cy - 4.0, gw, 8.0), *g, *color);
+        }
+    }
+    ui.p.alpha = alpha;
+}
+
+fn clock_text() -> String {
+    let st = unsafe { GetLocalTime() };
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS, Some(&st), PCWSTR::null(), Some(&mut buf)) };
+    String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize])
+}
+
+fn date_text() -> String {
+    let st = unsafe { GetLocalTime() };
+    let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(st.wDayOfWeek % 7) as usize];
+    format!("{day} {}", st.wDay)
+}
+
 fn draw_slot(ui: &mut Ui, slot: &Slot, sq: Rect, wing: Rect, left: bool, bars: &mut Option<(Rect, Color, bool)>) {
     match slot {
         Slot::Empty => {}
@@ -1861,24 +2319,19 @@ fn draw_slot(ui: &mut Ui, slot: &Slot, sq: Rect, wing: Rect, left: bool, bars: &
             *bars = Some((r, *color, *playing));
         }
         Slot::Ring(progress, c) => {
-            let cx = sq.cx();
-            let cy = sq.cy();
-            let rad = sq.w * 0.36;
+            let (cx, cy) = (sq.cx(), sq.cy());
+            let d = sq.w * 0.8;
             let w = (sq.w * 0.12).max(2.0);
-            ui.p.stroke_circle(cx, cy, rad, w, Color::white(0.18));
             match progress {
-                Some(f) => ui.p.arc(cx, cy, rad, 0.0, std::f32::consts::TAU * f.clamp(0.0, 1.0), w, *c),
-                None => {
-                    let t = crate::ui::epoch_secs() * 5.0;
-                    ui.p.arc(cx, cy, rad, t, 1.6, w, *c);
-                    ui.animate();
-                }
+                Some(f) => ui.ring(cx, cy, d, w, *f, *c),
+                None => ui.ring_spin(cx, cy, d, w, *c),
             }
         }
         Slot::Battery { level, charging } => {
             let c = battery_color(*level, *charging);
             icons::battery(ui.p, sq.inset_xy(0.0, sq.h * 0.18), *level, *charging, c);
         }
+        Slot::Vinyl { color, angle, art } => ui.vinyl(sq.inset(sq.w * 0.04), *angle, *color, art.as_ref()),
         Slot::Wave { levels, color } => {
             let r = Rect::new(wing.x, wing.y + wing.h * 0.12, wing.w, wing.h * 0.76);
             modules::voice::draw_wave(ui, r, levels, *color);
@@ -1898,46 +2351,502 @@ pub fn battery_color(level: f32, charging: bool) -> Color {
     }
 }
 
-fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek) {
-    let top = body.y + 10.0;
-    let inner = Rect::new(body.x + 18.0, top + 6.0, body.w - 36.0, body.h - top - 16.0);
-    let is = (inner.h).min(44.0);
-    let ir = Rect::new(inner.x, inner.cy() - is * 0.5, is, is);
-    match &pk.image {
-        Some(img) => ui.p.image(img, ir, 10.0, 1.0),
-        None => {
-            ui.p.fill_rounded(ir, is * 0.5, pk.accent.with_a(0.2));
-            ui.p.icon(pk.icon, ir.inset(is * 0.24), pk.accent);
+/// Glyph inside a peek's status badge: a check for green, a "!" style info
+/// mark for warnings, nothing (a plain dot) for other colours.
+fn badge_glyph(c: Color) -> Option<Icon> {
+    if c == palette::GREEN {
+        Some(Icon::Check)
+    } else if c == palette::RED || c == palette::ORANGE || c == palette::YELLOW {
+        Some(Icon::Info)
+    } else {
+        None
+    }
+}
+
+/// Volume / brightness: the icon top left, the value top right and a bar of
+/// thin ticks underneath.
+/// Pointer dwell on the volume peek's speaker icon: (since, already switched).
+thread_local! {
+    static HUD_DWELL: std::cell::Cell<(Option<Instant>, bool)> = const { std::cell::Cell::new((None, false)) };
+}
+const HUD_DWELL_SECS: f32 = 0.7;
+
+fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: Option<&str>) {
+    let pad = 24.0;
+    let row_y = body.bottom() - 36.0;
+    let ir = Rect::new(body.x + pad, row_y, 24.0, 24.0);
+    // Volume only: rest the pointer on the speaker for a moment to move to the next output device
+    let mut hint = false;
+    if pk.key == Some("osd-volume") {
+        let zone = ir.expand(8.0);
+        let over = ui.hovered(zone);
+        let go = HUD_DWELL.with(|d| {
+            let (since, fired) = d.get();
+            match (over, since) {
+                (false, _) => {
+                    d.set((None, false));
+                    (0.0, false)
+                }
+                (true, None) => {
+                    d.set((Some(ui.now), false));
+                    (0.0, false)
+                }
+                (true, Some(t)) => {
+                    let k = (ui.now.saturating_duration_since(t).as_secs_f32() / HUD_DWELL_SECS).min(1.0);
+                    if k >= 1.0 && !fired {
+                        d.set((Some(t), true));
+                        (1.0, true)
+                    } else {
+                        (k, false)
+                    }
+                }
+            }
+        });
+        if over {
+            ui.hot = true;
+            hint = true;
+            if go.0 < 1.0 {
+                ui.animate();
+            }
+            // a soft disc fills in behind the icon while the dwell runs
+            ui.p.fill_circle(ir.cx(), ir.cy(), 17.0 * go.0.max(0.35), Color::white(0.10 * go.0.max(0.4)));
+        }
+        if go.1 {
+            modules::osd::request_next_output(ui.bus);
         }
     }
+    ui.p.icon(pk.icon, ir, color);
+    let frac = frac.clamp(0.0, 1.0);
+    let value = text.map(str::to_string).unwrap_or_else(|| format!("{:.0}", frac * 100.0));
+    let vs = TextStyle::new(13.0, Color::white(0.80)).medium().display().right();
+    let vw = 46.0;
+    ui.p.text(&value, Rect::new(body.right() - pad - vw, ir.y, vw, ir.h), &vs);
+    let bx = if hint { ir.right() + 14.0 } else { ir.right() + 16.0 };
+    if hint {
+        ui.p.text("Switch output", Rect::new(bx, ir.y, 110.0, ir.h), &TextStyle::new(11.5, palette::TEXT_DIM));
+    } else {
+        let bar = Rect::new(bx, ir.cy() - 7.0, (body.right() - pad - vw - 12.0 - bx).max(20.0), 14.0);
+        if color.a >= 0.9 {
+            ui.ticks_hud(bar, frac); // blue with white highlights
+        } else {
+            ui.ticks_ex(bar, frac, color, true); // muted: stays quiet
+        }
+    }
+}
+
+thread_local! {
+    /// The last fitted hello text: (font|title, size, width).
+    static HELLO_FIT: std::cell::RefCell<Option<(String, f32, f32)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// When (0..1 of the peek) the scan gives way to the handwritten hello.
+const SCAN_HELLO_AT: f32 = 0.46;
+
+/// The name after "Hello" in the peek title ("" for a plain hello).
+fn hello_name(title: &str) -> &str {
+    title.strip_prefix("Hello").map_or("", str::trim)
+}
+
+/// Size of the stage for the hello: (width, height). A name adds a line below.
+fn hello_stage(title: &str, custom_font: bool) -> (f32, f32) {
+    let name = hello_name(title);
+    if custom_font {
+        ((52.0 + title.chars().count() as f32 * 22.0).clamp(210.0, 440.0), 112.0)
+    } else if name.is_empty() {
+        (210.0, 112.0)
+    } else {
+        ((52.0 + name.chars().count() as f32 * 17.0).clamp(210.0, 420.0), 158.0)
+    }
+}
+
+/// "hello" as one continuous pen stroke (monoline cursive), in a 240 x 110 box.
+const HELLO_PATH: [(f32, f32); 63] = [
+    (10.0, 96.0),
+    (18.0, 72.0),
+    (28.0, 40.0),
+    (37.0, 17.0),
+    (43.0, 9.0),
+    (50.0, 11.0),
+    (51.0, 22.0),
+    (46.0, 44.0),
+    (38.0, 68.0),
+    (33.0, 86.0),
+    (34.0, 80.0),
+    (38.0, 68.0),
+    (46.0, 62.0),
+    (55.0, 60.0),
+    (63.0, 65.0),
+    (65.0, 76.0),
+    (65.0, 86.0),
+    (70.0, 90.0),
+    (77.0, 84.0),
+    (83.0, 72.0),
+    (91.0, 64.0),
+    (98.0, 66.0),
+    (97.0, 75.0),
+    (88.0, 79.0),
+    (79.0, 80.0),
+    (83.0, 88.0),
+    (93.0, 91.0),
+    (102.0, 85.0),
+    (110.0, 66.0),
+    (119.0, 37.0),
+    (125.0, 15.0),
+    (130.0, 8.0),
+    (135.0, 13.0),
+    (131.0, 40.0),
+    (125.0, 68.0),
+    (122.0, 84.0),
+    (127.0, 91.0),
+    (135.0, 86.0),
+    (142.0, 66.0),
+    (151.0, 37.0),
+    (157.0, 15.0),
+    (162.0, 8.0),
+    (167.0, 13.0),
+    (163.0, 40.0),
+    (157.0, 68.0),
+    (154.0, 84.0),
+    (159.0, 91.0),
+    (167.0, 86.0),
+    (173.0, 75.0),
+    (180.0, 64.0),
+    (190.0, 60.0),
+    (198.0, 66.0),
+    (198.0, 78.0),
+    (190.0, 89.0),
+    (179.0, 90.0),
+    (172.0, 82.0),
+    (173.0, 72.0),
+    (182.0, 64.0),
+    (195.0, 59.0),
+    (210.0, 56.0),
+    (226.0, 51.0),
+    (226.0, 51.0),
+    (226.0, 51.0),
+];
+
+/// The pen path as evenly spaced points (smoothed with a Catmull-Rom spline), built once.
+fn hello_points() -> &'static [(f32, f32)] {
+    static PTS: std::sync::OnceLock<Vec<(f32, f32)>> = std::sync::OnceLock::new();
+    PTS.get_or_init(|| {
+        // the last points only pad the end of the spline
+        let src = &HELLO_PATH[..HELLO_PATH.len() - 2];
+        let n = src.len();
+        let at = |i: isize| -> (f32, f32) {
+            if i < 0 {
+                (2.0 * src[0].0 - src[1].0, 2.0 * src[0].1 - src[1].1)
+            } else if i as usize >= n {
+                (2.0 * src[n - 1].0 - src[n - 2].0, 2.0 * src[n - 1].1 - src[n - 2].1)
+            } else {
+                src[i as usize]
+            }
+        };
+        let mut dense = Vec::new();
+        for i in 0..(n as isize - 1) {
+            let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+            for k in 0..16 {
+                let t = k as f32 / 16.0;
+                let f = |a: f32, b: f32, c: f32, d: f32| {
+                    0.5 * (2.0 * b
+                        + (-a + c) * t
+                        + (2.0 * a - 5.0 * b + 4.0 * c - d) * t * t
+                        + (-a + 3.0 * b - 3.0 * c + d) * t * t * t)
+                };
+                dense.push((f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1)));
+            }
+        }
+        dense.push(src[n - 1]);
+        // resample at a fixed spacing so the pen moves at an even speed
+        let step = 2.2f32;
+        let mut out = vec![dense[0]];
+        let mut carry = 0.0f32;
+        for w in dense.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let seg = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let mut d = step - carry;
+            while d <= seg {
+                let k = d / seg.max(0.0001);
+                out.push((a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k));
+                d += step;
+            }
+            carry = seg - (d - step);
+        }
+        out
+    })
+}
+
+/// Face-ID style unlock animation, in the app's blue: four corner brackets
+/// close in, a ring of beams fills while a smiley waits, the smiley turns into
+/// a check, then the stage shrinks and "Hello" (or "Hello <name>") is written
+/// out in handwriting with a beam at the pen's edge. `t` runs 0..1 over the peek.
+fn draw_scan(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
+    let blue = palette::BLUE;
+    let cx = body.cx();
+    let cy = body.y + 66.0;
+    let alpha = ui.p.alpha;
+    // everything of the scan fades out as the stage shrinks
+    let gone = smoothstep(0.40, 0.50, t);
+    let scan_a = alpha * (1.0 - gone);
+
+    if gone < 0.999 {
+        // corner brackets: fly in from slightly outside
+        let appear = smoothstep(0.0, 0.08, t);
+        let half = 40.0 * (1.0 + 0.25 * (1.0 - appear)) * (1.0 - 0.1 * gone);
+        ui.p.alpha = scan_a * appear;
+        let (arm, th) = (17.0, 3.4);
+        for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let (x, y) = (cx + sx * half, cy + sy * half);
+            let hx = if sx < 0.0 { x - th * 0.5 } else { x - arm + th * 0.5 };
+            let vy = if sy < 0.0 { y - th * 0.5 } else { y - arm + th * 0.5 };
+            ui.p.fill_rounded(Rect::new(hx, y - th * 0.5, arm, th), th * 0.5, blue);
+            ui.p.fill_rounded(Rect::new(x - th * 0.5, vy, th, arm), th * 0.5, blue);
+        }
+
+        // ring of beams filling while it "scans"
+        ui.p.alpha = scan_a * smoothstep(0.02, 0.1, t);
+        ui.ring(cx, cy, 62.0, 4.0, smoothstep(0.06, 0.30, t), blue);
+
+        // smiley → check
+        let done = smoothstep(0.26, 0.34, t);
+        ui.p.alpha = scan_a * (1.0 - done) * smoothstep(0.02, 0.1, t);
+        let blink = 1.0 - 0.8 * (smoothstep(0.16, 0.19, t) - smoothstep(0.19, 0.22, t));
+        draw_smiley(ui, cx, cy, blink, blue);
+        ui.p.alpha = scan_a * done;
+        let k = 0.6 + 0.4 * done;
+        ui.p.icon(Icon::Check, Rect::centered(cx, cy, 30.0 * k, 30.0 * k), Color::white(1.0));
+
+        // label and a bar of beams underneath
+        ui.p.alpha = scan_a * smoothstep(0.32, 0.40, t);
+        ui.p.text(
+            "Unlocked",
+            Rect::new(body.x + 12.0, cy + 52.0, body.w - 24.0, 20.0),
+            &TextStyle::new(14.0, palette::TEXT).semibold().center(),
+        );
+        ui.p.alpha = scan_a * smoothstep(0.0, 0.1, t);
+        ui.ticks(Rect::new(body.x + 40.0, body.bottom() - 22.0, body.w - 80.0, 8.0), smoothstep(0.04, 0.40, t), blue);
+    }
+
+    // the handwritten hello: "hello" is drawn by a pen along one flowing stroke,
+    // a name (if there is one) is written below it in a script font
+    if t > SCAN_HELLO_AT {
+        let name = hello_name(&pk.title);
+        let fade_in = smoothstep(SCAN_HELLO_AT, SCAN_HELLO_AT + 0.05, t);
+        let ease = |x: f32| x * x * (3.0 - 2.0 * x);
+
+        // an installed handwriting font was chosen: write the whole greeting with it
+        let font = ui.cfg.greeting.font_name().to_string();
+        if ui.p.gfx.font_installed(&font) {
+            gfx::set_hello_font(&font);
+            let stage_w = hello_stage(&pk.title, true).0;
+            // measuring builds a text layout, so the fitted size is worked out once per greeting
+            let key = format!("{font}|{}", pk.title);
+            let cached = HELLO_FIT.with(|c| c.borrow().as_ref().filter(|f| f.0 == key).map(|f| (f.1, f.2)));
+            let (size, tw) = match cached {
+                Some(v) => v,
+                None => {
+                    let probe = TextStyle::new(48.0, blue).hello_font();
+                    let (pw, _) = ui.p.measure(&pk.title, &probe);
+                    let size = 48.0 * ((stage_w - 44.0) / pw.max(1.0)).min(1.0);
+                    let (tw, _) = ui.p.measure(&pk.title, &TextStyle::new(size, blue).hello_font());
+                    HELLO_FIT.with(|c| *c.borrow_mut() = Some((key, size, tw)));
+                    (size, tw)
+                }
+            };
+            let style = TextStyle::new(size, blue).hello_font().center();
+            let box_h = size * 1.6;
+            let ty = body.cy() - box_h * 0.5 - 8.0;
+            let tx = cx - tw * 0.5 - 10.0;
+            let wr = ease(smoothstep(SCAN_HELLO_AT + 0.04, 0.82, t));
+            let reveal = (tw + 20.0) * wr;
+            ui.p.alpha = alpha * fade_in;
+            ui.p.push_clip(Rect::new(tx, ty - 6.0, reveal, box_h + 12.0));
+            ui.p.text(&pk.title, Rect::new(tx, ty, tw + 20.0, box_h), &style);
+            ui.p.pop_clip();
+            let pen_a = alpha * fade_in * (1.0 - smoothstep(0.82, 0.90, t));
+            if pen_a > 0.003 && wr > 0.0 && wr < 1.0 {
+                let lead = crate::ui::beam_lead();
+                let ex = tx + reveal;
+                for (i, a) in [0.40f32, 0.20, 0.09].iter().enumerate() {
+                    ui.p.alpha = pen_a * a;
+                    ui.p.fill_rounded(
+                        Rect::new(ex - 6.0 * (i as f32 + 1.0) - 1.2, ty + 4.0, 2.4, box_h - 8.0),
+                        1.2,
+                        blue,
+                    );
+                }
+                ui.p.alpha = pen_a;
+                ui.p.fill_rounded(Rect::new(ex - 1.7, ty, 3.4, box_h), 1.7, lead);
+            }
+            ui.p.alpha = alpha * smoothstep(SCAN_HELLO_AT + 0.02, SCAN_HELLO_AT + 0.08, t);
+            ui.ticks(Rect::new(body.x + 40.0, body.bottom() - 20.0, body.w - 80.0, 8.0), wr, blue);
+            ui.p.alpha = alpha;
+            // nothing moves once the writing is done: no more frames until the peek ends
+            if t < 0.92 {
+                ui.animate();
+            }
+            return;
+        }
+        let path_end = if name.is_empty() { 0.76 } else { 0.70 };
+        let wr = ease(smoothstep(SCAN_HELLO_AT + 0.04, path_end, t));
+        let pts = hello_points();
+        let s = 0.84f32;
+        let (bw, bh) = (240.0 * s, 110.0 * s);
+        let top = if name.is_empty() { body.cy() - bh * 0.5 - 8.0 } else { body.y + 16.0 };
+        let (ox, oy) = (cx - bw * 0.5, top);
+        let n_vis = ((pts.len() as f32) * wr) as usize;
+        ui.p.alpha = alpha * fade_in;
+        for &(px, py) in &pts[..n_vis.min(pts.len())] {
+            ui.p.fill_circle(ox + px * s, oy + py * s, 1.6, blue);
+        }
+        // a beam rides at the pen with a short trail behind it
+        let write_end = if name.is_empty() { path_end } else { 0.90 };
+        let pen_a = alpha * fade_in * (1.0 - smoothstep(write_end, write_end + 0.08, t));
+        let mut tip = (ox, oy);
+        if pen_a > 0.003 && wr > 0.0 {
+            let lead = crate::ui::beam_lead();
+            let at_pen = |back: usize| {
+                let i = n_vis.saturating_sub(back).min(pts.len() - 1);
+                (ox + pts[i].0 * s, oy + pts[i].1 * s)
+            };
+            if wr < 1.0 {
+                for (k, a) in [(30usize, 0.10f32), (20, 0.18), (10, 0.32)] {
+                    let (x, y) = at_pen(k);
+                    ui.p.alpha = pen_a * a;
+                    ui.p.fill_rounded(Rect::new(x - 1.2, y - 11.0, 2.4, 22.0), 1.2, blue);
+                }
+                let (x, y) = at_pen(0);
+                tip = (x, y);
+                ui.p.alpha = pen_a;
+                ui.p.fill_rounded(Rect::new(x - 1.7, y - 13.0, 3.4, 26.0), 1.7, lead);
+            }
+        }
+        let _ = tip;
+
+        let mut frac = wr;
+        if !name.is_empty() {
+            let nt = ease(smoothstep(0.72, 0.90, t));
+            frac = 0.5 * wr + 0.5 * nt;
+            let max_w = hello_stage(&pk.title, false).0 - 40.0;
+            let probe = TextStyle::new(28.0, blue).script();
+            let (pw, _) = ui.p.measure(name, &probe);
+            let size = 28.0 * (max_w / pw.max(1.0)).min(1.0);
+            let style = TextStyle::new(size, blue).script().center();
+            let (tw, _) = ui.p.measure(name, &style);
+            let box_h = size * 1.5;
+            let ty = body.y + 16.0 + bh + 2.0;
+            let tx = cx - tw * 0.5 - 8.0;
+            let reveal = (tw + 16.0) * nt;
+            ui.p.alpha = alpha * fade_in;
+            ui.p.push_clip(Rect::new(tx, ty - 4.0, reveal, box_h + 8.0));
+            ui.p.text(name, Rect::new(tx, ty, tw + 16.0, box_h), &style);
+            ui.p.pop_clip();
+            if nt > 0.0 && nt < 1.0 {
+                let lead = crate::ui::beam_lead();
+                let ex = tx + reveal;
+                for (i, a) in [0.40f32, 0.20, 0.09].iter().enumerate() {
+                    ui.p.alpha = alpha * a;
+                    ui.p.fill_rounded(
+                        Rect::new(ex - 6.0 * (i as f32 + 1.0) - 1.2, ty + 2.0, 2.4, box_h - 4.0),
+                        1.2,
+                        blue,
+                    );
+                }
+                ui.p.alpha = alpha;
+                ui.p.fill_rounded(Rect::new(ex - 1.7, ty, 3.4, box_h), 1.7, lead);
+            }
+        }
+
+        // a rule of beams along the bottom fills as the pen moves
+        ui.p.alpha = alpha * smoothstep(SCAN_HELLO_AT + 0.02, SCAN_HELLO_AT + 0.08, t);
+        ui.ticks(Rect::new(body.x + 40.0, body.bottom() - 20.0, body.w - 80.0, 8.0), frac, blue);
+    }
+    ui.p.alpha = alpha;
+    if t < 0.92 {
+        ui.animate();
+    }
+}
+
+/// The Face ID smiley: two eyes, a hooked nose and a smile, all round-capped strokes.
+fn draw_smiley(ui: &mut Ui, cx: f32, cy: f32, eye_open: f32, color: Color) {
+    let w = 3.6;
+    // eyes (they squash towards their middle when blinking)
+    let (top, bot) = (cy - 19.0, cy - 9.0);
+    let mid = (top + bot) * 0.5;
+    let half = (bot - top) * 0.5 * eye_open.clamp(0.1, 1.0);
+    for x in [cx - 12.0, cx + 12.0] {
+        ui.p.line(x, mid - half, x, mid + half, w, color);
+    }
+    // nose: a stroke that hooks to the left at the bottom
+    let nx = cx + 3.0;
+    ui.p.line(nx, cy - 13.0, nx, cy + 3.0, w, color);
+    ui.p.arc(nx - 5.0, cy + 3.0, 5.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI * 0.62, w, color);
+    // smile
+    ui.p.arc(cx, cy + 2.0, 15.0, std::f32::consts::PI - 1.0, 2.0, w, color);
+}
+
+fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek, left: f32, swap: Option<(f32, &Peek)>) {
     if ui.hovered(body) {
         ui.hot = true;
     }
+    // One look for every peek, taken from the unlock animation: a plain white
+    // icon on the left, a small coloured status badge on the right.
+    if pk.scan {
+        draw_scan(ui, body, pk, 1.0 - left);
+        return;
+    }
     if let Trailing::Level { frac, color, text } = &pk.trailing {
-        // title (+ dim subtitle) on top, a slider-like bar below, value on the right
-        let tx = ir.right() + 12.0;
-        let vs = TextStyle::new(15.0, palette::TEXT).semibold().display().right();
-        let value = text.clone().unwrap_or_else(|| format!("{:.0}", frac.clamp(0.0, 1.0) * 100.0));
-        let vw = ui.p.measure("100", &vs).0.max(ui.p.measure(&value, &vs).0) + 4.0;
-        let ts = TextStyle::new(13.0, palette::TEXT).semibold();
-        let (tw, _) = ui.p.measure(&pk.title, &ts);
-        let col_w = inner.right() - tx;
-        ui.p.text(&pk.title, Rect::new(tx, inner.cy() - 20.0, col_w, 18.0), &ts);
-        if !pk.subtitle.is_empty() && tw + 30.0 < col_w {
-            let sx = tx + tw + 8.0;
-            ui.p.text(
-                &pk.subtitle,
-                Rect::new(sx, inner.cy() - 20.0, inner.right() - sx, 18.0),
-                &TextStyle::new(12.5, palette::TEXT_DIM),
-            );
+        draw_hud(ui, body, pk, *frac, *color, text.as_deref());
+        return;
+    }
+    // text peeks carry a rail of ticks along the bottom that drains while the peek is up
+    let rail = !pk.is_compact();
+    let inner = Rect::new(body.x + 22.0, body.y + 8.0, body.w - 44.0, body.h - 16.0 - if rail { 12.0 } else { 0.0 });
+    if rail {
+        let c = pk.accent.lerp(Color::white(1.0), 0.35);
+        ui.ticks(Rect::new(body.x + 26.0, body.bottom() - 17.0, body.w - 52.0, 6.0), left, c);
+        ui.animate();
+    }
+    match swap {
+        // the next track: the old content drifts up and fades, the new one rises in
+        Some((t, old)) => {
+            let e = t.clamp(0.0, 1.0);
+            let a0 = ui.p.alpha;
+            ui.p.push_clip(body);
+            let out = smoothstep(0.0, 0.5, e);
+            let inn = smoothstep(0.35, 1.0, e);
+            ui.p.alpha = a0 * (1.0 - out);
+            draw_peek_content(ui, inner.translate(0.0, -10.0 * out), old);
+            ui.p.alpha = a0 * inn;
+            draw_peek_content(ui, inner.translate(0.0, 10.0 * (1.0 - inn)), pk);
+            ui.p.alpha = a0;
+            ui.p.pop_clip();
+            ui.animate();
         }
-        let bar = Rect::new(tx, inner.cy() + 6.0, col_w - vw - 10.0, 6.0);
-        ui.progress(bar, *frac, *color);
-        ui.p.text(&value, Rect::new(inner.right() - vw, bar.cy() - 11.0, vw, 22.0), &vs.color(*color));
+        None => draw_peek_content(ui, inner, pk),
+    }
+}
+
+/// Icon or cover, title, subtitle and trailing part of a text peek, inside `inner`.
+fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
+    let is = if pk.is_compact() { 22.0 } else { 26.0 };
+    let ir = Rect::new(inner.x, inner.cy() - is * 0.5, is, is);
+    match &pk.image {
+        Some(img) => ui.p.image(img, ir, 8.0, 1.0),
+        None => ui.p.icon(pk.icon, ir.inset(is * 0.04), Color::white(0.96)),
+    }
+    let badge = false;
+    if pk.is_compact() {
         return;
     }
     let trailing_w = match &pk.trailing {
-        Trailing::None | Trailing::Level { .. } => 0.0,
+        Trailing::None | Trailing::Level { .. } => {
+            if badge {
+                30.0
+            } else {
+                0.0
+            }
+        }
         Trailing::Text(s, _) => ui.p.measure(s, &TextStyle::new(15.0, palette::TEXT).semibold()).0 + 8.0,
         Trailing::Ring(..) => 34.0,
         Trailing::Battery { .. } => 40.0,
@@ -1957,8 +2866,7 @@ fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek) {
         Trailing::Text(s, c) => ui.p.text(s, tr, &TextStyle::new(15.0, *c).semibold().display().right()),
         Trailing::Ring(f, c) => {
             let (cx, cy) = (tr.right() - 14.0, tr.cy());
-            ui.p.stroke_circle(cx, cy, 11.0, 3.0, Color::white(0.18));
-            ui.p.arc(cx, cy, 11.0, 0.0, std::f32::consts::TAU * f.clamp(0.0, 1.0), 3.0, *c);
+            ui.ring(cx, cy, 24.0, 3.0, *f, *c);
         }
         Trailing::Battery { level, charging } => {
             let r = Rect::new(tr.right() - 36.0, tr.cy() - 8.0, 36.0, 16.0);
@@ -1975,50 +2883,153 @@ fn draw_expanded(
     started: &[bool],
     tabs: &[(ModuleId, Icon, String)],
     page: ModuleId,
+    trans: Option<(ModuleId, f32, f32)>,
     indicators: &[Indicator],
+    snaps: Option<(&Snapshot, &Snapshot)>,
 ) {
-    // header: tabs on the left, status on the right
-    let hy = full.y + 7.0;
-    let ts = 30.0;
+    // header: tabs on the left, status and the settings gear on the right
+    let ts = 32.0;
+    let hy = full.y + (HEADER_H - ts) * 0.5 - 2.0;
     let mut x = full.x + PAD;
-    // many tabs: shrink them so the header never overflows into the status icons
-    let avail = full.w - 2.0 * PAD - 130.0;
-    let tab = ((avail + 4.0) / tabs.len().max(1) as f32 - 4.0).clamp(20.0, ts);
+    // bare icons; the open tab is bright with a short lit beam under it
+    let tab_style = |selected: bool| ButtonStyle {
+        fg: if selected { Color::white(1.0) } else { Color::white(0.50) },
+        bg: Color::white(0.0),
+        hover_bg: Color::white(0.0),
+        radius: 999.0,
+        icon_scale: 0.54,
+    };
+    let avail = full.w - 2.0 * PAD - 200.0;
+    let tab = ((avail + 4.0) / tabs.len().max(1) as f32 - 4.0).clamp(22.0, ts);
     for (id, icon, _title) in tabs {
+        let sel = *id == page;
         let r = Rect::new(x, hy + (ts - tab) * 0.5, tab, tab);
-        let selected = *id == page;
-        let style = ButtonStyle {
-            fg: if selected { palette::TEXT } else { palette::TEXT_DIM },
-            bg: if selected { Color::white(0.13) } else { Color::white(0.0) },
-            hover_bg: if selected { Color::white(0.16) } else { Color::white(0.08) },
-            radius: 10.0,
-            icon_scale: 0.52,
-        };
-        if ui.icon_button(r, *icon, style) {
+        x += tab + 4.0;
+        let hover = ui.hovered(r);
+        if hover {
+            ui.hot = true;
+        }
+        let lit = ui.glide(gkey(id, 11), if sel { 1.0 } else { 0.0 });
+        let fg = Color::white(if hover { 0.85 } else { 0.50 }).lerp(Color::white(1.0), lit);
+        ui.p.icon(*icon, r.center_square(ts * 0.52), fg);
+        if lit > 0.02 {
+            let bw = tab * 0.62 * lit;
+            ui.ticks(Rect::new(r.cx() - bw * 0.5, hy + ts + 1.0, bw, 3.0), 1.0, Color::white(0.9 * lit));
+        }
+        if !sel && ui.clicked(r) {
             ui.fx.open_page = Some(id);
         }
-        x += tab + 4.0;
     }
-    // status (right)
+    // scroll the wheel over the header to flip through the tabs
+    let wheel = ui.wheel(Rect::new(full.x, full.y, full.w, HEADER_H));
+    if wheel != 0.0 && !tabs.is_empty() {
+        let ready = WHEEL_FLIP.with(|c| c.get().is_none_or(|t| t.elapsed() > Duration::from_millis(450)));
+        if ready {
+            let cur = tabs.iter().position(|t| t.0 == page);
+            let next = match cur {
+                Some(i) if wheel < 0.0 => (i + 1).min(tabs.len() - 1),
+                Some(i) => i.saturating_sub(1),
+                // e.g. on the settings page: jump back into the tabs
+                None => 0,
+            };
+            if cur != Some(next) {
+                ui.fx.open_page = Some(tabs[next].0);
+            }
+            WHEEL_FLIP.with(|c| c.set(Some(Instant::now())));
+        }
+    }
+    // status (right): the settings gear sits at the far end, next to the battery
     let mut rx = full.right() - PAD;
+    if modules.iter().enumerate().any(|(i, m)| started[i] && m.id() == "settings") {
+        let g = Rect::new(rx - ts, hy, ts, ts);
+        if ui.icon_button(g, Icon::Settings, tab_style(page == "settings")) {
+            ui.fx.open_page = Some("settings");
+        }
+        if page == "settings" {
+            ui.ticks(Rect::new(g.cx() - ts * 0.31, hy + ts + 1.0, ts * 0.62, 3.0), 1.0, Color::white(0.9));
+        }
+        rx = g.x - 12.0;
+    }
     for ind in indicators.iter().rev() {
         if let Some((level, charging)) = ind.battery {
-            let label = format!("{:.0}%", level * 100.0);
+            let pct = format!("{:.0}%", level * 100.0);
             let st = TextStyle::new(12.5, palette::TEXT_DIM).medium().right();
-            let (tw, _) = ui.p.measure(&label, &st);
+            let (pw, _) = ui.p.measure(&pct, &st);
             let br = Rect::new(rx - 30.0, hy + ts * 0.5 - 7.0, 30.0, 14.0);
             icons::battery(ui.p, br, level, charging, battery_color(level, charging));
-            ui.p.text(&label, Rect::new(br.x - tw - 6.0, hy, tw + 2.0, ts), &st);
-            rx = br.x - tw - 16.0;
+            let mut tx = br.x - 8.0;
+            // time left (or an infinity sign while plugged in), always in blue
+            if let Some(extra) = &ind.label {
+                let blue = palette::BLUE;
+                if extra == "\u{221E}" {
+                    let (cx, cy, a) = (tx - 11.0, hy + ts * 0.5, 9.0);
+                    let pt = |t: f32| {
+                        let d = 1.0 + t.sin() * t.sin();
+                        (cx + a * t.cos() / d, cy + a * t.sin() * t.cos() / d)
+                    };
+                    let n = 28;
+                    for k in 0..n {
+                        let t0 = k as f32 / n as f32 * std::f32::consts::TAU;
+                        let t1 = (k + 1) as f32 / n as f32 * std::f32::consts::TAU;
+                        let (x0, y0) = pt(t0);
+                        let (x1, y1) = pt(t1);
+                        ui.p.line(x0, y0, x1, y1, 1.9, blue);
+                    }
+                    tx -= 28.0;
+                } else {
+                    let es = TextStyle::new(12.5, blue).medium().right();
+                    let (ew, _) = ui.p.measure(extra, &es);
+                    ui.p.text(extra, Rect::new(tx - ew - 2.0, hy, ew + 2.0, ts), &es);
+                    tx -= ew + 12.0;
+                }
+            }
+            ui.p.text(&pct, Rect::new(tx - pw - 2.0, hy, pw + 2.0, ts), &st);
+            rx = tx - pw - 14.0;
         } else if let Some(icon) = ind.icon {
-            let r = Rect::new(rx - 22.0, hy + 4.0, 22.0, 22.0);
-            ui.p.fill_rounded(r, 11.0, ind.color.with_a(0.18));
-            ui.p.icon(icon, r.inset(4.5), ind.color);
+            let r = Rect::new(rx - 22.0, hy + (ts - 22.0) * 0.5, 22.0, 22.0);
+            ui.p.icon(icon, r.inset(3.0), ind.color);
             rx -= 28.0;
         }
     }
 
     let content = Rect::new(full.x + PAD, full.y + HEADER_H, full.w - 2.0 * PAD, full.h - HEADER_H - BOTTOM_PAD);
+    let Some((from, dir, t)) = trans else {
+        draw_body(ui, content, modules, started, page);
+        return;
+    };
+    // One page is drawn at a time: the old one slides a little and fades out, then the new one
+    // slides in and fades up. (Drawing both at once doubled the work for no visible gain.)
+    const SLIDE: f32 = 16.0;
+    const SPLIT: f32 = 0.45;
+    let base = ui.p.alpha;
+    let was_interactive = ui.interactive;
+    let clip = Rect::new(full.x, content.y - 4.0, full.w, content.h + 8.0);
+    ui.p.push_clip(clip);
+    if t < SPLIT {
+        let u = t / SPLIT;
+        ui.p.alpha = base * (1.0 - smoothstep(0.0, 1.0, u));
+        ui.interactive = false;
+        let dx = (-dir * SLIDE * smoothstep(0.0, 1.0, u)).round();
+        match snaps {
+            Some((old, _)) => ui.p.snapshot(old, dx, 0.0, 1.0),
+            None => draw_body(ui, content.translate(dx, 0.0), modules, started, from),
+        }
+    } else {
+        let u = (t - SPLIT) / (1.0 - SPLIT);
+        ui.p.alpha = base * smoothstep(0.0, 0.8, u);
+        ui.interactive = was_interactive && u > 0.6;
+        let dx = (dir * SLIDE * (1.0 - smoothstep(0.0, 1.0, u))).round();
+        match snaps {
+            Some((_, new)) => ui.p.snapshot(new, dx, 0.0, 1.0),
+            None => draw_body(ui, content.translate(dx, 0.0), modules, started, page),
+        }
+    }
+    ui.p.alpha = base;
+    ui.interactive = was_interactive;
+    ui.p.pop_clip();
+}
+
+fn draw_body(ui: &mut Ui, content: Rect, modules: &mut [Box<dyn Module>], started: &[bool], page: ModuleId) {
     if page == HOME {
         draw_home(ui, content, modules, started);
     } else if let Some(i) = modules.iter().position(|m| m.id() == page) {
@@ -2026,107 +3037,267 @@ fn draw_expanded(
     }
 }
 
-/// One slot in the right-hand column of the home page.
-#[derive(Clone, Copy)]
-enum Tile {
-    Module(usize),
-    Clock,
-}
-
-/// The widgets to show on the home page: the ones chosen in `[home] widgets`
-/// (Settings → Home) that are available right now, at most `HOME_TILES`.
-/// An empty list keeps the old behaviour: the first modules with a small card.
-fn home_tiles(modules: &[Box<dyn Module>], started: &[bool], cfg: &Config) -> Vec<Tile> {
+/// The widgets to show in the right-hand column of the home page: the ones
+/// chosen in `[home] widgets` (Settings → Home) that are available right now,
+/// at most `HOME_TILES`. An empty list keeps the old behaviour: the first
+/// modules with a small card. The clock is not a choice any more: it always
+/// lives on the left.
+fn home_tiles(modules: &[Box<dyn Module>], started: &[bool], cfg: &Config) -> Vec<usize> {
     let small = |i: usize| started[i] && modules[i].card() == Some(CardSize::Small);
     if cfg.home.widgets.is_empty() {
-        return (0..modules.len()).filter(|&i| small(i)).take(HOME_TILES).map(Tile::Module).collect();
+        return (0..modules.len()).filter(|&i| small(i)).take(HOME_TILES).collect();
     }
     let mut out = Vec::new();
     for id in &cfg.home.widgets {
         if out.len() >= HOME_TILES {
             break;
         }
-        if id == "clock" {
-            out.push(Tile::Clock);
-        } else if let Some(i) = modules.iter().position(|m| m.id() == id.as_str()) {
-            if small(i) {
-                out.push(Tile::Module(i));
+        // Wi-Fi and Bluetooth are one module now; older configs still say "wifi" / "bluetooth"
+        let id = if matches!(id.as_str(), "wifi" | "bluetooth") { "control" } else { id.as_str() };
+        if let Some(i) = modules.iter().position(|m| m.id() == id) {
+            if small(i) && !out.contains(&i) {
+                out.push(i);
             }
         }
     }
     out
 }
 
+/// Where the small round Mirror button sits on the home page's clock card.
 fn draw_home(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], started: &[bool]) {
     let large = (0..modules.len()).find(|&i| started[i] && modules[i].card() == Some(CardSize::Large));
     let tiles = home_tiles(modules, started, ui.cfg);
-    let (left, right) = if tiles.is_empty() { (r, Rect::default()) } else { r.split_left((r.w * 0.58).round(), 12.0) };
+    let (left, right) = if tiles.is_empty() { (r, Rect::default()) } else { r.split_left((r.w * 0.56).round(), 16.0) };
+    // flat columns on black, separated by hairlines
+    let line = Color::white(0.09);
     match large {
-        Some(i) => modules[i].draw_card(ui, left),
+        // something is playing: the player on top, the clock in its own strip below
+        Some(i) => {
+            let (media, clock) = left.split_top((left.h - CLOCK_STRIP_H - 10.0).max(60.0), 10.0);
+            modules[i].draw_card(ui, media);
+            ui.p.fill_rect(Rect::new(left.x + 6.0, clock.y - 5.0, left.w - 12.0, 1.0), line);
+            draw_clock_strip(ui, clock);
+        }
         None => draw_clock_card(ui, left),
     }
     if !tiles.is_empty() {
+        ui.p.fill_rect(Rect::new(left.right() + 8.0, r.y + 6.0, 1.0, r.h - 12.0), line);
         let n = tiles.len() as f32;
-        let gap = 8.0;
+        let gap = 10.0;
         let ch = (right.h - gap * (n - 1.0)) / n;
-        for (k, tile) in tiles.iter().enumerate() {
+        for (k, &i) in tiles.iter().enumerate() {
             let cr = Rect::new(right.x, right.y + k as f32 * (ch + gap), right.w, ch);
-            match *tile {
-                Tile::Module(i) => modules[i].draw_card(ui, cr),
-                Tile::Clock => draw_clock_tile(ui, cr),
+            modules[i].draw_card(ui, cr);
+            if k > 0 {
+                ui.p.fill_rect(Rect::new(right.x + 6.0, cr.y - gap * 0.5, right.w - 12.0, 1.0), line.alpha(0.8));
             }
         }
     }
 }
 
-/// Compact clock for the right-hand column: "10:42   Fri 10/23/2026".
-fn draw_clock_tile(ui: &mut Ui, r: Rect) {
-    ui.card(r, false);
+/// Local time pieces for the flip clock: (hour, minute, second, "AM"/"PM" or "", date text).
+fn clock_parts() -> (u8, u8, u8, String, String) {
     let st = unsafe { GetLocalTime() };
-    let mut tbuf = [0u16; 64];
-    let mut dbuf = [0u16; 128];
-    let tn = unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS, Some(&st), PCWSTR::null(), Some(&mut tbuf)) };
-    let dn = unsafe {
-        GetDateFormatEx(PCWSTR::null(), DATE_SHORTDATE, Some(&st), PCWSTR::null(), Some(&mut dbuf), PCWSTR::null())
+    // the formatted time and the date text only change when the minute does: work them out once per minute
+    thread_local! {
+        static FMT: std::cell::RefCell<Option<((u16, u16, u16), String, String)>> = const { std::cell::RefCell::new(None) };
+    }
+    let key = (st.wDay, st.wHour, st.wMinute);
+    let cached = FMT.with(|c| c.borrow().as_ref().filter(|e| e.0 == key).map(|e| (e.1.clone(), e.2.clone())));
+    let (suffix, date) = match cached {
+        Some(v) => v,
+        None => {
+            let mut tbuf = [0u16; 64];
+            let tn =
+                unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS, Some(&st), PCWSTR::null(), Some(&mut tbuf)) };
+            let time = String::from_utf16_lossy(&tbuf[..(tn.max(1) - 1) as usize]);
+            // "Friday 26th": the day of the week and the date, without the month
+            let day = st.wDay;
+            let ord = match (day % 10, day % 100) {
+                (_, 11..=13) => "th",
+                (1, _) => "st",
+                (2, _) => "nd",
+                (3, _) => "rd",
+                _ => "th",
+            };
+            let weekday = crate::util::WEEKDAY_NAMES[(st.wDayOfWeek as usize).min(6)];
+            let date = format!("{weekday} {day}{ord}");
+            // a letter in the formatted time means a 12 hour clock (AM / PM)
+            let suffix: String = time.chars().filter(|c| c.is_alphabetic()).collect();
+            FMT.with(|c| *c.borrow_mut() = Some((key, suffix.clone(), date.clone())));
+            (suffix, date)
+        }
     };
-    let time = String::from_utf16_lossy(&tbuf[..(tn.max(1) - 1) as usize]);
-    let date = String::from_utf16_lossy(&dbuf[..(dn.max(1) - 1) as usize]);
-    let inner = r.inset_xy(12.0, 0.0);
-    let ts = TextStyle::new(14.0, palette::TEXT).semibold().display();
-    let (tw, _) = ui.p.measure(&time, &ts);
-    ui.p.text(&time, Rect::new(inner.x, r.y, tw + 4.0, r.h), &ts);
+    let h = if suffix.is_empty() {
+        st.wHour as u8
+    } else {
+        match st.wHour % 12 {
+            0 => 12,
+            h => h as u8,
+        }
+    };
+    (h, st.wMinute as u8, st.wSecond as u8, suffix, date)
+}
+
+/// Flip clock under the media player: digits on the left, date on the right.
+fn draw_clock_strip(ui: &mut Ui, r: Rect) {
+    ui.card(r, false);
+    let (h, m, s, suffix, date) = clock_parts();
+    let inner = r.inset_xy(14.0, 0.0);
+    let th = (r.h - 14.0).clamp(24.0, 40.0);
+    let tw = th * 0.72;
+    let used = ui.clock(inner.x, r.cy() - th * 0.5, tw, th, h, m, s, 100);
+    let text = if suffix.is_empty() { date } else { format!("{suffix} · {date}") };
     ui.p.text(
-        &date,
-        Rect::new(inner.x + tw + 12.0, r.y, (inner.w - tw - 12.0).max(0.0), r.h),
-        &TextStyle::new(12.0, palette::TEXT_DIM),
+        &text,
+        Rect::new(inner.x + used + 12.0, r.y, (inner.w - used - 12.0).max(0.0), r.h),
+        &TextStyle::new(12.0, palette::TEXT_DIM).right(),
     );
 }
 
 fn draw_clock_card(ui: &mut Ui, r: Rect) {
     ui.card(r, false);
-    let st = unsafe { GetLocalTime() };
-    let mut tbuf = [0u16; 64];
-    let mut dbuf = [0u16; 128];
-    let tn = unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS, Some(&st), PCWSTR::null(), Some(&mut tbuf)) };
-    let dn = unsafe {
-        GetDateFormatEx(PCWSTR::null(), DATE_LONGDATE, Some(&st), PCWSTR::null(), Some(&mut dbuf), PCWSTR::null())
-    };
-    let time = String::from_utf16_lossy(&tbuf[..(tn.max(1) - 1) as usize]);
-    let date = String::from_utf16_lossy(&dbuf[..(dn.max(1) - 1) as usize]);
+    let (h, m, s, suffix, _date) = clock_parts();
     let inner = r.inset_xy(18.0, 14.0);
+    // size the tiles so six digits and the gaps fill the card (but never get huge)
+    let tw = ((inner.w - 24.0) / 6.6).clamp(26.0, 50.0);
+    let th = (tw * 1.28).min(inner.h - 62.0).max(34.0);
+    let used = ui.clock(inner.x, inner.y, tw, th, h, m, s, 0);
+    if !suffix.is_empty() {
+        ui.p.text(
+            &suffix,
+            Rect::new(inner.x + used + 8.0, inner.y + th - 20.0, 40.0, 20.0),
+            &TextStyle::new(12.0, palette::TEXT_DIM),
+        );
+    }
+    // the calendar strip sits under the time
+    let top = inner.y + th + 10.0;
+    let strip = Rect::new(inner.x, top, inner.w, (inner.bottom() - top).clamp(30.0, 48.0));
+    draw_calendar(ui, strip);
+}
+
+thread_local! {
+    /// Days the calendar strip is moved from today (0 = today is selected).
+    static CAL_OFF: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAY_LETTER: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
+const DAY_SHORT: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// Days since 1970-01-01 for a calendar date (proleptic Gregorian).
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = (if m <= 2 { y - 1 } else { y }) as i64;
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The calendar date (year, month 1..=12, day) for a day count since 1970-01-01.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    ((y + i64::from(m <= 2)) as i32, m, d)
+}
+
+/// 0 = Sunday for a day count since 1970-01-01 (a Thursday).
+fn weekday_of(z: i64) -> usize {
+    (z + 4).rem_euclid(7) as usize
+}
+
+/// A week strip: the month on the left, then days that scroll with the mouse wheel (or a click).
+/// The chosen day is blue with a lit beam under it that glides along a rail of beams.
+fn draw_calendar(ui: &mut Ui, area: Rect) {
+    let st = unsafe { GetLocalTime() };
+    let today = days_from_civil(st.wYear as i32, st.wMonth as u32, st.wDay as u32);
+    let mut off = CAL_OFF.with(|c| c.get());
+
+    // wheel over the strip moves through the days (down = later)
+    if ui.hovered(area) {
+        let wheel = ui.input.wheel;
+        if wheel.abs() > 0.01 {
+            let step = (wheel.abs().round() as i32).max(1);
+            off += if wheel < 0.0 { step } else { -step };
+        }
+    }
+
+    let month_w = 54.0;
+    let days = Rect::new(area.x + month_w, area.y, (area.w - month_w).max(60.0), area.h);
+    let cw = days.w / 6.0;
+    let blue = Color::hex(0x3D95FF);
+
+    // the month of the chosen day; a click on it jumps back to today
+    let (_, month, _) = civil_from_days(today + off as i64);
+    let label = Rect::new(area.x, area.y, month_w, area.h);
     ui.p.text(
-        &time,
-        Rect::new(inner.x, inner.y, inner.w, 50.0),
-        &TextStyle::new(42.0, palette::TEXT).semibold().display(),
+        MONTHS[(month as usize - 1).min(11)],
+        Rect::new(area.x, area.y + 2.0, month_w, 28.0),
+        &TextStyle::new(22.0, Color::white(0.98)).semibold().display(),
     );
-    ui.p.text(&date, Rect::new(inner.x, inner.y + 52.0, inner.w, 20.0), &TextStyle::new(13.0, palette::TEXT_DIM));
-    let hint = Rect::new(inner.x, inner.bottom() - 20.0, inner.w, 20.0);
-    ui.p.icon(Icon::Music, Rect::new(hint.x, hint.y + 2.0, 16.0, 16.0), palette::TEXT_FAINT);
-    ui.p.text(
-        "Nothing playing",
-        Rect::new(hint.x + 22.0, hint.y, hint.w - 22.0, 20.0),
-        &TextStyle::new(12.0, palette::TEXT_FAINT),
-    );
+    if off != 0 {
+        ui.p.text("today", Rect::new(area.x, area.y + 28.0, month_w, 14.0), &TextStyle::new(10.5, palette::TEXT_FAINT));
+        if ui.clicked(label) {
+            off = 0;
+        }
+    }
+
+    let scroll = ui.glide(gkey("cal-scroll", 0), off as f32);
+    let base_alpha = ui.p.alpha;
+    ui.p.push_clip(days);
+    let first = scroll.floor() as i32 - 3;
+    for k in 0..=10 {
+        let d = first + k;
+        let idx = 2.0 + (d as f32 - scroll);
+        // fade out at both ends of the strip
+        let fade = (idx + 1.0).clamp(0.0, 1.0) * (6.0 - idx).clamp(0.0, 1.0);
+        if fade <= 0.01 {
+            continue;
+        }
+        let cell = Rect::new(days.x + idx * cw, area.y, cw, area.h - 8.0);
+        let z = today + d as i64;
+        let (_, _, dd) = civil_from_days(z);
+        let wd = weekday_of(z);
+        // how close this day is to being the chosen one (smooth while scrolling)
+        let near = (1.0 - (d as f32 - scroll).abs()).clamp(0.0, 1.0);
+        let body = if d < 0 { Color::white(0.50) } else { Color::white(0.90) };
+        let col = body.lerp(blue, near);
+        ui.p.alpha = base_alpha * fade;
+        let name = if near > 0.5 { DAY_SHORT[wd] } else { DAY_LETTER[wd] };
+        ui.p.text(
+            name,
+            Rect::new(cell.x, cell.y + 2.0, cell.w, 12.0),
+            &TextStyle::new(9.5, Color::white(0.50).lerp(blue, near)).medium().center(),
+        );
+        ui.p.text(
+            &dd.to_string(),
+            Rect::new(cell.x, cell.y + 14.0, cell.w, 22.0),
+            &TextStyle::new(16.0, col).semibold().display().center(),
+        );
+        if ui.clicked(cell) {
+            off = d;
+        }
+    }
+    ui.p.alpha = base_alpha;
+    ui.p.pop_clip();
+
+    // a rail of beams under the days; the lit stretch follows the chosen day
+    let rail = Rect::new(days.x, area.bottom() - 5.0, days.w, 4.0);
+    let cx = days.x + (2.5 + (off as f32 - scroll)) * cw;
+    let from = ((cx - cw * 0.34 - days.x) / days.w).clamp(0.0, 1.0);
+    let to = ((cx + cw * 0.34 - days.x) / days.w).clamp(0.0, 1.0);
+    ui.tick_range(rail, from, to, blue);
+
+    CAL_OFF.with(|c| c.set(off.clamp(-3650, 3650)));
 }
 
 // ---------------------------------------------------------------------------
@@ -2292,6 +3463,46 @@ fn leak_page(p: &str) -> ModuleId {
         "voice" => "voice",
         "shelf" => "shelf",
         "ports" => "ports",
+        "mirror" => "mirror",
         _ => HOME,
+    }
+}
+
+/// Drive letter and direction ("in" / "out") of a volume arrival or removal.
+fn usb_event(wp: u32, lp: isize) -> Option<Vec<String>> {
+    const ARRIVAL: u32 = 0x8000;
+    const REMOVED: u32 = 0x8004;
+    if (wp != ARRIVAL && wp != REMOVED) || lp == 0 {
+        return None;
+    }
+    // DEV_BROADCAST_VOLUME { size, device type (2 = volume), reserved, unit mask, flags }
+    let hdr = lp as *const u32;
+    let kind = unsafe { *hdr.add(1) };
+    if kind != 2 {
+        return None;
+    }
+    let mask = unsafe { *hdr.add(3) };
+    if mask == 0 {
+        return None;
+    }
+    let letter = (b'A' + mask.trailing_zeros() as u8) as char;
+    let dir = if wp == ARRIVAL { "in" } else { "out" };
+    Some(vec![format!("{letter}:"), dir.to_string()])
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn dates_round_trip() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        for (y, m, d) in [(2000, 2, 29), (2024, 12, 31), (2026, 10, 26), (1999, 3, 1)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+        // 1970-01-01 was a Thursday, 2026-10-26 is a Monday
+        assert_eq!(weekday_of(0), 4);
+        assert_eq!(weekday_of(days_from_civil(2026, 10, 26)), 1);
     }
 }

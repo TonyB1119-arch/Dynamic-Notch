@@ -23,9 +23,7 @@ use windows::core::{Interface, GUID, HSTRING};
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristicUuids, GattCommunicationStatus, GattServiceUuids,
 };
-use windows::Devices::Bluetooth::{
-    BluetoothCacheMode, BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice,
-};
+use windows::Devices::Bluetooth::{BluetoothCacheMode, BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice};
 use windows::Devices::Enumeration::{
     DeviceInformation, DeviceInformationKind, DeviceInformationUpdate, DevicePairingResultStatus,
     DeviceUnpairingResultStatus, DeviceWatcher,
@@ -33,6 +31,9 @@ use windows::Devices::Enumeration::{
 use windows::Devices::Radios::RadioKind;
 use windows::Foundation::{IReference, TypedEventHandler};
 use windows::Storage::Streams::DataReader;
+use windows::Win32::Devices::Bluetooth::{
+    BluetoothSetServiceState, BLUETOOTH_DEVICE_INFO, BLUETOOTH_SERVICE_DISABLE, BLUETOOTH_SERVICE_ENABLE,
+};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows_collections::{IIterable, IMapView};
 use windows_core::IInspectable;
@@ -45,14 +46,14 @@ use crate::sys::{radio, shell_open};
 use crate::ui::{ButtonStyle, Ui};
 use crate::util::{palette, Color, Rect};
 
-const ID: ModuleId = "bluetooth";
+const ID: ModuleId = "control";
 const IS_CONNECTED: &str = "System.Devices.Aep.IsConnected";
 const CONTAINER: &str = "System.Devices.Aep.ContainerId";
 /// DEVPKEY_Bluetooth_Battery: percentage on the device's PnP nodes.
 const BATTERY: &str = "{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2";
 const SIGNAL: &str = "System.Devices.Aep.SignalStrength";
-const ROW_H: f32 = 34.0;
-const HEADER_H: f32 = 30.0;
+const ROW_H: f32 = 42.0;
+const HEADER_H: f32 = 34.0;
 const LIST_H: f32 = 5.0 * ROW_H;
 const RESCAN_AFTER: Duration = Duration::from_secs(45);
 /// Battery arrives late on many headsets: retry after these delays (ms).
@@ -131,6 +132,7 @@ enum Ctl {
     Scan,
     Pair(String),
     Connect(String),
+    Disconnect(String),
     Remove(String),
     Radio(bool),
     Quit,
@@ -163,6 +165,11 @@ pub struct Bluetooth {
 }
 
 impl Bluetooth {
+    /// Is this message one of ours? (The control center routes by type.)
+    pub(super) fn accepts(msg: &Box<dyn Any + Send>) -> bool {
+        msg.is::<BtMsg>()
+    }
+
     pub fn new() -> Self {
         Self {
             tx: None,
@@ -245,6 +252,20 @@ impl Module for Bluetooth {
         self.found.clear();
     }
 
+    fn glance(&self) -> Option<(Icon, String)> {
+        let mut names: Vec<&Device> = self.devices.values().collect();
+        names.sort_by(|a, b| a.name.cmp(&b.name));
+        let text = match (names.first(), self.radio_on) {
+            (Some(d), _) => match d.battery {
+                Some(b) => format!("{b}%"),
+                None => crate::util::truncate_chars(&d.name, 9),
+            },
+            (None, Some(false)) => "Off".to_string(),
+            (None, _) => "—".to_string(),
+        };
+        Some((Icon::Bluetooth, text))
+    }
+
     fn card(&self) -> Option<CardSize> {
         Some(CardSize::Small)
     }
@@ -265,12 +286,12 @@ impl Module for Bluetooth {
             (None, Some(false)) => (Icon::Bluetooth, "Bluetooth is off".to_string(), palette::TEXT_DIM),
             (None, _) => (Icon::Bluetooth, "No devices connected".to_string(), palette::TEXT_DIM),
         };
-        ui.p.icon(icon, Rect::new(inner.x, r.cy() - 9.0, 18.0, 18.0), if names.is_empty() { palette::TEXT_FAINT } else { palette::BLUE });
-        ui.p.text(
-            &text,
-            Rect::new(inner.x + 26.0, r.y, inner.w - 26.0, r.h),
-            &TextStyle::new(12.0, col).medium(),
+        ui.p.icon(
+            icon,
+            Rect::new(inner.x, r.cy() - 9.0, 18.0, 18.0),
+            if names.is_empty() { palette::TEXT_FAINT } else { palette::BLUE },
         );
+        ui.p.text(&text, Rect::new(inner.x + 26.0, r.y, inner.w - 26.0, r.h), &TextStyle::new(12.0, col).medium());
     }
 
     fn has_page(&self) -> bool {
@@ -278,12 +299,11 @@ impl Module for Bluetooth {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        HEADER_H + 8.0 + LIST_H
+        HEADER_H + 12.0 + LIST_H
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
-        if self.last_scan.is_none_or(|t| t.elapsed() > RESCAN_AFTER) && !self.scanning && self.radio_on != Some(false)
-        {
+        if self.last_scan.is_none_or(|t| t.elapsed() > RESCAN_AFTER) && !self.scanning && self.radio_on != Some(false) {
             self.scan();
         }
         let accent = palette::BLUE;
@@ -314,7 +334,8 @@ impl Module for Bluetooth {
         );
         if hint_w > 0.0 {
             let b = Rect::new(rb.x - hint_w - 6.0, head.y + 3.0, hint_w, 24.0);
-            if ui.pill_button(b, "Windows settings", None, ButtonStyle::filled(Color::white(0.1)).fg(palette::TEXT_DIM)) {
+            if ui.pill_button(b, "Windows settings", None, ButtonStyle::filled(Color::white(0.1)).fg(palette::TEXT_DIM))
+            {
                 shell_open("ms-settings:bluetooth");
             }
         }
@@ -335,8 +356,18 @@ impl Module for Bluetooth {
             }
         }
 
+        // tick strip under the header: sweeps while scanning or connecting, otherwise how many of the listed devices are connected
+        let strip = Rect::new(r.x + 2.0, head.bottom() + 2.0, r.w - 4.0, 7.0);
+        if self.scanning || self.busy.is_some() {
+            ui.ticks_sweep(strip, Color::white(0.9));
+        } else {
+            let live =
+                self.found.iter().filter(|f| f.connected || self.devices.values().any(|d| d.name == f.name)).count();
+            ui.ticks(strip, live as f32 / self.found.len().max(1) as f32, Color::white(0.9));
+        }
+
         // --- list -------------------------------------------------------------
-        let area = Rect::new(r.x, head.bottom() + 8.0, r.w, LIST_H);
+        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, LIST_H);
         if let Some(p) = self.problem.clone() {
             ui.empty_state(area, Icon::Bluetooth, &p);
         } else if self.radio_on == Some(false) {
@@ -353,19 +384,24 @@ impl Module for Bluetooth {
             ui.p.push_clip(area);
             let mut action: Option<Ctl> = None;
             for (i, f) in self.found.iter().enumerate() {
-                let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 4.0);
+                let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 6.0);
                 if row.bottom() < area.y || row.y > area.bottom() {
                     continue;
                 }
                 let live = f.connected || self.devices.values().any(|d| d.name == f.name);
-                ui.p.fill_rounded(row, 12.0, if live { accent.with_a(0.16) } else { palette::CARD });
-                ui.p.icon(f.kind.icon(), Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0), if live { accent } else { palette::TEXT_DIM });
+                let rh = ui.hovered(row);
+                ui.row_bg(row, rh, None);
+                ui.p.icon(
+                    f.kind.icon(),
+                    Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0),
+                    if live { accent } else { palette::TEXT_DIM },
+                );
                 let btn = Rect::new(row.right() - 100.0, row.cy() - 12.0, 90.0, 24.0);
                 let trash = Rect::new(btn.x - 28.0, row.cy() - 12.0, 24.0, 24.0);
                 let text_w = (if f.paired { trash.x } else { btn.x }) - row.x - 46.0;
                 ui.p.text(
                     &f.name,
-                    Rect::new(row.x + 38.0, row.y + 2.0, text_w, 16.0),
+                    Rect::new(row.x + 38.0, row.y + 4.0, text_w, 16.0),
                     &TextStyle::new(13.0, palette::TEXT).medium(),
                 );
                 let sub = if live {
@@ -380,33 +416,58 @@ impl Module for Bluetooth {
                 };
                 ui.p.text(
                     &sub,
-                    Rect::new(row.x + 38.0, row.y + 17.0, text_w, 12.0),
+                    Rect::new(row.x + 38.0, row.y + 20.0, text_w, 12.0),
                     &TextStyle::new(10.5, if live { palette::GREEN } else { palette::TEXT_FAINT }),
                 );
+                if live {
+                    if let Some(b) = self.battery_of(&f.name) {
+                        let sw = ui.p.measure(&sub, &TextStyle::new(10.5, palette::GREEN)).0;
+                        let gx = row.x + 38.0 + sw + 8.0;
+                        if gx + 44.0 < row.x + 38.0 + text_w {
+                            ui.ticks(Rect::new(gx, row.y + 21.0, 44.0, 9.0), b as f32 / 100.0, palette::GREEN);
+                        }
+                    }
+                }
                 let busy_here = self.busy.as_deref() == Some(f.id.as_str());
                 if busy_here {
                     ui.progress_indeterminate(Rect::new(btn.x + 10.0, btn.cy() - 1.5, btn.w - 20.0, 3.0), accent);
-                } else if live {
+                } else {
+                    // no buttons: the row is the control and shows its action as a quiet word on hover
+                    let word = match (live, f.paired, rh) {
+                        (true, _, true) => "Disconnect",
+                        (false, true, true) => "Connect",
+                        (false, false, true) => "Pair",
+                        _ => "",
+                    };
                     ui.p.text(
-                        "Connected",
-                        btn,
-                        &TextStyle::new(11.5, palette::GREEN).medium().center(),
+                        word,
+                        Rect::new(row.right() - 110.0, row.y, 98.0, row.h),
+                        &TextStyle::new(12.0, palette::TEXT_DIM).medium().right(),
                     );
-                } else if f.paired {
-                    if ui.pill_button(btn, "Connect", None, ButtonStyle::filled(accent.with_a(0.8)).fg(Color::white(1.0))) {
-                        action = Some(Ctl::Connect(f.id.clone()));
+                    let remove = f.paired
+                        && rh
+                        && ui.icon_button(
+                            trash,
+                            Icon::Trash,
+                            ButtonStyle::default().scale(0.55).fg(palette::TEXT_FAINT),
+                        );
+                    if remove {
+                        action = Some(Ctl::Remove(f.id.clone()));
+                    } else if ui.clicked(row) {
+                        action = Some(if live {
+                            Ctl::Disconnect(f.id.clone())
+                        } else if f.paired {
+                            Ctl::Connect(f.id.clone())
+                        } else {
+                            Ctl::Pair(f.id.clone())
+                        });
                     }
-                } else if ui.pill_button(btn, "Pair", None, ButtonStyle::filled(accent.with_a(0.8)).fg(Color::white(1.0))) {
-                    action = Some(Ctl::Pair(f.id.clone()));
-                }
-                if f.paired && !busy_here && ui.icon_button(trash, Icon::Trash, ButtonStyle::default().scale(0.55).fg(palette::TEXT_FAINT)) {
-                    action = Some(Ctl::Remove(f.id.clone()));
                 }
             }
             ui.p.pop_clip();
             if let Some(a) = action {
                 self.busy = match &a {
-                    Ctl::Pair(id) | Ctl::Connect(id) | Ctl::Remove(id) => Some(id.clone()),
+                    Ctl::Pair(id) | Ctl::Connect(id) | Ctl::Disconnect(id) | Ctl::Remove(id) => Some(id.clone()),
                     _ => None,
                 };
                 self.settings_hint = false;
@@ -845,6 +906,10 @@ fn page_worker(rx: Receiver<Ctl>, bus: Bus) {
                 let (ok, text) = connect_paired(&id);
                 bus.to_module(ID, BtMsg::ActionDone { ok, text, settings_hint: !ok });
             }
+            Ctl::Disconnect(id) => {
+                let (ok, text) = disconnect(&id);
+                bus.to_module(ID, BtMsg::ActionDone { ok, text, settings_hint: !ok });
+            }
             Ctl::Remove(id) => {
                 let (ok, text) = remove(&id);
                 bus.to_module(ID, BtMsg::ActionDone { ok, text, settings_hint: false });
@@ -973,6 +1038,63 @@ fn connect_paired(id: &str) -> (bool, String) {
         Ok(true) => (true, "Connected".to_string()),
         Ok(false) => (false, "Windows didn't connect it from here".to_string()),
         Err(e) => (false, e),
+    }
+}
+
+/// Profiles switched off and on again to drop a connection. Keyboards and mice
+/// (HID) are left alone on purpose: if the switch back on failed they would be dead.
+const PROFILES: [GUID; 5] = [
+    GUID::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb), // A2DP sink (headphones, speakers)
+    GUID::from_u128(0x0000110a_0000_1000_8000_00805f9b34fb), // A2DP source
+    GUID::from_u128(0x0000111e_0000_1000_8000_00805f9b34fb), // Hands-Free
+    GUID::from_u128(0x00001108_0000_1000_8000_00805f9b34fb), // Headset
+    GUID::from_u128(0x0000110e_0000_1000_8000_00805f9b34fb), // AVRCP remote control
+];
+
+/// Drop the connection but keep the device paired. Windows has no WinRT call
+/// for this, so the device's audio profiles are switched off and back on
+/// through the classic Bluetooth API. Works for headphones, speakers and
+/// similar; low-energy devices, keyboards and mice are left to Windows settings.
+fn disconnect(id: &str) -> (bool, String) {
+    if id.starts_with("BluetoothLE#") {
+        return (false, "Low-energy devices can only be disconnected in Windows settings".to_string());
+    }
+    let dev = match BluetoothDevice::FromIdAsync(&HSTRING::from(id)).and_then(|op| op.join()) {
+        Ok(d) => d,
+        Err(e) => return (false, es(e)),
+    };
+    let Ok(addr) = dev.BluetoothAddress() else {
+        return (false, "Couldn't read the device address".to_string());
+    };
+    let up = |d: &BluetoothDevice| d.ConnectionStatus().is_ok_and(|s| s == BluetoothConnectionStatus::Connected);
+    if !up(&dev) {
+        let _ = dev.Close();
+        return (true, "Already disconnected".to_string());
+    }
+    // SAFETY: plain C struct, size set as the API requires; `info` outlives the calls.
+    let mut info: BLUETOOTH_DEVICE_INFO = unsafe { std::mem::zeroed() };
+    info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+    info.Address.Anonymous.ullLong = addr;
+    for g in PROFILES.iter() {
+        unsafe { BluetoothSetServiceState(None, &info, g, BLUETOOTH_SERVICE_DISABLE) };
+    }
+    // wait for the link to drop, then give the profiles back
+    for _ in 0..10 {
+        if !up(&dev) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    for g in PROFILES.iter() {
+        unsafe { BluetoothSetServiceState(None, &info, g, BLUETOOTH_SERVICE_ENABLE) };
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let still = up(&dev);
+    let _ = dev.Close();
+    if still {
+        (false, "Windows kept (or restored) the connection".to_string())
+    } else {
+        (true, "Disconnected. Still paired.".to_string())
     }
 }
 

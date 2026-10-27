@@ -16,22 +16,32 @@ use crate::ui::{ButtonStyle, Ui};
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 6] = ["General", "Look", "Home", "Modules", "Weather", "Gemini"];
-const ROW_H: f32 = 32.0;
-const ROW_GAP: f32 = 3.0;
-const TAB_H: f32 = 28.0;
-const FOOT_H: f32 = 18.0;
+const TABS: [&str; 8] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs"];
+const ROW_H: f32 = 36.0;
+const ROW_GAP: f32 = 4.0;
+const TAB_H: f32 = 32.0;
+const FOOT_H: f32 = 22.0;
 const MAX_HOME: usize = 4;
+const MAX_NOTCH: usize = 3;
 
-/// Widgets that can be placed on the home page: (config id, label).
-const HOME_CHOICES: [(&str, &str); 11] = [
+/// Widgets that can sit on the closed notch: (config id, label).
+const NOTCH_CHOICES: [(&str, &str); 7] = [
+    ("clock", "Clock"),
+    ("date", "Date"),
+    ("battery", "Battery"),
     ("weather", "Weather"),
-    ("stats", "System stats"),
-    ("timer", "Timer"),
     ("wifi", "Wi-Fi"),
     ("bluetooth", "Bluetooth"),
     ("notes", "Notes"),
-    ("clock", "Clock"),
+];
+
+/// Widgets that can be placed on the home page: (config id, label).
+const HOME_CHOICES: [(&str, &str); 9] = [
+    ("weather", "Weather"),
+    ("stats", "System stats"),
+    ("timer", "Timer"),
+    ("control", "Wi-Fi & Bluetooth"),
+    ("notes", "Notes"),
     ("clipboard", "Clipboard"),
     ("downloads", "Downloads"),
     ("shelf", "Shelf"),
@@ -39,7 +49,7 @@ const HOME_CHOICES: [(&str, &str); 11] = [
 ];
 
 /// Modules that can be switched on and off: (config id, label).
-const MODULE_CHOICES: [(&str, &str); 18] = [
+const MODULE_CHOICES: [(&str, &str); 21] = [
     ("media", "Media"),
     ("timer", "Timer"),
     ("downloads", "Downloads"),
@@ -49,15 +59,36 @@ const MODULE_CHOICES: [(&str, &str); 18] = [
     ("ai", "Ask AI"),
     ("gemini", "Gemini"),
     ("weather", "Weather"),
-    ("wifi", "Wi-Fi"),
-    ("bluetooth", "Bluetooth"),
+    ("control", "Wi-Fi & Bluetooth"),
+    ("notifications", "Notifications"),
+    ("mirror", "Mirror (camera tab)"),
     ("notes", "Notes"),
+    ("greeting", "Unlock greeting"),
     ("stats", "System stats"),
     ("ports", "Dev servers"),
     ("privacy", "Mic & camera"),
     ("battery", "Battery"),
     ("locks", "Lock keys"),
     ("osd", "Volume & brightness"),
+    ("devices", "USB drives"),
+];
+
+/// Tabs that can be reordered: (config id, label), in the default order.
+const TAB_CHOICES: [(&str, &str); 14] = [
+    ("timer", "Timer"),
+    ("stats", "System Stats"),
+    ("voice", "Dictation"),
+    ("clipboard", "Clipboard"),
+    ("downloads", "Downloads"),
+    ("shelf", "Shelf"),
+    ("ports", "Dev Servers"),
+    ("ai", "Ask AI"),
+    ("gemini", "Gemini"),
+    ("weather", "Weather"),
+    ("control", "Wi-Fi & BT"),
+    ("notes", "Notes"),
+    ("notifications", "Notifications"),
+    ("mirror", "Mirror"),
 ];
 
 const SWATCHES: [u32; 6] = [0x0A84FF, 0xBF5AF2, 0xFF375F, 0xFF9F0A, 0x34C759, 0x64D2FF];
@@ -66,6 +97,7 @@ const SWATCHES: [u32; 6] = [0x0A84FF, 0xBF5AF2, 0xFF375F, 0xFF9F0A, 0x34C759, 0x
 enum Focus {
     None,
     City,
+    Name,
     Key,
     Model,
 }
@@ -74,6 +106,7 @@ pub struct Settings {
     tab: usize,
     cfg: Config,
     city: TextField,
+    name: TextField,
     key: TextField,
     model: TextField,
     focus: Focus,
@@ -88,6 +121,7 @@ impl Settings {
             tab: 0,
             cfg: Config::default(),
             city: TextField::new(80),
+            name: TextField::new(24),
             key: TextField::new(200).masked(),
             model: TextField::new(80),
             focus: Focus::None,
@@ -104,6 +138,9 @@ impl Settings {
     fn sync_fields(&mut self) {
         if self.focus != Focus::City {
             self.city.set(&self.cfg.weather.city);
+        }
+        if self.focus != Focus::Name {
+            self.name.set(&self.cfg.greeting.name);
         }
         if self.focus != Focus::Model {
             self.model.set(&self.cfg.gemini.model);
@@ -133,12 +170,72 @@ fn list_value(ids: &[String]) -> String {
     format!("[{}]", ids.iter().map(|s| toml_str(s)).collect::<Vec<_>>().join(", "))
 }
 
+/// "Order" grid for a list of items: each one is a capsule with ‹ › arrows to
+/// move it earlier or later. `row` is the first row (its height is the row
+/// height). Returns the new order when something moved.
+fn order_row(ui: &mut Ui, row: Rect, ids: &[String], names: &[(&str, &str)], cols: usize) -> Option<Vec<String>> {
+    if ids.len() < 2 {
+        return None;
+    }
+    let gap = 8.0;
+    let cols = cols.max(1);
+    let w = (row.w - gap * (cols as f32 - 1.0)) / cols as f32;
+    let mut result = None;
+    for (i, id) in ids.iter().enumerate() {
+        let r = Rect::new(row.x + (i % cols) as f32 * (w + gap), row.y + (i / cols) as f32 * (row.h + gap), w, row.h);
+        ui.p.fill_rounded(r, r.h * 0.5, Color::white(0.07));
+        let label = names.iter().find(|(k, _)| *k == id.as_str()).map(|(_, n)| *n).unwrap_or(id.as_str());
+        ui.p.text(
+            label,
+            Rect::new(r.x + 28.0, r.y, r.w - 56.0, r.h),
+            &TextStyle::new(12.0, palette::TEXT).medium().center(),
+        );
+        for (dir, can) in [(-1i32, i > 0), (1i32, i + 1 < ids.len())] {
+            let a = if dir < 0 {
+                Rect::new(r.x + 3.0, r.y + 3.0, 24.0, r.h - 6.0)
+            } else {
+                Rect::new(r.right() - 27.0, r.y + 3.0, 24.0, r.h - 6.0)
+            };
+            let hover = can && ui.hovered(a);
+            if hover {
+                ui.hot = true;
+                ui.p.fill_rounded(a, a.h * 0.5, Color::white(0.14));
+            }
+            let col = if can { palette::TEXT } else { palette::TEXT_FAINT.with_a(0.4) };
+            ui.p.text(if dir < 0 { "‹" } else { "›" }, a, &TextStyle::new(17.0, col).medium().center());
+            if can && ui.clicked(a) {
+                let mut next = ids.to_vec();
+                let j = (i as i32 + dir) as usize;
+                next.swap(i, j);
+                result = Some(next);
+            }
+        }
+    }
+    result
+}
+
+/// The tab order to show: the saved order (known ids only), then anything missing.
+fn tab_order(saved: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in saved {
+        if TAB_CHOICES.iter().any(|(k, _)| *k == id.as_str()) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    for (k, _) in TAB_CHOICES {
+        if !out.iter().any(|o| o == k) {
+            out.push(k.to_string());
+        }
+    }
+    out
+}
+
 fn row_rect(body: Rect, i: usize) -> Rect {
     Rect::new(body.x, body.y + i as f32 * (ROW_H + ROW_GAP), body.w, ROW_H)
 }
 
 fn label(ui: &mut Ui, row: Rect, text: &str) {
-    ui.p.fill_rounded(row, 10.0, palette::CARD);
+    ui.row_bg(row, false, None);
     ui.p.text(text, Rect::new(row.x + 12.0, row.y, row.w * 0.5, row.h), &TextStyle::new(13.0, palette::TEXT));
 }
 
@@ -216,12 +313,14 @@ impl Module for Settings {
 
     fn page_height(&self, _w: f32) -> f32 {
         let rows = match self.tab {
-            0 => 6.0,
-            1 => 7.0,
-            2 => 6.0,
+            0 => 9.0,
+            1 => 12.0,
+            2 => 5.6,
             3 => 5.5,
             4 => 4.0,
-            _ => 4.0,
+            5 => 4.0,
+            6 => 5.6,
+            _ => 5.9,
         };
         TAB_H + 10.0 + rows * (ROW_H + ROW_GAP) + FOOT_H
     }
@@ -229,6 +328,7 @@ impl Module for Settings {
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
         let enter = match self.focus {
             Focus::City => self.city.key(key, self.hwnd),
+            Focus::Name => self.name.key(key, self.hwnd),
             Focus::Key => self.key.key(key, self.hwnd),
             Focus::Model => self.model.key(key, self.hwnd),
             Focus::None => false,
@@ -239,6 +339,11 @@ impl Module for Settings {
                     let v = self.city.text().trim().to_string();
                     cx.fx.save_config.push(("weather".into(), "city".into(), toml_str(&v)));
                     self.say("City saved", true);
+                }
+                Focus::Name => {
+                    let v = self.name.text().trim().to_string();
+                    cx.fx.save_config.push(("greeting".into(), "name".into(), toml_str(&v)));
+                    self.say("Name saved", true);
                 }
                 Focus::Key => self.save_key(cx.bus),
                 Focus::Model => {
@@ -266,7 +371,7 @@ impl Module for Settings {
             let b = Rect::new(r.x + i as f32 * (tw + gap), r.y, tw, TAB_H);
             let on = i == self.tab;
             let style = if on {
-                ButtonStyle::filled(accent.with_a(0.85)).fg(Color::white(1.0))
+                ButtonStyle::inverted()
             } else {
                 ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM)
             };
@@ -285,18 +390,16 @@ impl Module for Settings {
             2 => self.home(ui, body),
             3 => self.modules(ui, body),
             4 => self.weather(ui, body),
-            _ => self.gemini(ui, body),
+            5 => self.gemini(ui, body),
+            6 => self.notch(ui, body),
+            _ => self.tabs(ui, body),
         }
 
         // --- status line ------------------------------------------------------
         if let Some((text, at, good)) = self.status.clone() {
             if at.elapsed() < Duration::from_secs(4) {
                 let col = if good { palette::GREEN } else { palette::ORANGE };
-                ui.p.text(
-                    &text,
-                    Rect::new(r.x, r.bottom() - FOOT_H, r.w, FOOT_H),
-                    &TextStyle::new(11.5, col).right(),
-                );
+                ui.p.text(&text, Rect::new(r.x, r.bottom() - FOOT_H, r.w, FOOT_H), &TextStyle::new(11.5, col).right());
             } else {
                 self.status = None;
             }
@@ -314,8 +417,22 @@ impl Settings {
     fn general(&mut self, ui: &mut Ui, body: Rect) {
         let g = self.cfg.general.clone();
         let accent = ui.accent;
-        toggle_row(ui, row_rect(body, 0), "Open when I hover the notch", g.expand_on_hover, "general", "expand_on_hover");
-        toggle_row(ui, row_rect(body, 1), "Hide for fullscreen apps", g.hide_in_fullscreen, "general", "hide_in_fullscreen");
+        toggle_row(
+            ui,
+            row_rect(body, 0),
+            "Open when I hover the notch",
+            g.expand_on_hover,
+            "general",
+            "expand_on_hover",
+        );
+        toggle_row(
+            ui,
+            row_rect(body, 1),
+            "Hide for fullscreen apps",
+            g.hide_in_fullscreen,
+            "general",
+            "hide_in_fullscreen",
+        );
         toggle_row(ui, row_rect(body, 2), "Start with Windows", g.start_with_windows, "general", "start_with_windows");
 
         let row = row_rect(body, 3);
@@ -338,7 +455,42 @@ impl Settings {
             put(ui, "general", "monitor", toml_str(["primary", "active"][i]));
         }
 
-        let row = row_rect(body, 5);
+        toggle_row(ui, row_rect(body, 5), "Greet me when I unlock", self.cfg.modules.greeting, "modules", "greeting");
+
+        // the name the unlock animation says hello to
+        let row = row_rect(body, 6);
+        label(ui, row, "Say hello to");
+        let save = Rect::new(row.right() - 70.0, row.y + 2.0, 64.0, row.h - 4.0);
+        let field = Rect::new(save.x - 8.0 - 190.0, row.y + 2.0, 190.0, row.h - 4.0);
+        if self.name.draw(ui, field, "Your name", accent, self.focus == Focus::Name) {
+            self.focus = Focus::Name;
+            ui.fx.keyboard_focus = Some(true);
+        }
+        if ui.pill_button(save, "Save", None, ButtonStyle::inverted()) {
+            let v = self.name.text().trim().to_string();
+            put(ui, "greeting", "name", toml_str(&v));
+            self.say("Name saved", true);
+            self.focus = Focus::None;
+            ui.fx.keyboard_focus = Some(false);
+        }
+
+        // the handwriting the unlock hello is written in
+        let row = row_rect(body, 7);
+        label(ui, row, "Hello font");
+        let cur = self.cfg.greeting.font_name();
+        let sel = if cur == "Yellowtail" {
+            Some(0)
+        } else if cur == "Script Regular" {
+            Some(1)
+        } else {
+            None
+        };
+        let seg = Rect::new(row.right() - 232.0, row.y + 3.0, 224.0, row.h - 6.0);
+        if let Some(i) = segmented(ui, seg, &["Yellowtail", "Script Regular"], sel, accent) {
+            put(ui, "greeting", "font", toml_str(["Yellowtail", "Script Regular"][i]));
+        }
+
+        let row = row_rect(body, 8);
         let w = (row.w - 16.0) / 3.0;
         let style = ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM);
         let b = |k: f32| Rect::new(row.x + k * (w + 8.0), row.y + 2.0, w, row.h - 4.0);
@@ -376,6 +528,16 @@ impl Settings {
         slider_row(
             ui,
             row_rect(body, 3),
+            "Panel width",
+            a.expanded_width,
+            (520.0, 960.0),
+            format!("{:.0}", a.expanded_width),
+            "appearance",
+            "expanded_width",
+        );
+        slider_row(
+            ui,
+            row_rect(body, 4),
             "Size",
             a.scale,
             (0.8, 1.5),
@@ -383,10 +545,19 @@ impl Settings {
             "appearance",
             "scale",
         );
-        slider_row(ui, row_rect(body, 4), "Bounce", a.bounce, (0.0, 1.0), format!("{:.0}%", a.bounce * 100.0), "appearance", "bounce");
         slider_row(
             ui,
             row_rect(body, 5),
+            "Bounce",
+            a.bounce,
+            (0.0, 1.0),
+            format!("{:.0}%", a.bounce * 100.0),
+            "appearance",
+            "bounce",
+        );
+        slider_row(
+            ui,
+            row_rect(body, 6),
             "Animation speed",
             a.animation_speed,
             (0.5, 2.0),
@@ -395,13 +566,13 @@ impl Settings {
             "animation_speed",
         );
 
-        let row = row_rect(body, 6);
+        let row = row_rect(body, 7);
         label(ui, row, "Accent color");
         let auto_sel = a.accent.eq_ignore_ascii_case("auto");
         let mut x = row.right() - 12.0 - 6.0 * 26.0 - 64.0;
         let auto = Rect::new(x, row.y + 4.0, 56.0, row.h - 8.0);
         let style = if auto_sel {
-            ButtonStyle::filled(accent.with_a(0.85)).fg(Color::white(1.0))
+            ButtonStyle::inverted()
         } else {
             ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)
         };
@@ -426,20 +597,49 @@ impl Settings {
             }
             x += 26.0;
         }
+
+        // beam style: exactly one of the two is on; pressing the one that is on keeps it on
+        let white = a.white_beams;
+        for (i, (text, on)) in
+            [("Blue beams, a hint of white", !white), ("White beams, a hint of blue", white)].into_iter().enumerate()
+        {
+            let row = row_rect(body, 8 + i);
+            label(ui, row, text);
+            let sw = Rect::new(row.right() - 56.0, row.y, 48.0, row.h);
+            if switch(ui, sw, on, accent) && !on {
+                put(ui, "appearance", "white_beams", (i == 1).to_string());
+            }
+        }
+
+        let row = row_rect(body, 10);
+        label(ui, row, "Home clock");
+        let sel = usize::from(a.clock_style.eq_ignore_ascii_case("flip"));
+        let seg = Rect::new(row.right() - 232.0, row.y + 3.0, 224.0, row.h - 6.0);
+        if let Some(i) = segmented(ui, seg, &["Rolling digits", "Flip clock"], Some(sel), accent) {
+            put(ui, "appearance", "clock_style", toml_str(["roll", "flip"][i]));
+        }
+        toggle_row(
+            ui,
+            row_rect(body, 11),
+            "Light animations (cached frames)",
+            a.motion_cache,
+            "appearance",
+            "motion_cache",
+        );
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {
         let accent = ui.accent;
         let chosen = self.cfg.home.widgets.clone();
         ui.p.text(
-            &format!("Pick up to {MAX_HOME} widgets for the home page, in the order you want them."),
+            &format!("Pick up to {MAX_HOME} widgets for the home page. Use the arrows below to change their order."),
             Rect::new(body.x + 2.0, body.y, body.w, 18.0),
             &TextStyle::new(12.0, palette::TEXT_DIM),
         );
         let cols = 4;
         let gap = 8.0;
         let cw = (body.w - gap * (cols as f32 - 1.0)) / cols as f32;
-        let ch = 32.0;
+        let ch = 36.0;
         let top = body.y + 26.0;
         for (i, (id, name)) in HOME_CHOICES.iter().enumerate() {
             let (cx, cy) = (i % cols, i / cols);
@@ -460,6 +660,18 @@ impl Settings {
                 put(ui, "home", "widgets", list_value(&next));
             }
         }
+        // reorder what is chosen
+        let oy = top + 2.0 * (ch + gap) + 6.0;
+        if chosen.len() > 1 {
+            ui.p.text(
+                "Order",
+                Rect::new(body.x + 2.0, oy, 200.0, 16.0),
+                &TextStyle::new(11.5, palette::TEXT_FAINT).semibold(),
+            );
+            if let Some(next) = order_row(ui, Rect::new(body.x, oy + 20.0, body.w, 32.0), &chosen, &HOME_CHOICES, 4) {
+                put(ui, "home", "widgets", list_value(&next));
+            }
+        }
     }
 
     fn modules(&mut self, ui: &mut Ui, body: Rect) {
@@ -467,7 +679,7 @@ impl Settings {
         let cols = 4;
         let gap = 8.0;
         let cw = (body.w - gap * (cols as f32 - 1.0)) / cols as f32;
-        let ch = 32.0;
+        let ch = 36.0;
         for (i, (id, name)) in MODULE_CHOICES.iter().enumerate() {
             let (cx, cy) = (i % cols, i / cols);
             let cr = Rect::new(body.x + cx as f32 * (cw + gap), body.y + cy as f32 * (ch + gap), cw, ch);
@@ -488,7 +700,7 @@ impl Settings {
             self.focus = Focus::City;
             ui.fx.keyboard_focus = Some(true);
         }
-        if ui.pill_button(save, "Save", None, ButtonStyle::filled(accent.with_a(0.85)).fg(Color::white(1.0))) {
+        if ui.pill_button(save, "Save", None, ButtonStyle::inverted()) {
             let v = self.city.text().trim().to_string();
             put(ui, "weather", "city", toml_str(&v));
             self.say("City saved", true);
@@ -512,6 +724,83 @@ impl Settings {
         );
     }
 
+    fn notch(&mut self, ui: &mut Ui, body: Rect) {
+        let accent = ui.accent;
+        let chosen = self.cfg.notch.widgets.clone();
+        ui.p.text(
+            &format!(
+                "Pick up to {MAX_NOTCH} widgets for the closed notch. Use the arrows below to change their order."
+            ),
+            Rect::new(body.x + 2.0, body.y, body.w, 18.0),
+            &TextStyle::new(12.0, palette::TEXT_DIM),
+        );
+        let cols = 4;
+        let gap = 8.0;
+        let cw = (body.w - gap * (cols as f32 - 1.0)) / cols as f32;
+        let ch = 36.0;
+        let top = body.y + 26.0;
+        for (i, (id, name)) in NOTCH_CHOICES.iter().enumerate() {
+            let (cx, cy) = (i % cols, i / cols);
+            let cr = Rect::new(body.x + cx as f32 * (cw + gap), top + cy as f32 * (ch + gap), cw, ch);
+            let pos = chosen.iter().position(|w| w == *id);
+            if chip(ui, cr, name, pos.is_some(), pos.map(|p| p + 1), accent) {
+                let mut next = chosen.clone();
+                match pos {
+                    Some(p) => {
+                        next.remove(p);
+                    }
+                    None if next.len() < MAX_NOTCH => next.push(id.to_string()),
+                    None => {
+                        self.status = Some((format!("Only {MAX_NOTCH} fit. Remove one first."), Instant::now(), false));
+                        continue;
+                    }
+                }
+                put(ui, "notch", "widgets", list_value(&next));
+            }
+        }
+        // reorder what is chosen
+        let oy = top + 2.0 * (ch + gap) + 6.0;
+        if chosen.len() > 1 {
+            ui.p.text(
+                "Order",
+                Rect::new(body.x + 2.0, oy, 200.0, 16.0),
+                &TextStyle::new(11.5, palette::TEXT_FAINT).semibold(),
+            );
+            if let Some(next) = order_row(ui, Rect::new(body.x, oy + 20.0, body.w, 32.0), &chosen, &NOTCH_CHOICES, 4) {
+                put(ui, "notch", "widgets", list_value(&next));
+            }
+        }
+        ui.p.text(
+            "They show while nothing is playing. With the pill style they appear when you hover it.",
+            Rect::new(body.x + 2.0, oy + 58.0, body.w, 18.0),
+            &TextStyle::new(11.5, palette::TEXT_FAINT),
+        );
+    }
+
+    fn tabs(&mut self, ui: &mut Ui, body: Rect) {
+        let order = tab_order(&self.cfg.tabs.order);
+        ui.p.text(
+            "Use the arrows to change the order of the tabs in the header. Home always stays first.",
+            Rect::new(body.x + 2.0, body.y, body.w, 18.0),
+            &TextStyle::new(12.0, palette::TEXT_DIM),
+        );
+        let top = body.y + 28.0;
+        if let Some(next) = order_row(ui, Rect::new(body.x, top, body.w, 32.0), &order, &TAB_CHOICES, 4) {
+            put(ui, "tabs", "order", list_value(&next));
+        }
+        let rows = order.len().div_ceil(4) as f32;
+        let by = top + rows * 40.0 + 6.0;
+        let style = ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM);
+        if ui.pill_button(Rect::new(body.x, by, 170.0, 30.0), "Reset order", Some(Icon::Refresh), style) {
+            put(ui, "tabs", "order", "[]".to_string());
+        }
+        ui.p.text(
+            "Tabs for modules you switched off are hidden.",
+            Rect::new(body.x + 182.0, by, body.w - 182.0, 30.0),
+            &TextStyle::new(11.5, palette::TEXT_FAINT),
+        );
+    }
+
     fn gemini(&mut self, ui: &mut Ui, body: Rect) {
         let accent = ui.accent;
         let blue = Color::hex(0x4285F4);
@@ -526,11 +815,8 @@ impl Settings {
             ui.fx.keyboard_focus = Some(true);
         }
         let can = !self.key.is_empty();
-        let style = if can {
-            ButtonStyle::filled(blue.with_a(0.9)).fg(Color::white(1.0))
-        } else {
-            ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT)
-        };
+        let style =
+            if can { ButtonStyle::inverted() } else { ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT) };
         if ui.pill_button(save, "Save", None, style) && can {
             let bus = ui.bus.clone();
             self.save_key(&bus);
@@ -546,7 +832,7 @@ impl Settings {
             self.focus = Focus::Model;
             ui.fx.keyboard_focus = Some(true);
         }
-        if ui.pill_button(save, "Save", None, ButtonStyle::filled(accent.with_a(0.85)).fg(Color::white(1.0))) {
+        if ui.pill_button(save, "Save", None, ButtonStyle::inverted()) {
             let v = self.model.text().trim().to_string();
             if !v.is_empty() {
                 put(ui, "gemini", "model", toml_str(&v));
@@ -558,11 +844,17 @@ impl Settings {
 
         let row = row_rect(body, 2);
         let style = ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM);
-        if ui.pill_button(Rect::new(row.x, row.y + 2.0, 170.0, row.h - 4.0), "Get a free key", Some(Icon::Link), style) {
+        if ui.pill_button(Rect::new(row.x, row.y + 2.0, 170.0, row.h - 4.0), "Get a free key", Some(Icon::Link), style)
+        {
             shell_open("https://aistudio.google.com/apikey");
         }
         if self.has_key
-            && ui.pill_button(Rect::new(row.x + 178.0, row.y + 2.0, 150.0, row.h - 4.0), "Remove saved key", Some(Icon::Trash), style)
+            && ui.pill_button(
+                Rect::new(row.x + 178.0, row.y + 2.0, 150.0, row.h - 4.0),
+                "Remove saved key",
+                Some(Icon::Trash),
+                style,
+            )
         {
             dotenv::set_saved(gemini::KEY_VAR, "");
             self.has_key = dotenv::get_saved_first(gemini::KEY_VAR).is_some();

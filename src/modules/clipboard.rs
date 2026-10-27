@@ -15,7 +15,7 @@ use super::{CardSize, Cx, Module, ModuleId, Peek, SystemEvent};
 use crate::gfx::{image, Icon, ImageData, TextStyle};
 use crate::sys::clip::{self, with_global};
 use crate::ui::{ButtonStyle, Ui};
-use crate::util::{one_line, palette, truncate_chars, Rect, SendHwnd};
+use crate::util::{one_line, palette, truncate_chars, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "clipboard";
 const ROW_H: f32 = 36.0;
@@ -195,7 +195,13 @@ impl Module for Clipboard {
             None => ui.p.icon(it.icon(), Rect::new(inner.x, r.cy() - is * 0.5, is, is), palette::BLUE),
         }
         let tx = inner.x + 30.0;
-        ui.p.text(&it.summary(), Rect::new(tx, r.y, inner.right() - tx, r.h), &TextStyle::new(12.5, palette::TEXT));
+        let fill = self.items.len() as f32 / self.max.max(1) as f32;
+        ui.ticks(Rect::new(inner.right() - 40.0, r.cy() - 4.0, 40.0, 8.0), fill, Color::white(0.85));
+        ui.p.text(
+            &it.summary(),
+            Rect::new(tx, r.y, inner.right() - tx - 50.0, r.h),
+            &TextStyle::new(12.5, palette::TEXT),
+        );
     }
 
     fn has_page(&self) -> bool {
@@ -222,13 +228,16 @@ impl Module for Clipboard {
             self.items.clear();
             return;
         }
+        // how full the history is, as a short run of ticks beside the clear button
+        let fill = self.items.len() as f32 / self.max.max(1) as f32;
+        ui.ticks(Rect::new(clear.x - 10.0 - 72.0, head.cy() - 5.0, 72.0, 10.0), fill, Color::white(0.85));
         let mut peeks = Vec::new();
         let mut copy_idx = None;
         for (i, it) in self.items.iter().take(MAX_ROWS).enumerate() {
             let row = Rect::new(body.x, body.y + i as f32 * (ROW_H + 4.0), body.w, ROW_H);
             let copyable = !matches!(it.kind, Kind::Image { .. });
             let hover = copyable && ui.hovered(row);
-            ui.p.fill_rounded(row, 10.0, if hover { palette::CARD_HOVER } else { palette::CARD });
+            ui.row_bg(row, hover, None);
             let ir = Rect::new(row.x + 10.0, row.cy() - 10.0, 20.0, 20.0);
             match &it.thumb {
                 Some(t) => ui.p.image(t, ir.expand(2.0), 4.0, 1.0),
@@ -239,9 +248,12 @@ impl Module for Clipboard {
             let tx = row.x + 40.0;
             ui.p.text(
                 &it.summary(),
-                Rect::new(tx, row.y, row.right() - tx - 70.0, row.h),
+                Rect::new(tx, row.y, row.right() - tx - 100.0, row.h),
                 &TextStyle::new(12.5, palette::TEXT),
             );
+            // freshness: the ticks burn down over the first hour
+            let fresh = 1.0 - (it.at.elapsed().as_secs_f32() / 3600.0).min(1.0);
+            ui.ticks(Rect::new(row.right() - 94.0, row.cy() - 4.0, 28.0, 8.0), fresh, Color::white(0.7));
             if hover {
                 ui.hot = true;
                 ui.p.icon(Icon::Copy, Rect::new(row.right() - 28.0, row.cy() - 8.0, 16.0, 16.0), palette::TEXT_DIM);

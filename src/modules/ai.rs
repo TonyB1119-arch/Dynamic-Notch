@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::{Cx, Key, Module, ModuleId, SystemEvent};
-use crate::anim::{ease_out, smoothstep};
+use crate::anim::ease_out;
 use crate::bus::Bus;
 use crate::config::AiCfg;
 use crate::gfx::{Icon, TextStyle};
@@ -425,8 +425,10 @@ impl Module for Ai {
         // --- input field ---------------------------------------------------
         let field = Rect::new(r.x, r.y, r.w, INPUT_H);
         let accent = palette::PURPLE;
-        ui.p.fill_rounded(field, 14.0, Color::white(0.08));
-        ui.p.stroke_rounded(field.inset(0.5), 14.0, 1.0, accent.with_a(if focused { 0.55 } else { 0.18 }));
+        ui.p.fill_rect(
+            Rect::new(field.x, field.bottom() - 1.0, field.w, 1.0),
+            accent.with_a(if focused { 0.60 } else { 0.18 }),
+        );
         if ui.clicked(field) {
             ui.fx.keyboard_focus = Some(true);
         }
@@ -592,22 +594,11 @@ impl Module for Ai {
     }
 }
 
-/// Shown until the first token arrives: a 3×3 pixel grid whose cells pulse
-/// in a staggered sweep, a shimmering label and the elapsed time.
+/// Shown until the first token arrives: a short row of ticks with a bright
+/// stretch sliding along it, a shimmering label and the elapsed time.
 fn draw_loader(ui: &mut Ui, r: Rect, t: f32, color: Color) {
-    // per-cell start offsets (row-major); the lit cells sweep left → right
-    const DELAYS: [f32; 9] = [0.09, 0.18, 0.27, 0.0, 0.09, 0.18, 0.09, 0.18, 0.27];
-    const PERIOD: f32 = 0.65;
-    const PX: f32 = 4.0;
-    const GAP: f32 = 1.5;
-    let grid = 3.0 * PX + 2.0 * GAP;
-    let gy = r.cy() - grid * 0.5;
-    for (i, d) in DELAYS.iter().enumerate() {
-        let p = ((t - d) / PERIOD).rem_euclid(1.0);
-        let on = if p < 0.42 { smoothstep(0.0, 0.18, p) } else { 1.0 - smoothstep(0.42, 0.62, p) };
-        let cell = Rect::new(r.x + (i % 3) as f32 * (PX + GAP), gy + (i / 3) as f32 * (PX + GAP), PX, PX);
-        ui.p.fill_rounded(cell, 1.0, color.alpha(0.15 + 0.85 * on));
-    }
+    let grid = 40.0;
+    ui.ticks_sweep(Rect::new(r.x, r.cy() - 5.0, grid, 10.0), color);
     let label = "Thinking";
     let st = TextStyle::new(13.0, palette::TEXT_FAINT).medium();
     let (lw, _) = ui.p.measure(label, &st);

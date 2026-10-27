@@ -15,11 +15,16 @@ pub mod ai;
 pub mod battery;
 pub mod bluetooth;
 pub mod clipboard;
+pub mod control;
+pub mod devices;
 pub mod downloads;
 pub mod gemini;
+pub mod greeting;
 pub mod locks;
 pub mod media;
+pub mod mirror;
 pub mod notes;
+pub mod notifications;
 pub mod osd;
 pub mod ports;
 pub mod privacy;
@@ -61,6 +66,12 @@ pub enum Slot {
     Battery {
         level: f32,
         charging: bool,
+    },
+    /// A black record; the artwork (when there is some) is its label.
+    Vinyl {
+        color: Color,
+        angle: f32,
+        art: Option<ImageData>,
     },
     /// Live level meter (recent 0..1 levels, newest last), drawn across the wing.
     Wave {
@@ -130,9 +141,29 @@ pub struct Peek {
     /// Show right away, pushing a visible peek back into the queue
     /// (feedback for a key press is useless when it arrives late).
     pub instant: bool,
+    /// Draw the icon on its own: no coloured circle behind it.
+    #[allow(dead_code)] // kept for module code; every peek now uses the plain-icon look
+    pub bare: bool,
+    /// Face-ID style unlock animation (blue brackets, tick ring, check).
+    pub scan: bool,
+    /// A follow-up for a peek that is already showing: the visible peek swaps to
+    /// this content with a short animation, and nothing new pops up when none is showing.
+    pub quiet: bool,
 }
 
 impl Peek {
+    /// Volume / brightness style: icon and value on top, a tick bar below.
+    pub fn is_hud(&self) -> bool {
+        matches!(self.trailing, Trailing::Level { .. })
+    }
+    /// Icon-only pill (no text), like the unlock animation.
+    pub fn is_compact(&self) -> bool {
+        self.title.is_empty()
+            && self.subtitle.is_empty()
+            && matches!(self.trailing, Trailing::None)
+            && self.image.is_none()
+    }
+
     pub fn new(icon: Icon, accent: Color, title: impl Into<String>, subtitle: impl Into<String>) -> Self {
         Self {
             icon,
@@ -146,7 +177,20 @@ impl Peek {
             key: None,
             focus: None,
             instant: false,
+            bare: false,
+            scan: false,
+            quiet: false,
         }
+    }
+    /// Icon without a background circle (drawn in the accent colour).
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
+    }
+    /// Play the unlock scan animation instead of a normal peek.
+    pub fn scan(mut self) -> Self {
+        self.scan = true;
+        self
     }
     pub fn instant(mut self) -> Self {
         self.instant = true;
@@ -166,6 +210,10 @@ impl Peek {
     }
     pub fn page(mut self, p: ModuleId) -> Self {
         self.page = Some(p);
+        self
+    }
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
         self
     }
     pub fn key(mut self, k: &'static str) -> Self {
@@ -296,6 +344,14 @@ pub trait Module {
         None
     }
     fn indicators(&self, out: &mut Vec<Indicator>) {}
+    /// A tiny icon + text summary for the closed notch (Settings → Notch).
+    fn glance(&self) -> Option<(Icon, String)> {
+        None
+    }
+    /// Like `glance`, for modules that offer several (the control center: "wifi" or "bluetooth").
+    fn glance_for(&self, id: &str) -> Option<(Icon, String)> {
+        self.glance()
+    }
 
     fn card(&self) -> Option<CardSize> {
         None
@@ -333,13 +389,16 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(ai::Ai::new()),
         Box::new(gemini::Gemini::new()),
         Box::new(weather::Weather::new()),
-        Box::new(wifi::Wifi::new()),
+        Box::new(control::ControlCenter::new()),
+        Box::new(mirror::Mirror::new()),
         Box::new(privacy::Privacy::new()),
         Box::new(battery::Battery::new()),
         Box::new(locks::Locks::new()),
         Box::new(osd::Osd::new()),
-        Box::new(bluetooth::Bluetooth::new()),
         Box::new(notes::Notes::new()),
+        Box::new(notifications::Notifications::new()),
+        Box::new(devices::Devices::new()),
+        Box::new(greeting::Greeting::new()),
         Box::new(settings::Settings::new()),
     ]
 }

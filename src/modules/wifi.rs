@@ -28,9 +28,9 @@ use crate::sys::radio;
 use crate::ui::{ButtonStyle, Ui};
 use crate::util::{palette, Color, Rect, SendHwnd};
 
-const ID: ModuleId = "wifi";
-const ROW_H: f32 = 34.0;
-const HEADER_H: f32 = 30.0;
+const ID: ModuleId = "control";
+const ROW_H: f32 = 40.0;
+const HEADER_H: f32 = 34.0;
 const LIST_H: f32 = 5.0 * ROW_H;
 const RESCAN_AFTER: Duration = Duration::from_secs(30);
 
@@ -42,7 +42,10 @@ struct Net {
 }
 
 enum WMsg {
-    List { nets: Vec<Net>, connected: Option<String> },
+    List {
+        nets: Vec<Net>,
+        connected: Option<String>,
+    },
     /// No adapter / access denied / scan failed.
     Problem(String),
     Connected(String),
@@ -79,6 +82,11 @@ pub struct Wifi {
 }
 
 impl Wifi {
+    /// Is this message one of ours? (The control center routes by type.)
+    pub(super) fn accepts(msg: &Box<dyn Any + Send>) -> bool {
+        msg.is::<WMsg>()
+    }
+
     pub fn new() -> Self {
         Self {
             tx: None,
@@ -187,6 +195,15 @@ impl Module for Wifi {
         cx.fx.redraw = true;
     }
 
+    fn glance(&self) -> Option<(Icon, String)> {
+        let text = match (&self.connected, self.radio_on) {
+            (_, Some(false)) => "Off".to_string(),
+            (Some(s), _) => crate::util::truncate_chars(s, 9),
+            _ => "—".to_string(),
+        };
+        Some((Icon::Wifi, text))
+    }
+
     fn card(&self) -> Option<CardSize> {
         Some(CardSize::Small)
     }
@@ -224,7 +241,7 @@ impl Module for Wifi {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        HEADER_H + 8.0 + LIST_H + if self.prompt.is_some() { 44.0 } else { 0.0 }
+        HEADER_H + 12.0 + LIST_H + if self.prompt.is_some() { 50.0 } else { 0.0 }
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -286,9 +303,21 @@ impl Module for Wifi {
             }
         }
 
+        // tick strip under the header: sweeps while scanning, otherwise shows the signal of the network you are on
+        let strip = Rect::new(r.x + 2.0, head.bottom() + 2.0, r.w - 4.0, 7.0);
+        if self.scanning || self.busy.is_some() {
+            ui.ticks_sweep(strip, Color::white(0.9));
+        } else {
+            let sig = self
+                .connected
+                .as_ref()
+                .and_then(|s| self.nets.iter().find(|n| &n.ssid == s))
+                .map_or(0.0, |n| n.bars as f32 / 4.0);
+            ui.ticks(strip, sig, Color::white(0.9));
+        }
+
         // --- body -----------------------------------------------------------
-        let prompt_h = if self.prompt.is_some() { 44.0 } else { 0.0 };
-        let area = Rect::new(r.x, head.bottom() + 8.0, r.w, LIST_H);
+        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, LIST_H);
         if let Some(p) = self.problem.clone() {
             ui.empty_state(area, Icon::Wifi, &p);
         } else if self.radio_on == Some(false) {
@@ -305,38 +334,52 @@ impl Module for Wifi {
             ui.p.push_clip(area);
             let mut action: Option<Cmd> = None;
             for (i, n) in self.nets.iter().enumerate() {
-                let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 4.0);
+                let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 6.0);
                 if row.bottom() < area.y || row.y > area.bottom() {
                     continue;
                 }
                 let is_conn = self.connected.as_deref() == Some(n.ssid.as_str());
-                ui.p.fill_rounded(row, 12.0, if is_conn { accent.with_a(0.16) } else { palette::CARD });
-                draw_bars(ui, Rect::new(row.x + 12.0, row.cy() - 8.0, 18.0, 16.0), n.bars, palette::TEXT);
+                let rh = ui.hovered(row);
+                ui.row_bg(row, rh, None);
+                ui.ticks(Rect::new(row.x + 12.0, row.cy() - 5.0, 40.0, 10.0), n.bars as f32 / 4.0, Color::white(0.9));
                 let btn = Rect::new(row.right() - 100.0, row.cy() - 12.0, 90.0, 24.0);
-                let name_w = btn.x - row.x - 70.0;
+                let name_w = btn.x - row.x - 88.0;
                 ui.p.text(
                     &n.ssid,
-                    Rect::new(row.x + 42.0, row.y, name_w, row.h),
+                    Rect::new(row.x + 60.0, row.y, name_w, row.h),
                     &TextStyle::new(13.0, palette::TEXT).medium(),
                 );
                 if n.secured {
                     let (tw, _) = ui.p.measure(&n.ssid, &TextStyle::new(13.0, palette::TEXT).medium());
                     ui.p.icon(
                         Icon::Lock,
-                        Rect::new(row.x + 42.0 + tw.min(name_w) + 6.0, row.cy() - 6.0, 12.0, 12.0),
+                        Rect::new(row.x + 60.0 + tw.min(name_w) + 6.0, row.cy() - 6.0, 12.0, 12.0),
                         palette::TEXT_FAINT,
                     );
                 }
                 let busy_here = self.busy.as_deref() == Some(n.ssid.as_str());
                 if busy_here {
                     ui.progress_indeterminate(Rect::new(btn.x + 10.0, btn.cy() - 1.5, btn.w - 20.0, 3.0), accent);
-                } else if is_conn {
-                    if ui.pill_button(btn, "Disconnect", None, ButtonStyle::filled(Color::white(0.1)).fg(palette::TEXT_DIM))
-                    {
-                        action = Some(Cmd::Disconnect);
+                } else {
+                    // no buttons: the whole row is the control, its state is a quiet word on the right
+                    let (word, col) = match (is_conn, rh) {
+                        (true, true) => ("Disconnect", palette::TEXT_DIM),
+                        (true, false) => ("Connected", accent),
+                        (false, true) => ("Connect", palette::TEXT_DIM),
+                        (false, false) => ("", palette::TEXT_FAINT),
+                    };
+                    ui.p.text(
+                        word,
+                        Rect::new(row.right() - 110.0, row.y, 98.0, row.h),
+                        &TextStyle::new(12.0, col).medium().right(),
+                    );
+                    if ui.clicked(row) {
+                        action = Some(if is_conn {
+                            Cmd::Disconnect
+                        } else {
+                            Cmd::Connect { ssid: n.ssid.clone(), password: None }
+                        });
                     }
-                } else if ui.pill_button(btn, "Connect", None, ButtonStyle::filled(accent.with_a(0.8)).fg(Color::white(1.0))) {
-                    action = Some(Cmd::Connect { ssid: n.ssid.clone(), password: None });
                 }
             }
             ui.p.pop_clip();
@@ -353,7 +396,7 @@ impl Module for Wifi {
 
         // --- password prompt / status line -----------------------------------
         if let Some(ssid) = self.prompt.clone() {
-            let bar = Rect::new(r.x, area.bottom() + 8.0, r.w, 36.0);
+            let bar = Rect::new(r.x, area.bottom() + 12.0, r.w, 36.0);
             let cancel = Rect::new(bar.right() - 34.0, bar.y + 2.0, 32.0, 32.0);
             let join = Rect::new(cancel.x - 76.0, bar.y + 4.0, 70.0, 28.0);
             let field = Rect::new(bar.x, bar.y + 2.0, join.x - bar.x - 8.0, 32.0);
@@ -361,7 +404,7 @@ impl Module for Wifi {
             self.pw.draw(ui, field, &hint, accent, true);
             let can = !self.pw.is_empty();
             let style = if can {
-                ButtonStyle::filled(accent.with_a(0.85)).fg(Color::white(1.0))
+                ButtonStyle::inverted()
             } else {
                 ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT)
             };
@@ -382,15 +425,17 @@ impl Module for Wifi {
     }
 }
 
-/// Four signal bars, `bars` of them lit (0–4).
+/// Signal strength as six thin ticks that grow taller, `bars` of four lit.
 fn draw_bars(ui: &mut Ui, r: Rect, bars: u8, color: Color) {
-    let w = 3.0;
-    let gap = 1.8;
-    for i in 0..4u8 {
-        let h = 4.0 + 3.0 * i as f32;
+    let n = 6usize;
+    let w = 2.0;
+    let gap = (r.w - w * n as f32) / (n as f32 - 1.0);
+    let lit = bars.min(4) as f32 / 4.0 * n as f32;
+    for i in 0..n {
+        let h = 4.0 + 2.0 * i as f32;
         let x = r.x + i as f32 * (w + gap);
-        let c = if i < bars { color } else { Color::white(0.2) };
-        ui.p.fill_rounded(Rect::new(x, r.bottom() - h, w, h), 1.0, c);
+        let c = Color::white(0.18).lerp(color, (lit - i as f32).clamp(0.0, 1.0));
+        ui.p.fill_rounded(Rect::new(x, r.cy() + 7.0 - h, w, h), 1.0, c);
     }
 }
 

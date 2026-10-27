@@ -25,7 +25,7 @@ use super::{Activity, CardSize, Cx, Module, ModuleId, Peek, Slot, SystemEvent};
 use crate::bus::Bus;
 use crate::gfx::{Icon, TextStyle};
 use crate::sys;
-use crate::ui::{ButtonStyle, Ui};
+use crate::ui::{gkey, ButtonStyle, Ui};
 use crate::util::{format_bytes, palette, Rect};
 
 const ID: ModuleId = "downloads";
@@ -225,13 +225,13 @@ impl Module for Downloads {
             return;
         }
         let mut y = body.y;
-        for a in active.iter().take(6) {
+        for (ai, a) in active.iter().take(6).enumerate() {
             let row = Rect::new(body.x, y, body.w, 42.0);
-            ui.p.fill_rounded(row, 10.0, palette::CARD);
+            ui.row_bg(row, false, None);
             ui.p.icon(Icon::Download, Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0), palette::BLUE);
             let tx = row.x + 38.0;
             let status = match a.progress {
-                Some(p) => format!("{:.0}%", p * 100.0),
+                Some(p) => format!("{:.0}%", ui.glide(gkey("download", ai), p) * 100.0),
                 None if a.external => "Working…".into(),
                 None => format!("{} · {}", format_bytes(a.size), speed_text(a.speed)),
             };
@@ -248,7 +248,7 @@ impl Module for Downloads {
         let mut remove = None;
         for (i, d) in self.recent.iter().enumerate().take(6usize.saturating_sub(active.len())) {
             let row = Rect::new(body.x, y, body.w, 42.0);
-            ui.p.fill_rounded(row, 10.0, palette::CARD);
+            ui.row_bg(row, false, None);
             ui.p.icon(Icon::Check, Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0), palette::GREEN);
             let tx = row.x + 38.0;
             ui.p.text(&d.name, Rect::new(tx, row.y, row.w - 160.0, row.h), &TextStyle::new(12.5, palette::TEXT));
@@ -368,13 +368,16 @@ impl Watch {
         if unsafe { GetOverlappedResult(self.handle, &*self.ov, &mut n, false) }.is_err() || n == 0 {
             return out;
         }
+        let end = (n as usize).min(self.buf.len());
         let mut off = 0usize;
         loop {
-            let base = &self.buf[off..];
+            // never read past what Windows filled in, even if a record looks damaged
+            let Some(base) = self.buf[..end].get(off..).filter(|b| b.len() >= 12) else { break };
             let next = u32::from_le_bytes(base[0..4].try_into().unwrap()) as usize;
             let action = u32::from_le_bytes(base[4..8].try_into().unwrap());
             let len = u32::from_le_bytes(base[8..12].try_into().unwrap()) as usize;
-            let name: Vec<u16> = base[12..12 + len].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+            let Some(raw) = base.get(12..12 + len) else { break };
+            let name: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
             out.push((action, String::from_utf16_lossy(&name)));
             if next == 0 {
                 break;

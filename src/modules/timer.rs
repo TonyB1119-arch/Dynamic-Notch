@@ -301,7 +301,7 @@ impl Module for Timer {
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
         // segmented mode switch
         let seg = Rect::new(r.x, r.y, 190.0, 28.0);
-        ui.p.fill_rounded(seg, 14.0, Color::white(0.08));
+        ui.p.fill_rounded(seg, 14.0, Color::white(0.05));
         let half = Rect::new(seg.x, seg.y, seg.w * 0.5, seg.h);
         for (i, (label, m)) in [("Timer", Mode::Timer), ("Stopwatch", Mode::Stopwatch)].iter().enumerate() {
             let b = half.translate(i as f32 * half.w, 0.0).inset(2.0);

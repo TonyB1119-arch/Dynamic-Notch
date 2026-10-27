@@ -12,8 +12,8 @@ use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "notes";
 const MAX_NOTES: usize = 40;
-const ROW_H: f32 = 32.0;
-const INPUT_H: f32 = 38.0;
+const ROW_H: f32 = 38.0;
+const INPUT_H: f32 = 42.0;
 const LIST_H: f32 = 4.0 * ROW_H;
 
 pub struct Notes {
@@ -71,6 +71,10 @@ impl Module for Notes {
         self.load();
     }
 
+    fn glance(&self) -> Option<(Icon, String)> {
+        Some((Icon::Edit, self.items.len().to_string()))
+    }
+
     fn card(&self) -> Option<CardSize> {
         Some(CardSize::Small)
     }
@@ -98,7 +102,7 @@ impl Module for Notes {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        INPUT_H + 10.0 + LIST_H
+        INPUT_H + 14.0 + LIST_H
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -111,22 +115,19 @@ impl Module for Notes {
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
         let accent = palette::YELLOW;
         let field = Rect::new(r.x, r.y, r.w - 84.0, INPUT_H);
-        let add = Rect::new(field.right() + 8.0, field.y + 4.0, 76.0, 30.0);
+        let add = Rect::new(field.right() + 8.0, field.y + 5.0, 76.0, 32.0);
         if self.input.draw(ui, field, "Write a note and press Enter…", accent, true) {
             ui.fx.keyboard_focus = Some(true);
         }
         let can = !self.input.is_empty();
-        let style = if can {
-            ButtonStyle::filled(accent.with_a(0.85)).fg(Color::black(0.9))
-        } else {
-            ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT)
-        };
+        let style =
+            if can { ButtonStyle::inverted() } else { ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT) };
         if ui.pill_button(add, "Add", Some(Icon::Plus), style) && can {
             self.add();
             ui.fx.layout_changed = true;
         }
 
-        let area = Rect::new(r.x, field.bottom() + 10.0, r.w, LIST_H);
+        let area = Rect::new(r.x, field.bottom() + 14.0, r.w, LIST_H);
         if self.items.is_empty() {
             ui.empty_state(area, Icon::Edit, "No notes yet");
             return;
@@ -136,7 +137,7 @@ impl Module for Notes {
         let mut delete: Option<usize> = None;
         let mut copied: Option<String> = None;
         for (i, n) in self.items.iter().enumerate() {
-            let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 4.0);
+            let row = Rect::new(area.x, area.y + i as f32 * ROW_H - self.scroll, area.w, ROW_H - 6.0);
             if row.bottom() < area.y || row.y > area.bottom() {
                 continue;
             }
@@ -157,7 +158,11 @@ impl Module for Notes {
         }
         if let Some(t) = copied {
             clip::set_text(self.hwnd.hwnd(), &t);
-            ui.fx.peek(Peek::new(Icon::Check, palette::GREEN, "Note copied", crate::util::truncate_chars(&t, 40)).key("notes").duration_ms(1500));
+            ui.fx.peek(
+                Peek::new(Icon::Check, palette::GREEN, "Note copied", crate::util::truncate_chars(&t, 40))
+                    .key("notes")
+                    .duration_ms(1500),
+            );
         }
     }
 }
