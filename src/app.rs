@@ -362,6 +362,7 @@ struct Look {
     expanded_opacity: f32,
     collapsed_opacity: f32,
     notch_height: f32,
+    glass_look: bool,
 }
 
 struct Targets {
@@ -2645,10 +2646,12 @@ impl App {
                 expanded_opacity: a.expanded_opacity,
                 collapsed_opacity: a.collapsed_opacity,
                 notch_height: a.notch_height,
+                glass_look: a.glass_look,
             }
         };
         let settled = self.settled;
         let see_through = ap.expanded_opacity < 0.97 || ap.collapsed_opacity < 0.97;
+        let glass = ap.glass_look && crate::ui::look_alcove();
         let a_glass = self.anim.glass.value;
         let a_r = self.anim.r.value;
         let a_ear = self.anim.ear.value;
@@ -2793,6 +2796,21 @@ impl App {
                     } else {
                         p.fill_geometry(&g, Color::black(bg_alpha));
                     }
+                    if glass && body.h >= 56.0 {
+                        // a soft sheen at the top and a little glow from below, like light in thick glass
+                        let k = a_glass;
+                        p.fill_geometry_vgrad(
+                            &g,
+                            body.y,
+                            body.bottom(),
+                            &[
+                                (0.0, Color::white(0.10 * k)),
+                                (0.3, Color::white(0.0)),
+                                (0.72, Color::white(0.0)),
+                                (1.0, Color::white(0.09 * k)),
+                            ],
+                        );
+                    }
                 }
 
                 p.push_clip(body);
@@ -2923,6 +2941,14 @@ impl App {
                             ui.fx.animate = true;
                         }
                     }
+                }
+                if glass && body.h >= 56.0 && a_glass > 0.01 {
+                    // the lit edge: a fine bright line down the sides and around the bottom corners
+                    let rim = Rect::new(body.x + 0.5, body.y - a_r - 2.0, body.w - 1.0, body.h + a_r + 1.5);
+                    p.push_clip(Rect::new(body.x - 1.0, body.y + a_ear * 0.8, body.w + 2.0, body.h));
+                    p.stroke_rounded(rim, a_r, 1.0, Color::white(0.17 * a_glass));
+                    p.stroke_rounded(rim.inset(1.0), (a_r - 1.0).max(1.0), 1.0, Color::white(0.05 * a_glass));
+                    p.pop_clip();
                 }
                 p.pop_clip();
             }
