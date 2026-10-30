@@ -2652,6 +2652,11 @@ impl App {
         let settled = self.settled;
         let see_through = ap.expanded_opacity < 0.97 || ap.collapsed_opacity < 0.97;
         let glass = ap.glass_look && crate::ui::look_alcove();
+        // the sheen and the lit edge step aside while a page is changing and come back as it lands
+        let glass_k = match self.page_from {
+            Some(_) => 1.0 - (self.anim.page.value.clamp(0.0, 1.0) * std::f32::consts::PI).sin(),
+            None => 1.0,
+        };
         let a_glass = self.anim.glass.value;
         let a_r = self.anim.r.value;
         let a_ear = self.anim.ear.value;
@@ -2798,7 +2803,7 @@ impl App {
                     }
                     if glass && body.h >= 56.0 {
                         // a soft sheen at the top and a little glow from below, like light in thick glass
-                        let k = a_glass;
+                        let k = a_glass * glass_k;
                         p.fill_geometry_vgrad(
                             &g,
                             body.y,
@@ -2942,12 +2947,12 @@ impl App {
                         }
                     }
                 }
-                if glass && body.h >= 56.0 && a_glass > 0.01 {
+                if glass && body.h >= 56.0 && a_glass * glass_k > 0.01 {
                     // the lit edge: a fine bright line down the sides and around the bottom corners
                     let rim = Rect::new(body.x + 0.5, body.y - a_r - 2.0, body.w - 1.0, body.h + a_r + 1.5);
                     p.push_clip(Rect::new(body.x - 1.0, body.y + a_ear * 0.8, body.w + 2.0, body.h));
-                    p.stroke_rounded(rim, a_r, 1.0, Color::white(0.17 * a_glass));
-                    p.stroke_rounded(rim.inset(1.0), (a_r - 1.0).max(1.0), 1.0, Color::white(0.05 * a_glass));
+                    p.stroke_rounded(rim, a_r, 1.0, Color::white(0.17 * a_glass * glass_k));
+                    p.stroke_rounded(rim.inset(1.0), (a_r - 1.0).max(1.0), 1.0, Color::white(0.05 * a_glass * glass_k));
                     p.pop_clip();
                 }
                 p.pop_clip();
