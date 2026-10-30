@@ -218,7 +218,7 @@ fn dial_height(p: &Peek, cfg: &Config) -> Option<f32> {
         return None;
     }
     match p.key {
-        Some("osd-volume" | "osd-brightness") if cfg.general.hud_ring => Some(172.0),
+        Some("osd-volume" | "osd-brightness") if cfg.general.hud_ring => Some(150.0),
         // these two have a status line under the value
         Some("battery" | "bluetooth") => Some(196.0),
         _ => None,
@@ -3242,8 +3242,14 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
     // Alcove: one big round dial instead of the slider (setting: General, round dial)
     let dial = dial_height(pk, ui.cfg).is_some();
     let dial_cy = body.y + ui.cfg.appearance.notch_height + 66.0;
-    let ir =
-        if dial { Rect::centered(body.cx(), dial_cy, 40.0, 40.0) } else { Rect::new(body.x + pad, row_y, 24.0, 24.0) };
+    let inside = dial && pk.key != Some("battery");
+    let ir = if inside {
+        Rect::centered(body.cx(), dial_cy - 13.0, 26.0, 26.0)
+    } else if dial {
+        Rect::centered(body.cx(), dial_cy, 40.0, 40.0)
+    } else {
+        Rect::new(body.x + pad, row_y, 24.0, 24.0)
+    };
     // Volume only: rest the pointer on the speaker for a moment to move to the next output device
     let mut hint = false;
     if pk.key == Some("osd-volume") {
@@ -3301,6 +3307,17 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
             crate::alcove::battery_glyph(ui, Rect::centered(body.cx(), dial_cy, 46.0, 24.0), frac, charging);
         } else {
             ui.p.icon(pk.icon, ir, fill.lerp(Color::white(1.0), 0.2));
+        }
+        if inside {
+            // the value sits inside the ring, clear of the soft blur along the bottom edge
+            let big = text.map_or_else(|| format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0), str::to_string);
+            let r = Rect::new(body.cx() - 36.0, dial_cy + 3.0, 72.0, 22.0);
+            if hint {
+                ui.p.text("Switch output", r, &TextStyle::new(10.5, palette::TEXT_DIM).medium().center());
+            } else {
+                ui.p.text(&big, r, &TextStyle::new(17.0, Color::white(0.95)).semibold().display().center());
+            }
+            return;
         }
         let label = Rect::new(body.x + 8.0, dial_cy + 60.0, body.w - 16.0, 30.0);
         // the big line, and a small one under it ("Charging" over "45%")
