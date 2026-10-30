@@ -2924,6 +2924,9 @@ impl App {
         // The live blur is the costliest thing the compositor does for us:
         // skip it while the panel is opaque anyway and while it is still moving.
         let blur = if ap.blur && (see_through || band_k > 0.01) && settled { a_glass } else { 0.0 };
+        // The frosted layer is dark and strong; under the see-through bottom edge it is only
+        // blended in lightly, so the page behind still shows through softly.
+        let blur = if band_k > 0.01 && !see_through { blur * 0.4 } else { blur };
         self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value);
 
         if let Some(page) = fx.open_page.take() {
