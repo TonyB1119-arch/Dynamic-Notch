@@ -2097,7 +2097,7 @@ impl App {
                 } else if pk.is_some_and(|p| p.is_hud()) {
                     // volume / brightness: one row, icon + beams + value
                     t.w = 300.0_f32.min(ap.expanded_width);
-                    t.h = base_h + 34.0;
+                    t.h = base_h + 34.0 + band_room(&self.cfg);
                     t.r = 26.0;
                     t.ear = 18.0;
                 } else if pk.is_some_and(|p| p.is_compact()) {
@@ -2109,24 +2109,24 @@ impl App {
                 } else if pk.is_some_and(crate::alcove::peek_notify) && crate::ui::look_alcove() {
                     // a message: avatar, name and two lines of text
                     t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
-                    t.h = base_h + 58.0;
+                    t.h = base_h + 58.0 + band_room(&self.cfg);
                     t.r = 40.0;
                     t.ear = 24.0;
                 } else if pk.is_some_and(crate::alcove::peek_conn) && crate::ui::look_alcove() {
                     // a device or network: small and left-weighted
                     t.w = (base_w + 70.0).max(280.0).min(ap.expanded_width);
-                    t.h = base_h + 24.0;
+                    t.h = base_h + 24.0 + band_room(&self.cfg);
                     t.r = 30.0;
                     t.ear = 18.0;
                 } else if pk.is_some_and(crate::alcove::peek_tall) && crate::ui::look_alcove() {
                     // a notice with a message: the text sits in its own box under the title
                     t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
-                    t.h = base_h + 92.0;
+                    t.h = base_h + 92.0 + band_room(&self.cfg);
                     t.r = 40.0;
                     t.ear = 24.0;
                 } else if crate::ui::look_alcove() {
                     t.w = (base_w + 170.0).max(400.0).min(ap.expanded_width);
-                    t.h = base_h + 46.0;
+                    t.h = base_h + 46.0 + band_room(&self.cfg);
                     t.r = 32.0;
                     t.ear = 22.0;
                 } else {
@@ -3299,7 +3299,7 @@ fn draw_device_dial(ui: &mut Ui, body: Rect, pk: &Peek) {
 
 fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: Option<&str>) {
     let pad = 24.0;
-    let row_y = body.bottom() - 36.0;
+    let row_y = body.bottom() - 36.0 - band_room(ui.cfg);
     // Alcove: one big round dial instead of the slider (setting: General, round dial)
     let dial = dial_height(pk, ui.cfg).is_some();
     let dial_cy = body.y + ui.cfg.appearance.notch_height + 66.0;
@@ -3451,8 +3451,8 @@ const SCAN_HELLO_AT: f32 = 0.46;
 /// the volume dial uses. The ring fills, the lock opens, then "Hello" and the name come in below.
 fn draw_scan_alcove(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
     let alpha = ui.p.alpha;
-    // the ring sits on the left, the words beside it
-    let cx = body.x + 82.0;
+    // the ring starts in the middle and slides to the left as "Hello" arrives
+    let cx = lerp(body.cx(), body.x + 82.0, smoothstep(0.44, 0.64, t));
     let cy = body.y + ui.cfg.appearance.notch_height + 66.0;
     let pop = smoothstep(0.0, 0.12, t);
     let fade = 1.0 - smoothstep(0.90, 1.0, t);
@@ -3868,7 +3868,8 @@ fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek, left: f32, swap: Option<(f32, &
     }
     // text peeks carry a rail of ticks along the bottom that drains while the peek is up
     let rail = !pk.is_compact() && !crate::ui::look_alcove();
-    let inner = Rect::new(body.x + 22.0, body.y + 8.0, body.w - 44.0, body.h - 16.0 - if rail { 12.0 } else { 0.0 });
+    let room = band_room(ui.cfg);
+    let inner = Rect::new(body.x + 22.0, body.y + 8.0, body.w - 44.0, body.h - 16.0 - room - if rail { 12.0 } else { 0.0 });
     if rail {
         let c = pk.accent.lerp(Color::white(1.0), 0.35);
         ui.ticks(Rect::new(body.x + 26.0, body.bottom() - 17.0, body.w - 52.0, 6.0), left, c);
@@ -3958,6 +3959,16 @@ fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
 fn band_draw(ui: &mut Ui, snap: &Snapshot, body: Rect, radius: f32, ear: f32) {
     if let Some(g) = gfx::notch_path(ui.p, body, radius, ear) {
         ui.p.snapshot_baked(snap, &g);
+    }
+}
+
+/// Extra height under the text of a popup while the soft bottom edge is on, so that edge only
+/// ever meets empty glass and never blurs a line of text.
+fn band_room(cfg: &Config) -> f32 {
+    if crate::ui::look_alcove() && cfg.appearance.bottom_fade && cfg.appearance.blur {
+        40.0
+    } else {
+        0.0
     }
 }
 
