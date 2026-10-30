@@ -4182,8 +4182,12 @@ fn draw_expanded_core(
     // direction while they move, like a quick scroll
     let al = crate::ui::look_alcove();
     let slide = if al { 28.0 } else { SLIDE };
-    if t < SPLIT {
-        let u = t / SPLIT;
+    // Alcove, with the pictures ready: the new page starts rising while the old one is still
+    // fading, so there is never an empty moment between the two
+    let overlap = al && snaps.is_some();
+    let (old_end, new_start) = if overlap { (0.52, 0.26) } else { (SPLIT, SPLIT) };
+    if t < old_end {
+        let u = t / old_end;
         let e = smoothstep(0.0, 1.0, u);
         ui.p.alpha = base * (1.0 - e);
         ui.interactive = false;
@@ -4193,8 +4197,9 @@ fn draw_expanded_core(
             Some((old, _)) => ui.p.snapshot(old, dx, dy, 1.0),
             None => draw_body(ui, from_content.translate(dx, dy), modules, started, from),
         }
-    } else {
-        let u = (t - SPLIT) / (1.0 - SPLIT);
+    }
+    if t >= new_start {
+        let u = (t - new_start) / (1.0 - new_start);
         // Alcove: the new page is already clearly there while it is still being stretched
         ui.p.alpha = base * if al { smoothstep(0.0, 0.4, u) } else { smoothstep(0.0, 0.8, u) };
         ui.interactive = was_interactive && u > 0.6;
