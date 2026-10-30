@@ -389,6 +389,8 @@ pub struct App {
     snap_pages: Option<(Snapshot, Snapshot)>,
     /// The bottom strip of the open page, for the soft blur along the bottom edge (Alcove).
     snap_band: Option<Snapshot>,
+    /// When the blur strip first appeared (it fades in from here).
+    band_since: Option<Instant>,
     pacer: Pacer,
     bus: Bus,
     rx: Receiver<Msg>,
@@ -489,6 +491,7 @@ impl App {
             snap_all: None,
             snap_pages: None,
             snap_band: None,
+            band_since: None,
             pacer,
             bus,
             rx,
@@ -2403,17 +2406,20 @@ impl App {
         let tw = self.page_width();
         let body = self.body_rect();
         let on = self.cfg.appearance.bottom_fade
+            && self.cfg.appearance.blur
             && crate::ui::look_alcove()
             && self.mode == Mode::Expanded
             && self.page_from.is_none()
             && self.page != "settings"
             && self.anim.exp.value >= 0.97
-            && (body.h - t.h).abs() < 1.5
-            && (body.w - tw).abs() < 1.5;
+            && (body.h - t.h).abs() < 3.0
+            && (body.w - tw).abs() < 3.0;
         if !on {
             self.snap_band = None;
+            self.band_since = None;
             return;
         }
+        self.band_since.get_or_insert(now);
         let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, t.h);
         let content = page_content(body.cx(), full.y, page_size(&self.cfg, &self.modules, &self.started, self.page));
         let h = BAND_H.min(full.h * 0.4);
@@ -2435,6 +2441,17 @@ impl App {
             };
             draw_body(&mut ui, content, &mut self.modules, &self.started, page);
         });
+    }
+
+    /// 0..1: how far the soft bottom edge has faded in (0 while it is off or the notch moves).
+    fn band_k(&self, now: Instant) -> f32 {
+        match (&self.snap_band, self.band_since) {
+            (Some(_), Some(t0)) => {
+                let x = (now.saturating_duration_since(t0).as_secs_f32() / 0.4).clamp(0.0, 1.0);
+                x * x * (3.0 - 2.0 * x)
+            }
+            _ => 0.0,
+        }
     }
 
     /// While the notch opens or closes, and while a page slides in, the content itself does not
@@ -2609,6 +2626,7 @@ impl App {
         let target_h = self.targets().h;
         // read before the painter borrows the window's resources
         let page_w = self.page_width();
+        let band_k = self.band_k(now);
         let bubble = self.bubble_rect();
         if !self.bubbles.is_empty() {
             if self.mode != Mode::Idle || self.peek.is_some() {
@@ -2728,7 +2746,20 @@ impl App {
                 // no blur while moving: stay a little more solid so it doesn't flash
                 let bg_alpha = if ap.blur && see_through && !settled { bg_alpha.max(0.94) } else { bg_alpha };
                 if let Some(g) = gfx::notch_path(&p, body, a_r, a_ear) {
-                    p.fill_geometry(&g, Color::black(bg_alpha));
+                    if band_k > 0.01 && body.h > BAND_H * 2.0 {
+                        // Alcove: the glass turns see-through toward the bottom edge
+                        let from = 1.0 - BAND_H / body.h;
+                        let low = bg_alpha * (1.0 - 0.62 * band_k);
+                        p.fill_geometry_vgrad(
+                            &g,
+                            body.y,
+                            body.bottom(),
+                            &[(0.0, Color::black(bg_alpha)), (from, Color::black(bg_alpha)), (1.0, Color::black(low))],
+                        );
+                        fx.animate |= band_k < 1.0;
+                    } else {
+                        p.fill_geometry(&g, Color::black(bg_alpha));
+                    }
                 }
 
                 p.push_clip(body);
@@ -2797,6 +2828,12 @@ impl App {
                             let trans =
                                 self.page_from.map(|(from, dir)| (from, dir, self.anim.page.value.clamp(0.0, 1.0)));
                             let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
+                            // the strip along the bottom is drawn from its own picture (sharp, then
+                            // softer toward the rim), so the live page stops just above it
+                            let band = if band_k > 0.01 { self.snap_band.as_ref() } else { None };
+                            if let Some(b) = band {
+                                ui.p.push_clip(Rect::new(0.0, -200.0, self.win_w, b.rect.y + 200.0));
+                            }
                             draw_expanded(
                                 &mut ui,
                                 full,
@@ -2809,11 +2846,9 @@ impl App {
                                 &self.indicators,
                                 pages,
                             );
-                            // Alcove: the soft blur along the bottom edge fades in once the notch has settled
-                            let want = if self.snap_band.is_some() { 1.0 } else { 0.0 };
-                            let k = ui.glide(gkey("alcove-band", 0), want);
-                            if let (Some(b), true) = (&self.snap_band, k > 0.01) {
-                                bottom_fade(&mut ui, b, full, k);
+                            if let Some(b) = band {
+                                ui.p.pop_clip();
+                                bottom_fade(&mut ui, b, full, band_k);
                             }
                         }
                     }
@@ -2869,7 +2904,7 @@ impl App {
         let bp = Rect::new(body.x * s, body.y * s, body.w * s, body.h.max(0.0) * s);
         // The live blur is the costliest thing the compositor does for us:
         // skip it while the panel is opaque anyway and while it is still moving.
-        let blur = if ap.blur && see_through && settled { a_glass } else { 0.0 };
+        let blur = if ap.blur && (see_through || band_k > 0.01) && settled { a_glass } else { 0.0 };
         self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value);
 
         if let Some(page) = fx.open_page.take() {
@@ -3806,11 +3841,12 @@ const BAND_H: f32 = 56.0;
 /// The bottom corner radius of the open Alcove notch (the strip follows it).
 const BAND_R: f32 = 46.0;
 
-/// The soft blur along the bottom edge (Alcove): content fades into a light blur and a little
-/// darkness toward the rim. `snap` is the strip's own picture; `k` fades the whole effect in.
-/// Drawn as a few thin slices so it follows the rounded corners and stays cheap.
+/// The soft blur along the bottom edge (Alcove): the content in the last strip of the open notch
+/// goes from sharp to a light blur and fades into the glass toward the rim. `snap` is the strip's
+/// own picture; `k` fades the whole effect in. Drawn as a few thin slices, which follow the rounded
+/// corners and keep it cheap.
 fn bottom_fade(ui: &mut Ui, snap: &Snapshot, full: Rect, k: f32) {
-    const N: usize = 10;
+    const N: usize = 14;
     let band = snap.rect;
     let bottom = full.bottom();
     let step = band.h / N as f32;
@@ -3818,27 +3854,23 @@ fn bottom_fade(ui: &mut Ui, snap: &Snapshot, full: Rect, k: f32) {
         let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    for pass in 0..3 {
-        for i in 0..N {
-            let u = (i as f32 + 0.5) / N as f32;
-            let y = band.y + step * i as f32;
-            // keep inside the rounded bottom corners
-            let dy = (y + step - (bottom - BAND_R)).max(0.0).min(BAND_R);
-            let inset = BAND_R - (BAND_R * BAND_R - dy * dy).max(0.0).sqrt();
-            let r = Rect::new(band.x + inset, y, band.w - inset * 2.0, step + 0.5);
-            if r.w <= 1.0 {
-                continue;
-            }
-            match pass {
-                0 => ui.p.fill_rect(r, Color::black(0.55 * ease(0.1, 1.0, u) * k)),
-                1 => {
-                    ui.p.push_clip(r);
-                    ui.p.snapshot_soft(snap, 0.0, 0.0, 0.75 * ease(0.1, 1.0, u) * k);
-                    ui.p.pop_clip();
-                }
-                _ => ui.p.fill_rect(r, Color::black(0.40 * ease(0.35, 1.0, u) * k)),
-            }
+    for i in 0..N {
+        let u = (i as f32 + 0.5) / N as f32;
+        let y0 = (band.y + step * i as f32).round();
+        let y1 = if i + 1 == N { band.bottom() } else { (band.y + step * (i + 1) as f32).round() };
+        // keep inside the rounded bottom corners
+        let dy = (y1 - (bottom - BAND_R)).clamp(0.0, BAND_R);
+        let inset = BAND_R - (BAND_R * BAND_R - dy * dy).max(0.0).sqrt();
+        let r = Rect::new(band.x + inset, y0, band.w - inset * 2.0, y1 - y0);
+        if r.w <= 1.0 || r.h <= 0.0 {
+            continue;
         }
+        let soft = ease(0.0, 0.9, u) * k;
+        let fade = 1.0 - 0.6 * ease(0.3, 1.0, u) * k;
+        ui.p.push_clip(r);
+        ui.p.snapshot(snap, 0.0, 0.0, (1.0 - soft) * fade);
+        ui.p.snapshot_soft(snap, 0.0, 0.0, soft * fade);
+        ui.p.pop_clip();
     }
 }
 

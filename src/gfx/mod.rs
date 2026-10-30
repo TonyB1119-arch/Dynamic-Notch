@@ -611,6 +611,31 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// A shape filled with a vertical gradient from `y0` to `y1`; `stops` are (position 0..1, color).
+    pub fn fill_geometry_vgrad(&self, g: &ID2D1Geometry, y0: f32, y1: f32, stops: &[(f32, Color)]) {
+        if stops.len() < 2 || y1 - y0 < 0.5 {
+            return;
+        }
+        let mut buf = [D2D1_GRADIENT_STOP::default(); 8];
+        let n = stops.len().min(buf.len());
+        for (slot, (pos, c)) in buf.iter_mut().zip(stops) {
+            *slot = D2D1_GRADIENT_STOP { position: *pos, color: d2c(c.alpha(self.alpha)) };
+        }
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: v2(0.0, y0), endPoint: v2(0.0, y1) };
+        unsafe {
+            let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+                &self.dc,
+                &buf[..n],
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            ) else {
+                return;
+            };
+            let Ok(brush) = self.dc.CreateLinearGradientBrush(&props, None, &coll) else { return };
+            self.dc.FillGeometry(g, &brush, None);
+        }
+    }
+
     pub fn fill_rounded(&self, r: Rect, radius: f32, c: Color) {
         if c.a * self.alpha <= 0.001 || r.w <= 0.0 || r.h <= 0.0 {
             return;
