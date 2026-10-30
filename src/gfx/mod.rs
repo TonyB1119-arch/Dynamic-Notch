@@ -1151,6 +1151,10 @@ pub struct Snapshot {
     pub rect: Rect,
     pub key: u64,
     pub born: std::time::Instant,
+    /// The pictures behind the brushes (full size, then half, quarter, eighth) and the size in
+    /// device pixels, so a strip that is redrawn often reuses them instead of allocating again.
+    bufs: Vec<ID2D1Bitmap1>,
+    px: (u32, u32),
 }
 
 impl Res {
@@ -1163,6 +1167,8 @@ impl Res {
         scale: f32,
         region: Rect,
         key: u64,
+        reuse: Option<Snapshot>,
+        deep: bool,
         draw: impl FnOnce(&mut Painter),
     ) -> Option<Snapshot> {
         let x0 = (region.x * scale).floor();
@@ -1184,7 +1190,51 @@ impl Res {
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
             colorContext: ManuallyDrop::new(None),
         };
+        let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+        // one halving step: `src` averaged down into `dst`
+        let down = |src: &ID2D1Bitmap1, dst: &ID2D1Bitmap1, nw: u32, nh: u32| -> bool {
+            let Ok(from) = src.cast::<ID2D1Bitmap>() else { return false };
+            unsafe {
+                dc.SetTarget(dst);
+                dc.SetTransform(&ident);
+                dc.BeginDraw();
+                dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                let d = D2D_RECT_F { left: 0.0, top: 0.0, right: nw as f32, bottom: nh as f32 };
+                dc.DrawBitmap(&from, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+                let ok = dc.EndDraw(None, None).is_ok();
+                dc.SetTarget(None);
+                ok
+            }
+        };
         unsafe {
+            // the same size as last time: draw into the pictures that already exist
+            if let Some(mut old) = reuse.filter(|r| r.px == (w, h) && r.bufs.len() == 4) {
+                dc.SetTarget(&old.bufs[0]);
+                dc.BeginDraw();
+                {
+                    let mut p = Painter::new(dc.clone(), gfx, &mut *self, scale, -x0, -y0);
+                    p.clear();
+                    draw(&mut p);
+                }
+                let ok = dc.EndDraw(None, None).is_ok();
+                dc.SetTarget(None);
+                if !ok {
+                    return None;
+                }
+                let (mut sw, mut sh) = (w, h);
+                for i in 1..4 {
+                    let (nw, nh) = (sw.div_ceil(2).max(1), sh.div_ceil(2).max(1));
+                    if !down(&old.bufs[i - 1], &old.bufs[i], nw, nh) {
+                        return None;
+                    }
+                    sw = nw;
+                    sh = nh;
+                }
+                old.rect = Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale);
+                old.key = key;
+                old.born = std::time::Instant::now();
+                return Some(old);
+            }
             let bmp = dc.CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props).ok()?;
             dc.SetTarget(&bmp);
             dc.BeginDraw();
@@ -1204,43 +1254,46 @@ impl Res {
                 interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
             };
             let brush = dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
-            // Halve the picture three times (each step averages 2x2 pixels) and keep every step:
-            // half, quarter and eighth size. Stretched back up with a smooth filter each one reads
-            // as a blur, a stronger one the smaller it is, for a fraction of a real blur's cost.
-            let levels = (|| -> Option<Vec<ID2D1BitmapBrush1>> {
+            // Halve the picture three times (each step averages 2x2 pixels). Stretched back up with a
+            // smooth filter each step reads as a blur, a stronger one the smaller it is, for a
+            // fraction of a real blur's cost. A page picture only ever needs the quarter-size step
+            // (`deep` keeps all three, for the bottom strip); the others are let go straight away.
+            let smooth = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+            };
+            let mut bufs: Vec<ID2D1Bitmap1> = Vec::new();
+            let mut brushes: [Option<ID2D1BitmapBrush1>; 3] = [None, None, None];
+            let built = (|| -> Option<()> {
                 let mut src: ID2D1Bitmap1 = bmp.clone();
                 let (mut sw, mut sh) = (w, h);
-                let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
-                let smooth = D2D1_BITMAP_BRUSH_PROPERTIES1 {
-                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
-                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
-                    interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                };
-                let mut out = Vec::with_capacity(3);
-                for _ in 0..3 {
+                if deep {
+                    bufs.push(bmp.clone());
+                }
+                for (i, slot) in brushes.iter_mut().enumerate() {
                     let (nw, nh) = (sw.div_ceil(2).max(1), sh.div_ceil(2).max(1));
                     let small = dc.CreateBitmap(D2D_SIZE_U { width: nw, height: nh }, None, 0, &props).ok()?;
-                    dc.SetTarget(&small);
-                    dc.SetTransform(&ident);
-                    dc.BeginDraw();
-                    dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-                    let d = D2D_RECT_F { left: 0.0, top: 0.0, right: nw as f32, bottom: nh as f32 };
-                    let from: ID2D1Bitmap = src.cast().ok()?;
-                    dc.DrawBitmap(&from, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
-                    let ok = dc.EndDraw(None, None).is_ok();
-                    dc.SetTarget(None);
-                    if !ok {
+                    if !down(&src, &small, nw, nh) {
                         return None;
+                    }
+                    if deep || i == 1 {
+                        *slot = Some(dc.CreateBitmapBrush(&small, Some(&smooth), None).ok()?);
+                    }
+                    if deep {
+                        bufs.push(small.clone());
                     }
                     src = small;
                     sw = nw;
                     sh = nh;
-                    out.push(dc.CreateBitmapBrush(&src, Some(&smooth), None).ok()?);
                 }
-                Some(out)
+                Some(())
             })();
-            let mut levels = levels.unwrap_or_default().into_iter();
-            let (half, soft, far) = (levels.next(), levels.next(), levels.next());
+            if built.is_none() {
+                bufs.clear();
+                brushes = [None, None, None];
+            }
+            let [half, soft, far] = brushes;
             Some(Snapshot {
                 brush,
                 soft,
@@ -1249,6 +1302,8 @@ impl Res {
                 rect: Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale),
                 key,
                 born: std::time::Instant::now(),
+                bufs,
+                px: (w, h),
             })
         }
     }

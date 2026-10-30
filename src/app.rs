@@ -2445,7 +2445,7 @@ impl App {
                 page_content(body.cx(), full.y, page_size(&self.cfg, &self.modules, &self.started, self.page));
             let h = BAND_H.min(full.h * 0.4);
             let region = Rect::new(full.x, full.bottom() - h, full.w, h);
-            self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4D, |p| {
+            self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4D, self.snap_band.take(), true, |p| {
                 let mut ui = Ui {
                     p,
                     input: &input,
@@ -2465,7 +2465,7 @@ impl App {
             let left = (act.until.saturating_duration_since(now).as_secs_f32()
                 / act.peek.duration.as_secs_f32().max(0.1))
             .clamp(0.0, 1.0);
-            self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4E, |p| {
+            self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4E, self.snap_band.take(), true, |p| {
                 let mut ui = Ui {
                     p,
                     input: &input,
@@ -2550,7 +2550,7 @@ impl App {
             if !fresh {
                 let tabs = self.tab_list();
                 let region = clamp(full);
-                self.snap_all = self.res.render_snapshot(&self.gfx, scale, region, key, |p| {
+                self.snap_all = self.res.render_snapshot(&self.gfx, scale, region, key, None, false, |p| {
                     let mut ui = Ui {
                         p,
                         input: &input,
@@ -2606,7 +2606,7 @@ impl App {
             if !fresh {
                 let mut shots: Vec<Option<Snapshot>> = Vec::with_capacity(2);
                 for (id, key, content) in [(from, kf, cf), (page, kt, ct)] {
-                    let snap = self.res.render_snapshot(&self.gfx, scale, region, key, |p| {
+                    let snap = self.res.render_snapshot(&self.gfx, scale, region, key, None, false, |p| {
                         let mut ui = Ui {
                             p,
                             input: &input,
@@ -2952,7 +2952,7 @@ impl App {
                         }
                     }
                 }
-                if glass && glass_k > 0.0 && body.h >= 56.0 && a_glass > 0.01 {
+                if glass && glass_k > 0.0 && settled && body.h >= 56.0 && a_glass > 0.01 {
                     // the lit edge: a fine bright line down the sides and around the bottom corners
                     let rim = Rect::new(body.x + 0.5, body.y - a_r - 2.0, body.w - 1.0, body.h + a_r + 1.5);
                     p.push_clip(Rect::new(body.x - 1.0, body.y + a_ear * 0.8, body.w + 2.0, body.h));
