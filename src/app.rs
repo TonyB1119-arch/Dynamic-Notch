@@ -2412,8 +2412,7 @@ impl App {
             && self.page_from.is_none()
             && self.page != "settings"
             && self.anim.exp.value >= 0.97
-            && (body.h - t.h).abs() < 3.0
-            && (body.w - tw).abs() < 3.0;
+            && (body.h - t.h).abs() < 24.0;
         if !on {
             self.snap_band = None;
             self.band_since = None;
@@ -2746,6 +2745,9 @@ impl App {
                 // no blur while moving: stay a little more solid so it doesn't flash
                 let bg_alpha = if ap.blur && see_through && !settled { bg_alpha.max(0.94) } else { bg_alpha };
                 if let Some(g) = gfx::notch_path(&p, body, a_r, a_ear) {
+                    if self.snap_band.is_some() && band_k < 1.0 {
+                        fx.animate = true;
+                    }
                     if band_k > 0.01 && body.h > BAND_H * 2.0 {
                         // Alcove: the glass turns see-through toward the bottom edge
                         let from = 1.0 - BAND_H / body.h;
