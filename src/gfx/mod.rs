@@ -1226,7 +1226,7 @@ impl Res {
                     dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
                     let d = D2D_RECT_F { left: 0.0, top: 0.0, right: nw as f32, bottom: nh as f32 };
                     let from: ID2D1Bitmap = src.cast().ok()?;
-                    dc.DrawBitmap(&from, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                    dc.DrawBitmap(&from, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
                     let ok = dc.EndDraw(None, None).is_ok();
                     dc.SetTarget(None);
                     if !ok {
