@@ -292,6 +292,9 @@ pub struct Res {
     /// Tessellated shapes kept on the GPU (see `Painter::fill_cached`).
     realizations: std::cell::RefCell<HashMap<RKey, (ID2D1GeometryRealization, u64)>>,
     frame: u64,
+    /// The fade masks and the full-strip rectangle used by `bake_band`, made once per strip height.
+    band_mask: Option<(u32, Vec<ID2D1LinearGradientBrush>)>,
+    band_geo: Option<((u32, u32), ID2D1Geometry)>,
 }
 
 /// Cache key for a realized shape: kind + quantized dimensions.
@@ -328,6 +331,8 @@ impl Res {
                 shadow: None,
                 realizations: std::cell::RefCell::new(HashMap::new()),
                 frame: 0,
+                band_mask: None,
+                band_geo: None,
             })
         }
     }
@@ -1155,6 +1160,149 @@ pub struct Snapshot {
     /// device pixels, so a strip that is redrawn often reuses them instead of allocating again.
     bufs: Vec<ID2D1Bitmap1>,
     px: (u32, u32),
+    /// The strip with its blur already blended in (see `Res::bake_band`).
+    baked: Option<(ID2D1Bitmap1, ID2D1BitmapBrush1)>,
+}
+
+impl Res {
+    /// Blend the strip's pictures (sharp, then lighter to heavier blur) into ONE picture. Each
+    /// layer is laid down through a smooth vertical fade, so the blur grows steadily toward the
+    /// rim with no slices and no steps, and the screen then draws a single picture. Called each
+    /// time the strip is redrawn; the masks and the rectangle are made once per strip height.
+    /// Returns false (and clears the baked picture) when something is missing.
+    pub fn bake_band(&mut self, gfx: &Gfx, s: &mut Snapshot) -> bool {
+        if s.bufs.len() != 4 || s.half.is_none() || s.soft.is_none() || s.far.is_none() {
+            s.baked = None;
+            return false;
+        }
+        let ok = self.bake_band_inner(gfx, s).is_some();
+        if !ok {
+            s.baked = None;
+        }
+        ok
+    }
+
+    fn bake_band_inner(&mut self, gfx: &Gfx, s: &mut Snapshot) -> Option<()> {
+        let (w, h) = s.px;
+        let dc = self.dc.clone();
+        let ease = |a: f32, b: f32, x: f32| {
+            let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        unsafe {
+            if self.band_mask.as_ref().map(|m| m.0) != Some(h) {
+                const N: usize = 40;
+                let mut masks = Vec::with_capacity(4);
+                for l in 0..4usize {
+                    let mut stops = [D2D1_GRADIENT_STOP::default(); N];
+                    for (j, st) in stops.iter_mut().enumerate() {
+                        let u = j as f32 / (N - 1) as f32;
+                        // how much of each picture a row takes: two neighbouring ones are blended so
+                        // that together they add up to exactly `fade` of coverage
+                        let pos = ease(0.0, 1.0, u) * 2.5;
+                        let lo = pos.floor();
+                        let mix = pos - lo;
+                        let fade = 1.0 - 0.72 * ease(0.25, 1.0, u);
+                        let under = fade * (1.0 - mix) / (1.0 - mix * fade).max(0.05);
+                        let lo = lo as usize;
+                        let a = if l == lo {
+                            under
+                        } else if l == lo + 1 && mix > 0.01 {
+                            mix * fade
+                        } else {
+                            0.0
+                        };
+                        *st = D2D1_GRADIENT_STOP { position: u, color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a } };
+                    }
+                    let coll = ID2D1RenderTarget::CreateGradientStopCollection(
+                        &dc,
+                        &stops,
+                        D2D1_GAMMA_2_2,
+                        D2D1_EXTEND_MODE_CLAMP,
+                    )
+                    .ok()?;
+                    let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: v2(0.0, 0.0), endPoint: v2(0.0, h as f32) };
+                    masks.push(dc.CreateLinearGradientBrush(&props, None, &coll).ok()?);
+                }
+                self.band_mask = Some((h, masks));
+            }
+            if self.band_geo.as_ref().map(|g| g.0) != Some((w, h)) {
+                let r = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+                let geo: ID2D1Geometry = gfx.d2d_factory.CreateRectangleGeometry(&r).ok()?.cast().ok()?;
+                self.band_geo = Some(((w, h), geo));
+            }
+            if s.baked.is_none() {
+                let props = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                    colorContext: ManuallyDrop::new(None),
+                };
+                let bmp = dc.CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props).ok()?;
+                let bprops = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
+                };
+                let brush = dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
+                s.baked = Some((bmp, brush));
+            }
+            let (bmp, _) = s.baked.as_ref()?;
+            let (_, masks) = self.band_mask.as_ref()?;
+            let (_, geo) = self.band_geo.as_ref()?;
+            let layers = [Some(&s.brush), s.half.as_ref(), s.soft.as_ref(), s.far.as_ref()];
+            dc.SetTarget(bmp);
+            dc.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+            dc.BeginDraw();
+            dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            // a mask brush needs aliased drawing; a pixel-aligned rectangle has no edge to smooth
+            dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            for (l, (layer, mask)) in layers.iter().zip(masks.iter()).enumerate() {
+                let Some(b) = layer else { continue };
+                let f = (1u32 << l) as f32;
+                b.SetTransform(&Matrix3x2 { M11: f, M12: 0.0, M21: 0.0, M22: f, M31: 0.0, M32: 0.0 });
+                b.SetOpacity(1.0);
+                dc.FillGeometry(geo, *b, mask);
+            }
+            dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            let ok = dc.EndDraw(None, None).is_ok();
+            dc.SetTarget(None);
+            ok.then_some(())
+        }
+    }
+}
+
+impl Snapshot {
+    /// True once the blended strip picture exists.
+    pub fn is_baked(&self) -> bool {
+        self.baked.is_some()
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Draw the blended strip through `shape` (the notch outline, so the rounded corners are
+    /// smooth), limited to the strip's own rectangle. One fill, whatever the strip height.
+    pub fn snapshot_baked(&self, s: &Snapshot, shape: &ID2D1Geometry) -> bool {
+        let Some((_, b)) = &s.baked else { return false };
+        let a = self.alpha;
+        if a <= 0.002 {
+            return true;
+        }
+        let k = 1.0 / self.scale;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: s.rect.x, M32: s.rect.y };
+        self.push_clip(s.rect);
+        unsafe {
+            b.SetTransform(&m);
+            b.SetOpacity(a);
+            self.dc.FillGeometry(shape, b, None);
+        }
+        self.pop_clip();
+        true
+    }
 }
 
 impl Res {
@@ -1304,6 +1452,7 @@ impl Res {
                 born: std::time::Instant::now(),
                 bufs,
                 px: (w, h),
+                baked: None,
             })
         }
     }
@@ -1354,34 +1503,6 @@ impl<'a> Painter<'a> {
                     self.dc.FillRectangle(&rf(Rect::new(x, y, w, h)), &s.brush);
                 }
             }
-        }
-    }
-}
-
-impl<'a> Painter<'a> {
-    /// A snapshot at blur level `lvl`: 0 sharp, 1 light, 2 medium, 3 heavy (the picture drawn from
-    /// a half, quarter or eighth size copy). Falls back to the sharp picture if there is none.
-    pub fn snapshot_level(&self, s: &Snapshot, lvl: u8, opacity: f32) {
-        let brush = match lvl {
-            0 => None,
-            1 => s.half.as_ref(),
-            2 => s.soft.as_ref(),
-            _ => s.far.as_ref(),
-        };
-        let Some(b) = brush else {
-            self.snapshot(s, 0.0, 0.0, opacity);
-            return;
-        };
-        let a = opacity * self.alpha;
-        if a <= 0.002 {
-            return;
-        }
-        let k = (1u32 << lvl.min(3)) as f32 / self.scale;
-        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: s.rect.x, M32: s.rect.y };
-        unsafe {
-            b.SetTransform(&m);
-            b.SetOpacity(a);
-            self.dc.FillRectangle(&rf(s.rect), b);
         }
     }
 }

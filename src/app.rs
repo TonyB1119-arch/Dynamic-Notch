@@ -219,8 +219,8 @@ fn dial_height(p: &Peek, cfg: &Config) -> Option<f32> {
     }
     match p.key {
         Some("osd-volume" | "osd-brightness") if cfg.general.hud_ring => Some(150.0),
-        // these two have a status line under the value
-        Some("battery" | "bluetooth") => Some(196.0),
+        // the value sits inside the ring here too, so no extra room is needed under it
+        Some("battery" | "bluetooth") => Some(150.0),
         _ => None,
     }
 }
@@ -390,6 +390,8 @@ pub struct App {
     snap_pages: Option<(Snapshot, Snapshot)>,
     /// The bottom strip of the open page, for the soft blur along the bottom edge (Alcove).
     snap_band: Option<Snapshot>,
+    /// Set if the blended bottom strip could not be made: the notch then stays solid, no see-through edge.
+    band_failed: bool,
     /// When the blur strip first appeared (it fades in from here).
     band_since: Option<Instant>,
     pacer: Pacer,
@@ -492,6 +494,7 @@ impl App {
             snap_all: None,
             snap_pages: None,
             snap_band: None,
+            band_failed: false,
             band_since: None,
             pacer,
             bus,
@@ -2415,7 +2418,7 @@ impl App {
         let tw = self.page_width();
         let body = self.body_rect();
         let ap = &self.cfg.appearance;
-        let on = ap.bottom_fade && ap.blur && crate::ui::look_alcove();
+        let on = ap.bottom_fade && ap.blur && crate::ui::look_alcove() && !self.band_failed;
         let page_band = on
             && self.mode == Mode::Expanded
             && self.page != "settings"
@@ -2479,6 +2482,17 @@ impl App {
                 };
                 draw_peek(&mut ui, body, &act.peek, left, None);
             });
+        }
+        // blend the strip's blur levels into one picture, drawn later in a single fill
+        let baked = match self.snap_band.as_mut() {
+            Some(s) => self.res.bake_band(&self.gfx, s),
+            None => true,
+        };
+        if !baked {
+            log!("bottom blur could not be built: staying solid");
+            self.band_failed = true;
+            self.snap_band = None;
+            self.band_since = None;
         }
     }
 
@@ -2867,7 +2881,7 @@ impl App {
                         draw_peek(&mut ui, body, &pk.peek, left.clamp(0.0, 1.0), swap);
                         if let Some(b) = band {
                             ui.p.pop_clip();
-                            bottom_fade(&mut ui, b, body.bottom(), a_r, band_k, self.scale);
+                            band_draw(&mut ui, b, body, a_r, a_ear);
                         }
                         ui.p.reset_local();
                     }
@@ -2921,7 +2935,7 @@ impl App {
                             );
                             if let Some(b) = band {
                                 ui.p.pop_clip();
-                                bottom_fade(&mut ui, b, body.bottom(), a_r, band_k, self.scale);
+                                band_draw(&mut ui, b, body, a_r, a_ear);
                             }
                         }
                     }
@@ -3278,7 +3292,7 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
     // Alcove: one big round dial instead of the slider (setting: General, round dial)
     let dial = dial_height(pk, ui.cfg).is_some();
     let dial_cy = body.y + ui.cfg.appearance.notch_height + 66.0;
-    let inside = dial && pk.key != Some("battery");
+    let inside = dial;
     let ir = if inside {
         Rect::centered(body.cx(), dial_cy - 13.0, 26.0, 26.0)
     } else if dial {
@@ -3340,41 +3354,34 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
         if battery {
             // a battery in the middle of the ring (with a bolt while charging)
             let charging = text.is_some_and(|t| t.starts_with("Charging") || t.starts_with("Fully"));
-            crate::alcove::battery_glyph(ui, Rect::centered(body.cx(), dial_cy, 46.0, 24.0), frac, charging);
+            crate::alcove::battery_glyph(ui, Rect::centered(body.cx(), dial_cy - 12.0, 38.0, 20.0), frac, charging);
         } else {
             ui.p.icon(pk.icon, ir, fill.lerp(Color::white(1.0), 0.2));
         }
-        if inside {
-            // the value sits inside the ring, clear of the soft blur along the bottom edge
-            let big = text.map_or_else(|| format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0), str::to_string);
-            let r = Rect::new(body.cx() - 36.0, dial_cy + 3.0, 72.0, 22.0);
-            if hint {
-                ui.p.text("Switch output", r, &TextStyle::new(10.5, palette::TEXT_DIM).medium().center());
-            } else {
-                ui.p.text(&big, r, &TextStyle::new(17.0, Color::white(0.95)).semibold().display().center());
-            }
+        // the value sits inside the ring, clear of the soft blur along the bottom edge
+        let pct = format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0);
+        let r = Rect::new(body.cx() - 38.0, dial_cy + 3.0, 76.0, 22.0);
+        if hint {
+            ui.p.text("Switch output", r, &TextStyle::new(10.5, palette::TEXT_DIM).medium().center());
             return;
         }
-        let label = Rect::new(body.x + 8.0, dial_cy + 60.0, body.w - 16.0, 30.0);
-        // the big line, and a small one under it ("Charging" over "45%")
-        let pct = format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0);
-        let (big, small) = match text {
-            Some(t) if battery => match t.split_once(" · ") {
-                Some((status, p)) => (p.to_string(), Some(status.to_string())),
-                None => (pct, Some(t.to_string())),
-            },
-            Some(t) => (t.to_string(), None),
-            None => (pct, None),
+        let mut big = match text {
+            // "Charging · 45%": the bolt in the glyph already says charging, so only the number
+            Some(t) if battery => t.split_once(" · ").map_or(pct, |(_, p)| p.to_string()),
+            Some(t) => t.to_string(),
+            None => pct,
         };
-        if hint {
-            ui.p.text("Switch output", label, &TextStyle::new(13.0, palette::TEXT_DIM).medium().center());
-        } else {
-            ui.p.text(&big, label, &TextStyle::new(24.0, Color::white(0.95)).semibold().display().center());
-            if let Some(sm) = small {
-                let line = Rect::new(body.x + 8.0, dial_cy + 90.0, body.w - 16.0, 20.0);
-                ui.p.text(&sm, line, &TextStyle::new(13.0, palette::TEXT_DIM).medium().center());
+        // a long name (a Bluetooth device) is set smaller and cut short to stay inside the ring
+        let size = if big.chars().count() <= 5 { 17.0 } else { 12.0 };
+        let st = TextStyle::new(size, Color::white(0.95)).semibold().display().center();
+        while big.chars().count() > 3 && ui.p.measure(&big, &st).0 > r.w {
+            big.pop();
+            if ui.p.measure(&big, &st).0 <= r.w {
+                big.push('\u{2026}');
+                break;
             }
         }
+        ui.p.text(&big, r, &st);
         return;
     }
     if crate::ui::look_alcove() {
@@ -3937,52 +3944,16 @@ fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
     }
 }
 
-/// How tall the soft-blur strip along the bottom of the open notch is.
-const BAND_H: f32 = 64.0;
-
-/// The soft blur along the bottom edge (Alcove): the content in the last strip of the open notch
-/// goes from sharp to a light blur and fades into the glass toward the rim. `snap` is the strip's
-/// own picture, `bottom` the notch's bottom edge and `radius` its corner radius; `k` scales the
-/// effect. Drawn as a few thin slices, which follow the rounded corners and keep it cheap.
-fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32, scale: f32) {
-    let band = snap.rect;
-    let n = ((band.h * scale).round() as usize).clamp(8, 160);
-    let rad = radius.max(6.0);
-    let step = band.h / n as f32;
-    // slice edges sit exactly on device pixels, so neighbouring slices meet without a seam
-    let px = |v: f32| (v * scale).round() / scale;
-    let ease = |a: f32, b: f32, x: f32| {
-        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-    for i in 0..n {
-        let u = (i as f32 + 0.5) / n as f32;
-        let y0 = px(band.y + step * i as f32);
-        let y1 = if i + 1 == n { band.bottom() } else { px(band.y + step * (i + 1) as f32) };
-        // keep inside the rounded bottom corners
-        let dy = (y1 - (bottom - rad)).clamp(0.0, rad);
-        let inset = rad - (rad * rad - dy * dy).max(0.0).sqrt();
-        let (x0, x1) = (px(band.x + inset), px(band.right() - inset));
-        let r = Rect::new(x0, y0, x1 - x0, y1 - y0);
-        if r.w <= 1.0 || r.h <= 0.0 {
-            continue;
-        }
-        // blur grows steadily toward the rim: each row blends two neighbouring levels
-        let pos = ease(0.0, 1.0, u) * k * 2.5;
-        let lo = pos.floor();
-        let mix = pos - lo;
-        let fade = 1.0 - 0.72 * ease(0.25, 1.0, u) * k;
-        ui.p.push_clip(r);
-        // two layers laid over each other must add up to exactly `fade` of coverage, with the upper
-        // one carrying `mix` of the colour; otherwise a step shows each time the pair moves on
-        let under = fade * (1.0 - mix) / (1.0 - mix * fade).max(0.05);
-        ui.p.snapshot_level(snap, lo as u8, under);
-        if mix > 0.01 {
-            ui.p.snapshot_level(snap, lo as u8 + 1, mix * fade);
-        }
-        ui.p.pop_clip();
+/// The soft bottom edge: the blended strip drawn in one fill through the notch outline.
+#[allow(clippy::too_many_arguments)]
+fn band_draw(ui: &mut Ui, snap: &Snapshot, body: Rect, radius: f32, ear: f32) {
+    if let Some(g) = gfx::notch_path(ui.p, body, radius, ear) {
+        ui.p.snapshot_baked(snap, &g);
     }
 }
+
+/// How tall the soft-blur strip along the bottom of the open notch is.
+const BAND_H: f32 = 64.0;
 
 /// The open notch. In the Alcove look the page dots sit on top of it, and while their page list
 /// is open the page underneath does not react to the mouse.

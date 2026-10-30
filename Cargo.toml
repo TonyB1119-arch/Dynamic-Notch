@@ -1,6 +1,6 @@
 [package]
 name = "dynamic-notch"
-version = "3.0.23"
+version = "3.0.24"
 edition = "2021"
 description = "A MacBook-style dynamic notch / desktop island for Windows"
 license = "MIT"
