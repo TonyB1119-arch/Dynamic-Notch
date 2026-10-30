@@ -1177,6 +1177,9 @@ impl App {
         self.process_timeouts(now);
         if self.trim_at.is_some_and(|t| t <= now + Duration::from_millis(2)) {
             self.trim_at = None;
+            if self.snap_band.is_some() {
+                log!("trim while the bottom blur is showing");
+            }
             self.res.trim_bitmaps();
             self.host.reset_dc(&self.gfx);
             self.gfx.trim();
@@ -2414,6 +2417,17 @@ impl App {
             && self.anim.exp.value >= 0.97
             && (body.h - t.h).abs() < 24.0;
         if !on {
+            if self.band_since.is_some() {
+                log!(
+                    "bottom blur off: mode {:?} paging {} page {} exp {:.3} dh {:.1} exp_w {:.1}",
+                    self.mode,
+                    self.page_from.is_some(),
+                    self.page,
+                    self.anim.exp.value,
+                    body.h - t.h,
+                    body.w - tw
+                );
+            }
             self.snap_band = None;
             self.band_since = None;
             return;
@@ -2440,6 +2454,9 @@ impl App {
             };
             draw_body(&mut ui, content, &mut self.modules, &self.started, page);
         });
+        if self.snap_band.is_none() {
+            log!("bottom blur: the strip picture could not be made");
+        }
     }
 
     /// 0..1: how far the soft bottom edge has faded in (0 while it is off or the notch moves).
