@@ -619,9 +619,11 @@ pub fn scroll_rows(ui: &mut Ui, area: Rect, off: &mut f32, content_h: f32, pitch
 
 /// How big the unlock greeting's stage is: wide enough for the name, tall enough for two lines.
 pub fn hello_stage(name: &str) -> (f32, f32) {
+    // the ring on the left, "Hello" and the name beside it: wide rather than tall, so nothing
+    // sits in the soft blur along the bottom edge
     if name.is_empty() {
-        (230.0, 112.0)
+        (290.0, 150.0)
     } else {
-        ((70.0 + name.chars().count() as f32 * 22.0).clamp(250.0, 440.0), 158.0)
+        ((180.0 + name.chars().count() as f32 * 13.0).clamp(310.0, 470.0), 150.0)
     }
 }

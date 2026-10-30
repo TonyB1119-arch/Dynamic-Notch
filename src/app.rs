@@ -2063,7 +2063,7 @@ impl App {
                     // unlock: a round dial like the volume one, with "Hello" and the name under it
                     let name = hello_name(pk.map_or("", |p| p.title.as_str()));
                     t.w = crate::alcove::hello_stage(name).0.min(ap.expanded_width);
-                    t.h = base_h + if name.is_empty() { 172.0 } else { 184.0 };
+                    t.h = base_h + crate::alcove::hello_stage(name).1;
                     t.r = 44.0;
                     t.ear = 26.0;
                 } else if pk.is_some_and(|p| p.scan) {
@@ -3451,7 +3451,8 @@ const SCAN_HELLO_AT: f32 = 0.46;
 /// the volume dial uses. The ring fills, the lock opens, then "Hello" and the name come in below.
 fn draw_scan_alcove(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
     let alpha = ui.p.alpha;
-    let cx = body.cx();
+    // the ring sits on the left, the words beside it
+    let cx = body.x + 82.0;
     let cy = body.y + ui.cfg.appearance.notch_height + 66.0;
     let pop = smoothstep(0.0, 0.12, t);
     let fade = 1.0 - smoothstep(0.90, 1.0, t);
@@ -3471,25 +3472,28 @@ fn draw_scan_alcove(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
     ui.p.alpha = alpha * fade * done;
     ui.p.icon(Icon::Unlock, Rect::centered(cx, cy, 44.0 * k, 44.0 * k), Color::white(1.0));
 
-    // "Hello" first, the name a beat later
+    // "Hello" first, the name a beat later, to the right of the ring
     let hello = smoothstep(0.50, 0.62, t);
+    let x0 = body.x + 152.0;
+    let tw = (body.right() - x0 - 22.0).max(40.0);
+    let name = hello_name(&pk.title);
+    let hy = if name.is_empty() { cy - 17.0 } else { cy - 38.0 };
     ui.p.alpha = alpha * hello * fade;
     ui.p.text(
         "Hello",
-        Rect::new(body.x + 8.0, cy + 60.0 + 8.0 * (1.0 - hello), body.w - 16.0, 34.0),
-        &TextStyle::new(28.0, Color::white(0.97)).semibold().display().center(),
+        Rect::new(x0 - 10.0 * (1.0 - hello), hy, tw, 34.0),
+        &TextStyle::new(28.0, Color::white(0.97)).semibold().display(),
     );
-    let name = hello_name(&pk.title);
     if !name.is_empty() {
         let nm = smoothstep(0.62, 0.74, t);
         ui.p.alpha = alpha * nm * fade;
         let mut size = 20.0;
         let (nw, _) = ui.p.measure(name, &TextStyle::new(size, Color::white(1.0)).semibold());
-        size *= ((body.w - 36.0) / nw.max(1.0)).min(1.0);
+        size *= (tw / nw.max(1.0)).min(1.0);
         ui.p.text(
             name,
-            Rect::new(body.x + 8.0, cy + 96.0 + 8.0 * (1.0 - nm), body.w - 16.0, 28.0),
-            &TextStyle::new(size, Color::white(0.62)).semibold().center(),
+            Rect::new(x0 - 10.0 * (1.0 - nm), cy + 2.0, tw, 28.0),
+            &TextStyle::new(size, Color::white(0.62)).semibold(),
         );
     }
     ui.p.alpha = alpha;
