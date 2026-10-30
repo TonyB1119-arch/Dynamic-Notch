@@ -251,7 +251,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 12.0,
+        1 => 13.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -740,6 +740,14 @@ impl Settings {
             a.motion_cache,
             "appearance",
             "motion_cache",
+        );
+        toggle_row(
+            ui,
+            row_rect(body, 12),
+            "Soft blur at the bottom edge",
+            a.bottom_fade,
+            "appearance",
+            "bottom_fade",
         );
     }
 

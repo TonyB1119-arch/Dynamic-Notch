@@ -113,6 +113,8 @@ pub struct Appearance {
     /// Draw the content once and only move/fade the picture while the notch opens, closes or
     /// switches pages (much less work per frame).
     pub motion_cache: bool,
+    /// Alcove: the bottom edge of the open notch softens into a light blur.
+    pub bottom_fade: bool,
     /// Extra UI scale on top of the monitor DPI.
     pub scale: f32,
 }
@@ -134,6 +136,7 @@ impl Default for Appearance {
             white_beams: false,
             clock_style: "roll".into(),
             motion_cache: true,
+            bottom_fade: true,
             scale: 1.0,
         }
     }
@@ -744,6 +747,8 @@ white_beams = false
 clock_style = "roll"
 # Draw content once and only move/fade it while opening, closing and switching pages
 motion_cache = true
+# Alcove: the bottom edge of the open notch softens into a light blur
+bottom_fade = true
 # "auto" picks the accent from album art, or use "#RRGGBB"
 accent = "auto"
 scale = 1.0

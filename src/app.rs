@@ -387,6 +387,8 @@ pub struct App {
     snap_all: Option<Snapshot>,
     /// The old and the new page, drawn once while the page slide runs.
     snap_pages: Option<(Snapshot, Snapshot)>,
+    /// The bottom strip of the open page, for the soft blur along the bottom edge (Alcove).
+    snap_band: Option<Snapshot>,
     pacer: Pacer,
     bus: Bus,
     rx: Receiver<Msg>,
@@ -486,6 +488,7 @@ impl App {
             host,
             snap_all: None,
             snap_pages: None,
+            snap_band: None,
             pacer,
             bus,
             rx,
@@ -2392,11 +2395,54 @@ impl App {
         tabs
     }
 
+    /// Alcove: the bottom edge of an open page softens into a light blur. Only the thin strip along
+    /// the bottom is drawn a second time into a small picture (and only on frames that are drawn
+    /// anyway), then laid over the live page in `bottom_fade`. Skipped while anything moves.
+    fn prepare_band(&mut self, now: Instant) {
+        let t = self.targets();
+        let tw = self.page_width();
+        let body = self.body_rect();
+        let on = self.cfg.appearance.bottom_fade
+            && crate::ui::look_alcove()
+            && self.mode == Mode::Expanded
+            && self.page_from.is_none()
+            && self.page != "settings"
+            && self.anim.exp.value >= 0.97
+            && (body.h - t.h).abs() < 1.5
+            && (body.w - tw).abs() < 1.5;
+        if !on {
+            self.snap_band = None;
+            return;
+        }
+        let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, t.h);
+        let content = page_content(body.cx(), full.y, page_size(&self.cfg, &self.modules, &self.started, self.page));
+        let h = BAND_H.min(full.h * 0.4);
+        let region = Rect::new(full.x, full.bottom() - h, full.w, h);
+        let input = Input::default();
+        let mut scratch = Effects::default();
+        let (accent, page, scale) = (self.accent, self.page, self.scale);
+        self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4D, |p| {
+            let mut ui = Ui {
+                p,
+                input: &input,
+                fx: &mut scratch,
+                cfg: &self.cfg,
+                bus: &self.bus,
+                now,
+                accent,
+                hot: false,
+                interactive: false,
+            };
+            draw_body(&mut ui, content, &mut self.modules, &self.started, page);
+        });
+    }
+
     /// While the notch opens or closes, and while a page slides in, the content itself does not
     /// change: it is only moved and faded. So it is drawn once into a picture and the frames of the
     /// animation just place that picture (one rectangle fill instead of laying out and drawing
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
+        self.prepare_band(now);
         let a_exp = self.anim.exp.value;
         let paging = self.page_from.is_some();
         let on = self.cfg.appearance.motion_cache;
@@ -2763,6 +2809,12 @@ impl App {
                                 &self.indicators,
                                 pages,
                             );
+                            // Alcove: the soft blur along the bottom edge fades in once the notch has settled
+                            let want = if self.snap_band.is_some() { 1.0 } else { 0.0 };
+                            let k = ui.glide(gkey("alcove-band", 0), want);
+                            if let (Some(b), true) = (&self.snap_band, k > 0.01) {
+                                bottom_fade(&mut ui, b, full, k);
+                            }
                         }
                     }
                     ui.p.reset_local();
@@ -3745,6 +3797,47 @@ fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
         Trailing::Battery { level, charging } => {
             let r = Rect::new(tr.right() - 36.0, tr.cy() - 8.0, 36.0, 16.0);
             icons::battery(ui.p, r, *level, *charging, battery_color(*level, *charging));
+        }
+    }
+}
+
+/// How tall the soft-blur strip along the bottom of the open notch is.
+const BAND_H: f32 = 56.0;
+/// The bottom corner radius of the open Alcove notch (the strip follows it).
+const BAND_R: f32 = 46.0;
+
+/// The soft blur along the bottom edge (Alcove): content fades into a light blur and a little
+/// darkness toward the rim. `snap` is the strip's own picture; `k` fades the whole effect in.
+/// Drawn as a few thin slices so it follows the rounded corners and stays cheap.
+fn bottom_fade(ui: &mut Ui, snap: &Snapshot, full: Rect, k: f32) {
+    const N: usize = 10;
+    let band = snap.rect;
+    let bottom = full.bottom();
+    let step = band.h / N as f32;
+    let ease = |a: f32, b: f32, x: f32| {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    for pass in 0..3 {
+        for i in 0..N {
+            let u = (i as f32 + 0.5) / N as f32;
+            let y = band.y + step * i as f32;
+            // keep inside the rounded bottom corners
+            let dy = (y + step - (bottom - BAND_R)).max(0.0).min(BAND_R);
+            let inset = BAND_R - (BAND_R * BAND_R - dy * dy).max(0.0).sqrt();
+            let r = Rect::new(band.x + inset, y, band.w - inset * 2.0, step + 0.5);
+            if r.w <= 1.0 {
+                continue;
+            }
+            match pass {
+                0 => ui.p.fill_rect(r, Color::black(0.55 * ease(0.1, 1.0, u) * k)),
+                1 => {
+                    ui.p.push_clip(r);
+                    ui.p.snapshot_soft(snap, 0.0, 0.0, 0.75 * ease(0.1, 1.0, u) * k);
+                    ui.p.pop_clip();
+                }
+                _ => ui.p.fill_rect(r, Color::black(0.40 * ease(0.35, 1.0, u) * k)),
+            }
         }
     }
 }
