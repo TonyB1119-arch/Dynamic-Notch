@@ -4185,11 +4185,12 @@ fn draw_expanded_core(
     // Alcove, with the pictures ready: the new page starts rising while the old one is still
     // fading, so there is never an empty moment between the two
     let overlap = al && snaps.is_some();
-    let (old_end, new_start) = if overlap { (0.52, 0.26) } else { (SPLIT, SPLIT) };
+    let (old_end, new_start) = if overlap { (0.46, 0.38) } else { (SPLIT, SPLIT) };
     if t < old_end {
         let u = t / old_end;
         let e = smoothstep(0.0, 1.0, u);
-        ui.p.alpha = base * (1.0 - e);
+        // overlapping: the old page drops away fast, so two similar pages never show as a double image
+        ui.p.alpha = base * if overlap { (1.0 - e) * (1.0 - e) } else { 1.0 - e };
         ui.interactive = false;
         let (dx, dy) = if al { (0.0, (-dir * slide * e).round()) } else { ((-dir * slide * e).round(), 0.0) };
         match snaps {
