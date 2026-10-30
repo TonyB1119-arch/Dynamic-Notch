@@ -3892,7 +3892,7 @@ const BAND_H: f32 = 64.0;
 /// own picture, `bottom` the notch's bottom edge and `radius` its corner radius; `k` scales the
 /// effect. Drawn as a few thin slices, which follow the rounded corners and keep it cheap.
 fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32, scale: f32) {
-    const N: usize = 14;
+    const N: usize = 40;
     let band = snap.rect;
     let rad = radius.max(6.0);
     let step = band.h / N as f32;
