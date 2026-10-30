@@ -2843,7 +2843,7 @@ impl App {
                         draw_peek(&mut ui, body, &pk.peek, left.clamp(0.0, 1.0), swap);
                         if let Some(b) = band {
                             ui.p.pop_clip();
-                            bottom_fade(&mut ui, b, body.bottom(), a_r, band_k);
+                            bottom_fade(&mut ui, b, body.bottom(), a_r, band_k, self.scale);
                         }
                         ui.p.reset_local();
                     }
@@ -2893,7 +2893,7 @@ impl App {
                             );
                             if let Some(b) = band {
                                 ui.p.pop_clip();
-                                bottom_fade(&mut ui, b, body.bottom(), a_r, band_k);
+                                bottom_fade(&mut ui, b, body.bottom(), a_r, band_k, self.scale);
                             }
                         }
                     }
@@ -3891,23 +3891,26 @@ const BAND_H: f32 = 64.0;
 /// goes from sharp to a light blur and fades into the glass toward the rim. `snap` is the strip's
 /// own picture, `bottom` the notch's bottom edge and `radius` its corner radius; `k` scales the
 /// effect. Drawn as a few thin slices, which follow the rounded corners and keep it cheap.
-fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32) {
+fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32, scale: f32) {
     const N: usize = 14;
     let band = snap.rect;
     let rad = radius.max(6.0);
     let step = band.h / N as f32;
+    // slice edges sit exactly on device pixels, so neighbouring slices meet without a seam
+    let px = |v: f32| (v * scale).round() / scale;
     let ease = |a: f32, b: f32, x: f32| {
         let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
     for i in 0..N {
         let u = (i as f32 + 0.5) / N as f32;
-        let y0 = (band.y + step * i as f32).round();
-        let y1 = if i + 1 == N { band.bottom() } else { (band.y + step * (i + 1) as f32).round() };
+        let y0 = px(band.y + step * i as f32);
+        let y1 = if i + 1 == N { band.bottom() } else { px(band.y + step * (i + 1) as f32) };
         // keep inside the rounded bottom corners
         let dy = (y1 - (bottom - rad)).clamp(0.0, rad);
         let inset = rad - (rad * rad - dy * dy).max(0.0).sqrt();
-        let r = Rect::new(band.x + inset, y0, band.w - inset * 2.0, y1 - y0);
+        let (x0, x1) = (px(band.x + inset), px(band.right() - inset));
+        let r = Rect::new(x0, y0, x1 - x0, y1 - y0);
         if r.w <= 1.0 || r.h <= 0.0 {
             continue;
         }
