@@ -3920,7 +3920,10 @@ fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32, s
         let mix = pos - lo;
         let fade = 1.0 - 0.72 * ease(0.25, 1.0, u) * k;
         ui.p.push_clip(r);
-        ui.p.snapshot_level(snap, lo as u8, fade);
+        // two layers laid over each other must add up to exactly `fade` of coverage, with the upper
+        // one carrying `mix` of the colour; otherwise a step shows each time the pair moves on
+        let under = fade * (1.0 - mix) / (1.0 - mix * fade).max(0.05);
+        ui.p.snapshot_level(snap, lo as u8, under);
         if mix > 0.01 {
             ui.p.snapshot_level(snap, lo as u8 + 1, mix * fade);
         }
