@@ -1144,6 +1144,9 @@ pub struct Snapshot {
     brush: ID2D1BitmapBrush1,
     /// The same picture at a quarter of the size; drawn stretched back up it is a soft blur.
     soft: Option<ID2D1BitmapBrush1>,
+    /// The same picture at half and at an eighth of the size (lighter and heavier blur).
+    half: Option<ID2D1BitmapBrush1>,
+    far: Option<ID2D1BitmapBrush1>,
     /// Where the picture sits, in logical units (snapped to whole device pixels).
     pub rect: Rect,
     pub key: u64,
@@ -1201,13 +1204,20 @@ impl Res {
                 interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
             };
             let brush = dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
-            // Halve the picture twice (each step averages 2x2 pixels); stretched back up with
-            // linear filtering this reads as a gentle blur, for a fraction of a real blur's cost.
-            let soft = (|| -> Option<ID2D1BitmapBrush1> {
+            // Halve the picture three times (each step averages 2x2 pixels) and keep every step:
+            // half, quarter and eighth size. Stretched back up with a smooth filter each one reads
+            // as a blur, a stronger one the smaller it is, for a fraction of a real blur's cost.
+            let levels = (|| -> Option<Vec<ID2D1BitmapBrush1>> {
                 let mut src: ID2D1Bitmap1 = bmp.clone();
                 let (mut sw, mut sh) = (w, h);
                 let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
-                for _ in 0..2 {
+                let smooth = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                };
+                let mut out = Vec::with_capacity(3);
+                for _ in 0..3 {
                     let (nw, nh) = (sw.div_ceil(2).max(1), sh.div_ceil(2).max(1));
                     let small = dc.CreateBitmap(D2D_SIZE_U { width: nw, height: nh }, None, 0, &props).ok()?;
                     dc.SetTarget(&small);
@@ -1225,18 +1235,17 @@ impl Res {
                     src = small;
                     sw = nw;
                     sh = nh;
+                    out.push(dc.CreateBitmapBrush(&src, Some(&smooth), None).ok()?);
                 }
-                // stretched back up with a smooth (cubic) filter, so the blur has no blocky edges
-                let smooth = D2D1_BITMAP_BRUSH_PROPERTIES1 {
-                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
-                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
-                    interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                };
-                dc.CreateBitmapBrush(&src, Some(&smooth), None).ok()
+                Some(out)
             })();
+            let mut levels = levels.unwrap_or_default().into_iter();
+            let (half, soft, far) = (levels.next(), levels.next(), levels.next());
             Some(Snapshot {
                 brush,
                 soft,
+                half,
+                far,
                 rect: Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale),
                 key,
                 born: std::time::Instant::now(),
@@ -1290,6 +1299,34 @@ impl<'a> Painter<'a> {
                     self.dc.FillRectangle(&rf(Rect::new(x, y, w, h)), &s.brush);
                 }
             }
+        }
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// A snapshot at blur level `lvl`: 0 sharp, 1 light, 2 medium, 3 heavy (the picture drawn from
+    /// a half, quarter or eighth size copy). Falls back to the sharp picture if there is none.
+    pub fn snapshot_level(&self, s: &Snapshot, lvl: u8, opacity: f32) {
+        let brush = match lvl {
+            0 => None,
+            1 => s.half.as_ref(),
+            2 => s.soft.as_ref(),
+            _ => s.far.as_ref(),
+        };
+        let Some(b) = brush else {
+            self.snapshot(s, 0.0, 0.0, opacity);
+            return;
+        };
+        let a = opacity * self.alpha;
+        if a <= 0.002 {
+            return;
+        }
+        let k = (1u32 << lvl.min(3)) as f32 / self.scale;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: s.rect.x, M32: s.rect.y };
+        unsafe {
+            b.SetTransform(&m);
+            b.SetOpacity(a);
+            self.dc.FillRectangle(&rf(s.rect), b);
         }
     }
 }

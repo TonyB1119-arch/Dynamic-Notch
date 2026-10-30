@@ -3914,11 +3914,16 @@ fn bottom_fade(ui: &mut Ui, snap: &Snapshot, bottom: f32, radius: f32, k: f32, s
         if r.w <= 1.0 || r.h <= 0.0 {
             continue;
         }
-        let soft = ease(0.0, 0.8, u) * k;
+        // blur grows steadily toward the rim: each row blends two neighbouring levels
+        let pos = ease(0.0, 1.0, u) * k * 2.5;
+        let lo = pos.floor();
+        let mix = pos - lo;
         let fade = 1.0 - 0.72 * ease(0.25, 1.0, u) * k;
         ui.p.push_clip(r);
-        ui.p.snapshot(snap, 0.0, 0.0, (1.0 - soft) * fade);
-        ui.p.snapshot_soft(snap, 0.0, 0.0, soft * fade);
+        ui.p.snapshot_level(snap, lo as u8, fade);
+        if mix > 0.01 {
+            ui.p.snapshot_level(snap, lo as u8 + 1, mix * fade);
+        }
         ui.p.pop_clip();
     }
 }
