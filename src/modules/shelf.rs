@@ -8,6 +8,7 @@
 
 use std::any::Any;
 use std::path::Path;
+use std::time::Instant;
 
 use super::{CardSize, Cx, Module, ModuleId, SystemEvent};
 use crate::bus::Bus;
@@ -29,6 +30,8 @@ struct Item {
     path: String,
     name: String,
     thumb: Option<ImageData>,
+    /// When it was dropped on the shelf (it pops in for a moment), not set for saved items.
+    born: Option<Instant>,
 }
 
 struct Thumb(String, Option<ImageData>);
@@ -38,20 +41,22 @@ pub struct Shelf {
     drop_hover: bool,
     remember: bool,
     bus: Option<Bus>,
+    /// Alcove: which kind of item shows (0 all, 1 images, 2 files, 3 folders).
+    filter: usize,
 }
 
 impl Shelf {
     pub fn new() -> Self {
-        Self { items: Vec::new(), drop_hover: false, remember: true, bus: None }
+        Self { items: Vec::new(), drop_hover: false, remember: true, bus: None, filter: 0 }
     }
 
-    fn add(&mut self, paths: &[String]) {
+    fn add(&mut self, paths: &[String], pop: bool) {
         let mut fresh = Vec::new();
         for p in paths {
             if self.items.iter().any(|i| i.path.eq_ignore_ascii_case(p)) {
                 continue;
             }
-            self.items.push(Item { path: p.clone(), name: file_name(p), thumb: None });
+            self.items.push(Item { path: p.clone(), name: file_name(p), thumb: None, born: pop.then(Instant::now) });
             fresh.push(p.clone());
         }
         if self.items.len() > MAX_ITEMS {
@@ -149,7 +154,7 @@ impl Module for Shelf {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default();
             let existing: Vec<String> = saved.into_iter().filter(|p| Path::new(p).exists()).collect();
-            self.add(&existing);
+            self.add(&existing, false);
         }
     }
 
@@ -170,7 +175,7 @@ impl Module for Shelf {
             }
             SystemEvent::Dropped(files) => {
                 self.drop_hover = false;
-                self.add(files);
+                self.add(files, true);
                 cx.fx.layout_changed = true;
             }
             SystemEvent::DragOutDone | SystemEvent::Expanded(true) if self.prune() => {
@@ -225,6 +230,9 @@ impl Module for Shelf {
     }
 
     fn page_height(&self, w: f32) -> f32 {
+        if crate::ui::look_alcove() {
+            return if self.items.is_empty() { 120.0 } else { 172.0 };
+        }
         if self.items.is_empty() {
             return 120.0;
         }
@@ -234,6 +242,9 @@ impl Module for Shelf {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r);
+        }
         let (head, body) = r.split_top(24.0, 4.0);
         ui.caption("SHELF", Rect::new(head.x, head.y, 200.0, head.h));
         let accent = palette::YELLOW;
@@ -310,6 +321,144 @@ impl Module for Shelf {
                 sys::shell_open(&it.path);
             }
         }
+        if let Some(i) = remove {
+            self.remove(i);
+            ui.fx.layout_changed = true;
+        }
+    }
+}
+
+impl Shelf {
+    /// Alcove: filter chips on top and a row of files below, each a thumbnail (or a plain icon)
+    /// with its name under it; drag them out, click to open.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let (head, body) = r.split_top(32.0, 12.0);
+        crate::alcove::title(ui, head, Icon::Package, palette::YELLOW, "Shelf", "");
+        let below = Rect::new(r.x, head.bottom() + 6.0, r.w, r.bottom() - head.bottom() - 6.0);
+        if self.drop_hover {
+            ui.p.fill_rounded(below, 26.0, palette::YELLOW.with_a(0.10));
+            ui.p.stroke_rounded(below.inset(0.75), 26.0, 1.5, palette::YELLOW.with_a(0.7));
+            ui.p.text("Drop to park files here", below, &TextStyle::new(15.0, palette::YELLOW).semibold().center());
+            return;
+        }
+        if self.items.is_empty() {
+            crate::alcove::empty(ui, below, Icon::Package, "Drag files onto the notch to park them");
+            return;
+        }
+        // 1 = picture, 3 = folder (no extension), 2 = any other file
+        let kind = |it: &Item| -> usize {
+            if it.thumb.is_some() {
+                1
+            } else if std::path::Path::new(&it.path).extension().is_none() {
+                3
+            } else {
+                2
+            }
+        };
+        let mut counts = [self.items.len(), 0, 0, 0];
+        for it in &self.items {
+            counts[kind(it)] += 1;
+        }
+        if counts[self.filter] == 0 {
+            self.filter = 0;
+        }
+        let mut x = head.x + crate::alcove::title_w(ui, head, "Shelf");
+        for (k, name) in ["All", "Images", "Files", "Folders"].iter().enumerate() {
+            if k > 0 && counts[k] == 0 {
+                continue;
+            }
+            let w = crate::alcove::chip_w(ui, name, None) + 6.0;
+            if crate::alcove::chip(ui, Rect::new(x, head.y + 2.0, w, 28.0), name, None, self.filter == k) {
+                self.filter = k;
+            }
+            x += w + 8.0;
+        }
+        // actions on the right
+        let cw = crate::alcove::chip_w(ui, "Clear", None);
+        let clear = Rect::new(head.right() - cw, head.y + 2.0, cw, 28.0);
+        if crate::alcove::chip(ui, clear, "Clear", None, false) {
+            self.items.clear();
+            self.save();
+            ui.fx.layout_changed = true;
+            return;
+        }
+        if self.items.len() > 1 {
+            let aw = crate::alcove::chip_w(ui, "Drag all", Some(Icon::Copy));
+            let all = Rect::new(clear.x - 8.0 - aw, head.y + 2.0, aw, 28.0);
+            if drag_started(ui, all) {
+                ui.fx.drag_files = Some(self.paths());
+            }
+            crate::alcove::chip(ui, all, "Drag all", Some(Icon::Copy), false);
+        }
+
+        let shown: Vec<usize> =
+            (0..self.items.len()).filter(|&i| self.filter == 0 || kind(&self.items[i]) == self.filter).collect();
+        let tw = 98.0;
+        let gap = 8.0;
+        let content_w = shown.len() as f32 * (tw + gap) - gap;
+        let off = crate::alcove::scroll_x(ui, body, content_w, "shelf-scroll");
+        let mut remove = None;
+        ui.p.push_clip(body);
+        for (j, &i) in shown.iter().enumerate() {
+            let it = &self.items[i];
+            let t = Rect::new(body.x + j as f32 * (tw + gap) - off, body.y, tw, body.h);
+            if t.right() < body.x - 4.0 || t.x > body.right() + 4.0 {
+                continue;
+            }
+            // a new file rises into place with a little give and fades in
+            let pop = it.born.map(|b| ui.now.saturating_duration_since(b).as_secs_f32() / 0.6).filter(|u| *u < 1.0);
+            let (lift, fade) = match pop {
+                Some(u) => {
+                    let c = 1.3_f32;
+                    let e = 1.0 + (c + 1.0) * (u - 1.0).powi(3) + c * (u - 1.0).powi(2);
+                    ui.animate();
+                    ((1.0 - e) * 18.0, (u / 0.35).min(1.0))
+                }
+                None => (0.0, 1.0),
+            };
+            let t = t.translate(0.0, lift);
+            let alpha_before = ui.p.alpha;
+            ui.p.alpha = alpha_before * fade;
+            let hover = ui.hovered(t) && ui.hovered(body);
+            if hover {
+                ui.hot = true;
+                ui.p.fill_rounded(t, 20.0, Color::white(0.08));
+            }
+            let th = Rect::new(t.x + 11.0, t.y + 8.0, t.w - 22.0, t.w - 22.0);
+            match &it.thumb {
+                Some(img) => {
+                    let k = (th.w / img.width.max(1) as f32).min(th.h / img.height.max(1) as f32);
+                    let (w, h) = (img.width as f32 * k, img.height as f32 * k);
+                    ui.p.image(img, Rect::new(th.cx() - w * 0.5, th.cy() - h * 0.5, w, h), 12.0, 1.0);
+                }
+                None => {
+                    let ic = if kind(it) == 3 { Icon::Folder } else { Icon::File };
+                    ui.p.icon(ic, th.center_square(44.0), Color::white(0.78));
+                }
+            }
+            ui.p.push_clip(Rect::new(t.x + 2.0, th.bottom() + 4.0, t.w - 4.0, t.bottom() - th.bottom() - 6.0));
+            ui.p.text(
+                &it.name,
+                Rect::new(t.x + 4.0, th.bottom() + 6.0, t.w - 8.0, 36.0),
+                &TextStyle::new(12.0, Color::white(0.9)).medium().center().wrap().top(),
+            );
+            ui.p.pop_clip();
+            let xb = Rect::new(t.right() - 26.0, t.y + 4.0, 20.0, 20.0);
+            let mut on_x = false;
+            if hover {
+                on_x = ui.hovered(xb);
+                if crate::alcove::round_button(ui, xb, Icon::Close, false) {
+                    remove = Some(i);
+                }
+            }
+            if drag_started(ui, t) && !on_x {
+                ui.fx.drag_files = Some(vec![it.path.clone()]);
+            } else if !on_x && ui.clicked(t) {
+                sys::shell_open(&it.path);
+            }
+            ui.p.alpha = alpha_before;
+        }
+        ui.p.pop_clip();
         if let Some(i) = remove {
             self.remove(i);
             ui.fx.layout_changed = true;

@@ -1,0 +1,43 @@
+Dynamic Notch (Extended)
+
+PART 1 - ADDITIONS IN THIS BUILD
+
+Copyright (c) 2026 <YOUR NAME>. All rights reserved.
+
+Everything added to this project in this build (including the Settings tab,
+Weather, Control Center, Notifications, Gemini tab, Notes, USB drive peek, the
+unlock animation, tab transitions and the "beam" visual language, together with
+their code, designs, text and documentation) is proprietary. You may not copy,
+modify, distribute, sublicense, publish or sell these additions, in whole or in
+part, without the prior written permission of the copyright holder. Permission
+to run the compiled program for personal use is granted to the person who
+received it from the copyright holder.
+
+PART 2 - EARLIER WORK (MIT LICENSE)
+
+Parts of this software are derived from earlier work that was released under
+the MIT License. That license requires its notice to stay with copies and
+substantial portions of that work, so it is reproduced here unchanged. Part 1
+does not reduce the rights this notice grants for that earlier work.
+
+MIT License
+
+Copyright (c) 2026 Eigenesf
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

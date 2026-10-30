@@ -26,7 +26,7 @@ use crate::bus::Bus;
 use crate::gfx::{Icon, TextStyle};
 use crate::sys;
 use crate::ui::{gkey, ButtonStyle, Ui};
-use crate::util::{format_bytes, palette, Rect};
+use crate::util::{format_bytes, palette, Color, Rect};
 
 const ID: ModuleId = "downloads";
 const TEMP_EXTS: [&str; 6] = [".crdownload", ".part", ".partial", ".download", ".opdownload", ".!qb"];
@@ -58,11 +58,13 @@ pub struct Downloads {
     external: HashMap<String, Active>,
     recent: Vec<Done>,
     running: bool,
+    /// Alcove: which downloads show (0 all, 1 active, 2 finished).
+    filter: usize,
 }
 
 impl Downloads {
     pub fn new() -> Self {
-        Self { browser: Vec::new(), external: HashMap::new(), recent: Vec::new(), running: false }
+        Self { browser: Vec::new(), external: HashMap::new(), recent: Vec::new(), running: false, filter: 0 }
     }
 
     fn all(&self) -> Vec<Active> {
@@ -209,6 +211,9 @@ impl Module for Downloads {
 
     fn page_height(&self, _w: f32) -> f32 {
         let n = self.all().len() + self.recent.len();
+        if crate::ui::look_alcove() {
+            return if n == 0 { 120.0 } else { 44.0 + n.min(3) as f32 * 62.0 };
+        }
         if n == 0 {
             110.0
         } else {
@@ -217,6 +222,9 @@ impl Module for Downloads {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r);
+        }
         let (head, body) = r.split_top(24.0, 4.0);
         ui.caption("DOWNLOADS", Rect::new(head.x, head.y, 200.0, head.h));
         let active = self.all();
@@ -269,6 +277,126 @@ impl Module for Downloads {
             }
             y += 46.0;
         }
+        if let Some(i) = remove {
+            self.recent.remove(i);
+        }
+    }
+}
+
+impl Downloads {
+    /// Alcove: filter chips on top and a row of downloads below. Each is a file with its name
+    /// under it; a running one has a progress ring round it, a finished one a green check.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let (head, body) = r.split_top(32.0, 12.0);
+        let active = self.all();
+        crate::alcove::title(ui, head, Icon::Download, palette::BLUE, "Downloads", "");
+        if active.is_empty() && self.recent.is_empty() {
+            crate::alcove::empty(
+                ui,
+                Rect::new(r.x, head.bottom() + 6.0, r.w, r.bottom() - head.bottom() - 6.0),
+                Icon::Download,
+                "Downloads in your browser show up here",
+            );
+            return;
+        }
+        let counts = [active.len() + self.recent.len(), active.len(), self.recent.len()];
+        if counts[self.filter] == 0 {
+            self.filter = 0;
+        }
+        let mut x = head.x + crate::alcove::title_w(ui, head, "Downloads");
+        for (k, name) in ["All", "Active", "Done"].iter().enumerate() {
+            if k > 0 && counts[k] == 0 {
+                continue;
+            }
+            let w = crate::alcove::chip_w(ui, name, None) + 6.0;
+            if crate::alcove::chip(ui, Rect::new(x, head.y + 2.0, w, 28.0), name, None, self.filter == k) {
+                self.filter = k;
+            }
+            x += w + 8.0;
+        }
+
+        let show_active = self.filter != 2;
+        let show_done = self.filter != 1;
+        let (tw, gap) = (98.0, 8.0);
+        let n = if show_active { active.len() } else { 0 } + if show_done { self.recent.len() } else { 0 };
+        let off = crate::alcove::scroll_x(ui, body, n as f32 * (tw + gap) - gap, "dl-scroll");
+        let name_st = TextStyle::new(12.0, Color::white(0.92)).medium().center();
+        let sub_st = TextStyle::new(11.0, palette::TEXT_DIM).center();
+        let mut remove = None;
+        let mut j = 0usize;
+        ui.p.push_clip(body);
+        if show_active {
+            for (ai, a) in active.iter().enumerate() {
+                let t = Rect::new(body.x + j as f32 * (tw + gap) - off, body.y, tw, body.h);
+                j += 1;
+                if t.right() < body.x - 4.0 || t.x > body.right() + 4.0 {
+                    continue;
+                }
+                let (cx, cy) = (t.cx(), t.y + 42.0);
+                match a.progress {
+                    Some(p) => {
+                        let shown = ui.glide(gkey("download", ai), p);
+                        ui.ring(cx, cy, 58.0, 4.0, shown, palette::BLUE);
+                    }
+                    None => ui.ring_spin(cx, cy, 58.0, 4.0, palette::BLUE),
+                }
+                ui.p.icon(Icon::Download, Rect::centered(cx, cy, 22.0, 22.0), Color::white(0.92));
+                let status = match a.progress {
+                    Some(p) => format!("{:.0}%", p * 100.0),
+                    None if a.external => "Working…".into(),
+                    None => format!("{} · {}", format_bytes(a.size), speed_text(a.speed)),
+                };
+                ui.p.push_clip(Rect::new(t.x + 2.0, t.y + 74.0, t.w - 4.0, 56.0));
+                ui.p.text(&a.name, Rect::new(t.x + 4.0, t.y + 76.0, t.w - 8.0, 18.0), &name_st);
+                ui.p.text(&status, Rect::new(t.x + 4.0, t.y + 96.0, t.w - 8.0, 16.0), &sub_st);
+                ui.p.pop_clip();
+                if a.progress.is_none() {
+                    ui.animate();
+                }
+            }
+        }
+        if show_done {
+            for (i, d) in self.recent.iter().enumerate() {
+                let t = Rect::new(body.x + j as f32 * (tw + gap) - off, body.y, tw, body.h);
+                j += 1;
+                if t.right() < body.x - 4.0 || t.x > body.right() + 4.0 {
+                    continue;
+                }
+                let hover = ui.hovered(t) && ui.hovered(body);
+                if hover {
+                    ui.hot = true;
+                    ui.p.fill_rounded(t, 20.0, Color::white(0.08));
+                }
+                let ic = Rect::centered(t.cx(), t.y + 42.0, 46.0, 46.0);
+                ui.p.icon(Icon::File, ic, Color::white(0.78));
+                ui.p.icon(Icon::Check, Rect::new(ic.right() - 10.0, ic.bottom() - 12.0, 16.0, 16.0), palette::GREEN);
+                ui.p.push_clip(Rect::new(t.x + 2.0, t.y + 74.0, t.w - 4.0, 56.0));
+                ui.p.text(&d.name, Rect::new(t.x + 4.0, t.y + 76.0, t.w - 8.0, 18.0), &name_st);
+                ui.p.text("Done", Rect::new(t.x + 4.0, t.y + 96.0, t.w - 8.0, 16.0), &sub_st);
+                ui.p.pop_clip();
+                let xb = Rect::new(t.right() - 26.0, t.y + 4.0, 20.0, 20.0);
+                let mut on_btn = false;
+                if hover {
+                    on_btn = ui.hovered(xb);
+                    if crate::alcove::round_button(ui, xb, Icon::Close, false) {
+                        remove = Some(i);
+                    }
+                    if let Some(p) = d.path.clone() {
+                        let fb = Rect::new(t.x + 6.0, t.y + 4.0, 20.0, 20.0);
+                        on_btn |= ui.hovered(fb);
+                        if crate::alcove::round_button(ui, fb, Icon::Folder, false) {
+                            sys::shell_reveal(&p);
+                        }
+                    }
+                }
+                if !on_btn && ui.clicked(t) {
+                    if let Some(p) = &d.path {
+                        sys::shell_open(p);
+                    }
+                }
+            }
+        }
+        ui.p.pop_clip();
         if let Some(i) = remove {
             self.recent.remove(i);
         }

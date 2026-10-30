@@ -1,4 +1,5 @@
 /target
+/dist
 
 # Secrets — never commit API keys
 .env

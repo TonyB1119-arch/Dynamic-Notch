@@ -18,7 +18,7 @@ use windows::UI::Notifications::Management::{UserNotificationListener, UserNotif
 use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds, UserNotification};
 
 use super::widgets::scroll;
-use super::{Cx, Module, ModuleId, Peek};
+use super::{Cx, Module, ModuleId, Peek, Trailing};
 use crate::bus::Bus;
 use crate::gfx::{Icon, TextStyle};
 use crate::ui::{ButtonStyle, Ui};
@@ -97,8 +97,15 @@ impl Module for Notifications {
                     (false, true) => n.app.clone(),
                     (false, false) => truncate_chars(&format!("{} · {}", n.app, n.body), 80),
                 };
+                // the message itself under the name; the count of kept notices as a red badge
+                let body = if n.body.is_empty() { sub } else { truncate_chars(&n.body, 110) };
+                let count = (self.items.len() + 1).min(9).to_string();
                 cx.fx.peek(
-                    Peek::new(Icon::Bell, palette::ORANGE, truncate_chars(&title, 40), sub).duration_ms(5500).page(ID),
+                    Peek::new(Icon::Bell, palette::ORANGE, truncate_chars(&title, 40), body)
+                        .key("notify")
+                        .trailing(Trailing::Text(count, palette::RED))
+                        .duration_ms(5500)
+                        .page(ID),
                 );
                 self.items.insert(0, n);
                 self.items.truncate(MAX_KEPT);
@@ -112,10 +119,16 @@ impl Module for Notifications {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
+        if crate::ui::look_alcove() {
+            return 40.0 + 3.0 * 66.0;
+        }
         HEADER_H + 12.0 + LIST_H
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r);
+        }
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
         ui.p.icon(Icon::Bell, Rect::new(head.x + 2.0, head.cy() - 9.0, 18.0, 18.0), palette::TEXT_DIM);
         let clear = Rect::new(head.right() - 78.0, head.y + 3.0, 78.0, 28.0);
@@ -160,6 +173,66 @@ impl Module for Notifications {
             ui.p.text(&head_line, Rect::new(tx, row.y + 4.0, tw, 17.0), &TextStyle::new(13.0, palette::TEXT).medium());
             let sub = if n.title.is_empty() { n.body.clone() } else { format!("{} · {}", n.app, n.body) };
             ui.p.text(&sub, Rect::new(tx, row.y + 21.0, tw, 15.0), &TextStyle::new(11.5, palette::TEXT_FAINT));
+        }
+        ui.p.pop_clip();
+    }
+}
+
+impl Notifications {
+    /// Alcove: each notification is a soft bubble with the app's first letter on a coloured tile.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let (head, body) = r.split_top(32.0, 8.0);
+        let note = if self.items.is_empty() { String::new() } else { format!("{}", self.items.len()) };
+        crate::alcove::title(ui, head, Icon::Bell, palette::ORANGE, "Notifications", &note);
+        if !self.items.is_empty() {
+            let cw = crate::alcove::chip_w(ui, "Clear", Some(Icon::Trash));
+            if crate::alcove::chip(
+                ui,
+                Rect::new(head.right() - cw, head.y + 2.0, cw, 28.0),
+                "Clear",
+                Some(Icon::Trash),
+                false,
+            ) {
+                self.items.clear();
+                return;
+            }
+        }
+        if self.items.is_empty() {
+            let text =
+                if self.allowed { "No notifications yet" } else { "Waiting for Windows to allow notification access" };
+            crate::alcove::empty(ui, body, Icon::Bell, text);
+            if !self.allowed {
+                ui.p.text(
+                    &self.status,
+                    Rect::new(body.x + 16.0, body.bottom() - 30.0, body.w - 32.0, 22.0),
+                    &TextStyle::new(11.5, palette::ORANGE).center(),
+                );
+            }
+            return;
+        }
+        let pitch = 66.0;
+        scroll(ui, body, &mut self.scroll, self.items.len() as f32 * pitch);
+        ui.p.push_clip(body);
+        for (i, n) in self.items.iter().enumerate() {
+            let row = Rect::new(body.x, body.y + i as f32 * pitch - self.scroll, body.w, pitch - 8.0);
+            if row.bottom() < body.y || row.y > body.bottom() {
+                continue;
+            }
+            let hover = ui.hovered(row) && ui.hovered(body);
+            if hover {
+                ui.p.fill_rounded(row, 22.0, Color::white(0.08));
+            }
+            // a round avatar with the first letter, the name in bold, the message under it
+            let av = Rect::centered(row.x + 30.0, row.cy(), 42.0, 42.0);
+            ui.p.fill_circle(av.cx(), av.cy(), 21.0, Color::white(0.13));
+            let who = if n.title.is_empty() { &n.app } else { &n.title };
+            let letter: String = who.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+            ui.p.text(&letter, av, &TextStyle::new(18.0, Color::white(0.95)).semibold().center());
+            let tx = av.right() + 14.0;
+            let tw = (row.right() - tx - 16.0).max(0.0);
+            ui.p.text(who, Rect::new(tx, row.y + 6.0, tw, 22.0), &TextStyle::new(15.0, Color::white(1.0)).semibold());
+            let sub = if n.title.is_empty() { n.body.clone() } else { format!("{} · {}", n.app, n.body) };
+            ui.p.text(&sub, Rect::new(tx, row.y + 29.0, tw, 20.0), &TextStyle::new(13.0, palette::TEXT_DIM));
         }
         ui.p.pop_clip();
     }

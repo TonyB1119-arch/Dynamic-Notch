@@ -63,7 +63,48 @@ const OWN_CHANGE: windows::core::GUID = windows::core::GUID::from_u128(0x6d1c2a4
 /// Hotkey ids for the volume keys (the shell's own hotkeys start at 0x4E00).
 const KEYS: [(i32, VIRTUAL_KEY); 3] = [(0x4F00, VK_VOLUME_UP), (0x4F01, VK_VOLUME_DOWN), (0x4F02, VK_VOLUME_MUTE)];
 
+/// Last known output volume (an `f32` as bits; negative = not known yet) and panel brightness
+/// (percent, -1 = none), for the control center sliders.
+static LEVEL_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xBF80_0000);
+static BRIGHT_PCT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Output volume 0..1, when known.
+pub fn volume_now() -> Option<f32> {
+    let v = f32::from_bits(LEVEL_BITS.load(Ordering::Relaxed));
+    (v >= 0.0).then_some(v)
+}
+
+/// Panel brightness 0..1, when known.
+pub fn brightness_now() -> Option<f32> {
+    let b = BRIGHT_PCT.load(Ordering::Relaxed);
+    (b >= 0).then_some(b as f32 / 100.0)
+}
+
+/// Move the output volume (a slider in the control center).
+pub fn set_volume(bus: &Bus, level: f32) {
+    bus.to_module(ID, OsdMsg::SetVolume(level.clamp(0.0, 1.0)));
+}
+
+/// Set the panel brightness (percent). Runs a hidden helper, so only call it when a drag ends.
+pub fn set_brightness(pct: u8) {
+    use std::os::windows::process::CommandExt;
+    let pct = pct.min(100);
+    BRIGHT_PCT.store(pct as i32, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name("set-brightness".into()).spawn(move || {
+        let script =
+            format!("(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{pct})");
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status();
+    });
+}
+
 enum OsdMsg {
+    /// A volume the control center slider set: remembered, no peek.
+    SetVolume(f32),
+    /// The worker's report after such a change.
+    Level(f32),
     /// The default output changed (or was bound for the first time).
     Device {
         name: String,
@@ -91,6 +132,7 @@ enum OsdMsg {
 }
 
 enum Cmd {
+    Set(f32),
     Step(i32),
     ToggleMute,
     Rebind,
@@ -233,14 +275,27 @@ impl Module for Osd {
     fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
         let Ok(m) = msg.downcast::<OsdMsg>() else { return };
         match *m {
+            OsdMsg::SetVolume(level) => {
+                self.level = level;
+                LEVEL_BITS.store(level.to_bits(), Ordering::Relaxed);
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send(Cmd::Set(level));
+                }
+            }
+            OsdMsg::Level(level) => {
+                self.level = level;
+                LEVEL_BITS.store(level.to_bits(), Ordering::Relaxed);
+            }
             OsdMsg::Device { name, level, muted } => {
                 self.device = name;
                 self.level = level;
                 self.muted = muted;
+                LEVEL_BITS.store(level.to_bits(), Ordering::Relaxed);
             }
             OsdMsg::Volume { level, muted, forced } => {
                 let changed = (level - self.level).abs() > 0.004 || muted != self.muted;
                 self.level = level;
+                LEVEL_BITS.store(level.to_bits(), Ordering::Relaxed);
                 self.muted = muted;
                 if (changed || forced) && cx.cfg.osd.volume {
                     cx.fx.peek(self.volume_peek());
@@ -284,6 +339,7 @@ impl Module for Osd {
             OsdMsg::Brightness(b) => {
                 let changed = self.brightness != Some(b);
                 self.brightness = Some(b);
+                BRIGHT_PCT.store(b.min(100) as i32, Ordering::Relaxed);
                 if changed && cx.cfg.osd.brightness {
                     let frac = b.min(100) as f32 / 100.0;
                     cx.fx.peek(
@@ -408,6 +464,13 @@ fn volume_worker(rx: Receiver<Cmd>, tx: Sender<Cmd>, bus: Bus) {
                     mic = bind_mic(&enumerator, &mic_events, &bus);
                 }
                 Cmd::NextDevice => next_output(&enumerator, &bus),
+                Cmd::Set(level) => {
+                    if let Some(v) = &ep {
+                        let _ = v.SetMute(false, &OWN_CHANGE);
+                        let _ = v.SetMasterVolumeLevelScalar(level, &OWN_CHANGE);
+                        bus.to_module(ID, OsdMsg::Level(level));
+                    }
+                }
                 Cmd::Step(dir) => {
                     if let Some(v) = &ep {
                         let level = v.GetMasterVolumeLevelScalar().unwrap_or(0.0);

@@ -132,6 +132,89 @@ pub fn play_sound(alias: &str) {
     }
 }
 
+/// A very short, very quiet "tick" standing in for haptics (Windows has no
+/// general haptics API for mice or most trackpads). `strong` is the click, the
+/// other the lighter hover tick. The wav is built once and lives forever, as
+/// async `SND_MEMORY` playback requires.
+pub fn haptic(strong: bool) {
+    use std::sync::OnceLock;
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    static TICKS: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
+    let ticks = TICKS.get_or_init(|| [tick_wav(0.035, 9), tick_wav(0.08, 14)]);
+    let buf = &ticks[strong as usize];
+    unsafe {
+        let _ = PlaySoundW(PCWSTR(buf.as_ptr() as *const u16), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+/// A very quiet, soft blip for a bubble: `out` false is the small rising pop as it appears, true
+/// the lower, falling one as it is pulled back in.
+pub fn bubble_sound(out: bool) {
+    use std::sync::OnceLock;
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    static BLIPS: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
+    let blips = BLIPS.get_or_init(|| [sweep_wav(520.0, 840.0, 0.10, 90), sweep_wav(700.0, 340.0, 0.08, 130)]);
+    let buf = &blips[out as usize];
+    unsafe {
+        let _ = PlaySoundW(PCWSTR(buf.as_ptr() as *const u16), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+/// Mono 16-bit 44.1 kHz wav: a soft sine that glides from `f0` to `f1` Hz over `ms` milliseconds,
+/// with a short fade in and a smooth fade out so it never clicks.
+fn sweep_wav(f0: f32, f1: f32, amp: f32, ms: u32) -> Vec<u8> {
+    const RATE: u32 = 44_100;
+    let n = RATE * ms / 1000;
+    let mut w = Vec::with_capacity(44 + n as usize * 2);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + n * 2).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&RATE.to_le_bytes());
+    w.extend_from_slice(&(RATE * 2).to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(n * 2).to_le_bytes());
+    let mut phase = 0.0_f32;
+    for i in 0..n {
+        let t = i as f32 / n as f32;
+        let f = f0 + (f1 - f0) * t;
+        phase += std::f32::consts::TAU * f / RATE as f32;
+        let env = (t / 0.08).min(1.0) * (1.0 - t).powi(2);
+        let v = phase.sin() * env * amp;
+        w.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+    }
+    w
+}
+
+/// Mono 16-bit 44.1 kHz wav: a decaying low sine burst of `ms` milliseconds.
+fn tick_wav(amp: f32, ms: u32) -> Vec<u8> {
+    const RATE: u32 = 44_100;
+    let n = RATE * ms / 1000;
+    let mut w = Vec::with_capacity(44 + n as usize * 2);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + n * 2).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&RATE.to_le_bytes());
+    w.extend_from_slice(&(RATE * 2).to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(n * 2).to_le_bytes());
+    for i in 0..n {
+        let t = i as f32 / n as f32;
+        let v = (i as f32 * 0.09).sin() * (1.0 - t).powi(3) * amp;
+        w.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+    }
+    w
+}
+
 /// Play a system sound alias with its samples scaled by `gain`. The gain is
 /// capped so the loudest sample doesn't clip. Falls back to plain
 /// `play_sound` when the alias isn't a 16-bit PCM wav.

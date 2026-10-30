@@ -317,10 +317,11 @@ impl Module for Gemini {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
+        let al = crate::ui::look_alcove();
         if self.key_form() {
-            return KEY_PAGE_H;
+            return if al { 196.0 } else { KEY_PAGE_H };
         }
-        self.text_h.clamp(LOG_MIN_H, LOG_MAX_H) + 12.0 + INPUT_H
+        self.text_h.clamp(LOG_MIN_H, LOG_MAX_H) + 12.0 + if al { 48.0 } else { INPUT_H }
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -351,8 +352,15 @@ impl Module for Gemini {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        let al = crate::ui::look_alcove();
         if self.key_form() {
-            self.draw_key_form(ui, r);
+            if al {
+                self.draw_key_form_alcove(ui, r);
+            } else {
+                self.draw_key_form(ui, r);
+            }
+        } else if al {
+            self.draw_chat_alcove(ui, r);
         } else {
             self.draw_chat(ui, r);
         }
@@ -606,5 +614,267 @@ impl Gemini {
             let ty = area.y + (area.h - th) * (self.scroll / max_scroll);
             ui.p.fill_rounded(Rect::new(area.right() - 4.0, ty, 2.0, th), 1.0, Color::white(0.22));
         }
+    }
+}
+
+/// Gemini's blue.
+const GEM: Color = Color::hex(0x4285F4);
+
+impl Gemini {
+    /// Alcove: the key form as one soft card with a round badge.
+    fn draw_key_form_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let badge = Rect::new(r.x + 20.0, r.y + 20.0, 46.0, 46.0);
+        ui.p.icon(Icon::Sparkle, badge.inset(12.0), GEM.lerp(Color::white(1.0), 0.3));
+        ui.p.text(
+            "Connect Gemini",
+            Rect::new(badge.right() + 14.0, r.y + 18.0, r.w - 100.0, 28.0),
+            &TextStyle::new(19.0, palette::TEXT).semibold(),
+        );
+        ui.p.text(
+            "Paste your API key. It stays on this PC, in your DynamicNotch folder.",
+            Rect::new(badge.right() + 14.0, r.y + 46.0, r.w - 100.0, 20.0),
+            &TextStyle::new(12.5, palette::TEXT_DIM),
+        );
+        let row = Rect::new(r.x + 20.0, r.y + 84.0, r.w - 40.0, 42.0);
+        let save = Rect::new(row.right() - 84.0, row.y, 84.0, row.h);
+        let field = Rect::new(row.x, row.y, row.w - 94.0, row.h);
+        ui.p.fill_rounded(field, field.h * 0.5, Color::white(0.09));
+        if self.key_field.draw_bare(ui, field.inset_xy(18.0, 6.0), "AIza…", true, 15.0) {
+            ui.fx.keyboard_focus = Some(true);
+        }
+        let can = !self.key_field.is_empty();
+        if crate::alcove::chip(ui, save, "Save", None, can) && can && self.save_key() {
+            ui.fx.layout_changed = true;
+        }
+        if let Some(e) = &self.key_error {
+            ui.p.text(
+                e,
+                Rect::new(row.x + 8.0, row.bottom() + 6.0, row.w - 16.0, 18.0),
+                &TextStyle::new(12.0, palette::RED),
+            );
+        }
+        let lw = crate::alcove::chip_w(ui, "Get a free key", Some(Icon::Link));
+        if crate::alcove::chip(
+            ui,
+            Rect::new(r.x + 20.0, r.bottom() - 46.0, lw, 30.0),
+            "Get a free key",
+            Some(Icon::Link),
+            false,
+        ) {
+            shell_open("https://aistudio.google.com/apikey");
+        }
+        if self.has_key {
+            let cw = crate::alcove::chip_w(ui, "Cancel", None);
+            if crate::alcove::chip(
+                ui,
+                Rect::new(r.right() - 20.0 - cw, r.bottom() - 46.0, cw, 30.0),
+                "Cancel",
+                None,
+                false,
+            ) {
+                self.editing_key = false;
+                self.key_field.clear();
+                ui.fx.layout_changed = true;
+            }
+        }
+    }
+
+    /// Alcove: bubbles above, a capsule to type in below.
+    fn draw_chat_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let input = Rect::new(r.x, r.bottom() - 48.0, r.w, 48.0);
+        let log = Rect::new(r.x, r.y, r.w, (input.y - 12.0 - r.y).max(0.0));
+        self.draw_log_alcove(ui, log);
+
+        ui.p.icon(
+            Icon::Sparkle,
+            Rect::centered(input.x + 26.0, input.cy(), 16.0, 16.0),
+            GEM.lerp(Color::white(1.0), 0.3),
+        );
+
+        let can = !self.input.is_empty();
+        let mut x = input.right() - 42.0;
+        let send = Rect::new(x, input.cy() - 18.0, 36.0, 36.0);
+        if self.streaming {
+            if crate::alcove::round_button(ui, send, Icon::Stop, true) {
+                self.stop_stream();
+            }
+        } else if crate::alcove::round_button(ui, send, Icon::Send, can) && can {
+            self.submit();
+        }
+        let small = |x: f32| Rect::new(x, input.cy() - 15.0, 30.0, 30.0);
+        if self.response().is_some() {
+            x -= 36.0;
+            if crate::alcove::round_button(ui, small(x), Icon::Refresh, false) {
+                self.new_chat();
+                ui.fx.layout_changed = true;
+            }
+            if let Some(t) = self.response() {
+                if !t.assistant.is_empty() && !self.streaming {
+                    x -= 34.0;
+                    let text = t.assistant.clone();
+                    if crate::alcove::round_button(ui, small(x), Icon::Copy, false) {
+                        clip::set_text(self.hwnd.hwnd(), &text);
+                    }
+                }
+            }
+        }
+        x -= 34.0;
+        if crate::alcove::round_button(ui, small(x), Icon::Lock, false) {
+            self.editing_key = true;
+            self.key_field.clear();
+            ui.fx.layout_changed = true;
+        }
+        let hint = if self.streaming { "Answering…" } else { "Ask Gemini anything" };
+        let fx = input.x + 52.0;
+        let field = Rect::new(fx, input.y + 8.0, (x - 8.0 - fx).max(80.0), 32.0);
+        if self.input.draw_bare(ui, field, hint, true, 15.0) {
+            ui.fx.keyboard_focus = Some(true);
+        }
+    }
+
+    fn draw_log_alcove(&mut self, ui: &mut Ui, area: Rect) {
+        #[derive(PartialEq, Clone, Copy)]
+        enum Kind {
+            User,
+            Bot,
+            Error,
+            Working,
+        }
+        let ask_line = TextStyle::new(14.5, palette::INK);
+        let ask = TextStyle::new(14.5, palette::INK).wrap().top();
+        let answer = TextStyle::new(14.5, Color::white(0.94)).wrap().top();
+        let (px, py) = (16.0, 11.0);
+        let max_user = (area.w * 0.72).min(area.w - 60.0).max(120.0);
+        let bot_x = 40.0;
+        let max_bot = (area.w - bot_x - 6.0).max(160.0);
+        let gap = 10.0;
+
+        let n_hist = self.history.len();
+        let mut msgs: Vec<(Kind, usize)> = Vec::new();
+        for i in 0..n_hist + usize::from(self.current.is_some()) {
+            let t = if i < n_hist { &self.history[i] } else { self.current.as_ref().unwrap() };
+            msgs.push((Kind::User, i));
+            if !t.assistant.is_empty() {
+                msgs.push((Kind::Bot, i));
+            }
+            if self.streaming && i >= n_hist && t.assistant.is_empty() {
+                msgs.push((Kind::Working, i));
+            }
+        }
+        if self.error.is_some() {
+            msgs.push((Kind::Error, 0));
+        }
+
+        if msgs.is_empty() {
+            self.text_h = 0.0;
+            let cx = area.cx();
+            ui.p.icon(
+                Icon::Sparkle,
+                Rect::centered(cx, area.cy() - 34.0, 24.0, 24.0),
+                GEM.lerp(Color::white(1.0), 0.3),
+            );
+            ui.p.text(
+                "How can I help?",
+                Rect::new(area.x, area.cy() - 8.0, area.w, 30.0),
+                &TextStyle::new(20.0, Color::white(0.95)).semibold().center(),
+            );
+            return;
+        }
+
+        // (height, width) of every bubble
+        let mut sizes: Vec<(f32, f32)> = Vec::with_capacity(msgs.len());
+        for &(kind, i) in &msgs {
+            let t = if i < n_hist { self.history.get(i) } else { self.current.as_ref() };
+            let size = match kind {
+                Kind::User => {
+                    let text = t.map(|t| t.user.clone()).unwrap_or_default();
+                    let (lw, _) = ui.p.measure(&text, &ask_line);
+                    let w = (lw + 2.0 * px + 4.0).min(max_user);
+                    (ui.p.measure_wrapped(&text, &ask, w - 2.0 * px) + 2.0 * py, w)
+                }
+                Kind::Bot => {
+                    let text = t.map(|t| t.assistant.clone()).unwrap_or_default();
+                    (ui.p.measure_wrapped(&text, &answer, max_bot - 2.0 * px) + 2.0 * py, max_bot)
+                }
+                Kind::Error => {
+                    let text = self.error.clone().unwrap_or_default();
+                    (ui.p.measure_wrapped(&text, &answer, max_bot - 2.0 * px) + 2.0 * py, max_bot)
+                }
+                Kind::Working => (36.0, 70.0),
+            };
+            sizes.push(size);
+        }
+        let total: f32 = sizes.iter().map(|s| s.0 + gap).sum::<f32>() - gap;
+        self.text_h = total + 12.0;
+
+        let max_scroll = (total - area.h).max(0.0);
+        let wheel = ui.wheel(area);
+        if wheel != 0.0 {
+            self.scroll -= wheel * 40.0;
+            self.stick_bottom = self.scroll >= max_scroll - 1.0;
+        }
+        if self.stick_bottom {
+            self.scroll = max_scroll;
+        }
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        if self.scroll >= max_scroll - 1.0 {
+            self.stick_bottom = true;
+        }
+
+        ui.p.push_clip(area);
+        let mut y = area.y - self.scroll;
+        for (k, &(kind, i)) in msgs.iter().enumerate() {
+            let (h, w) = sizes[k];
+            if y + h >= area.y && y <= area.bottom() {
+                let t = if i < n_hist { self.history.get(i) } else { self.current.as_ref() };
+                let rad = (h * 0.5).min(21.0);
+                match kind {
+                    Kind::User => {
+                        let b = Rect::new(area.right() - w - 6.0, y, w, h);
+                        ui.p.fill_rounded(b, rad, Color::white(0.94));
+                        if let Some(t) = t {
+                            ui.p.text(&t.user, Rect::new(b.x + px, b.y + py, b.w - 2.0 * px, b.h - 2.0 * py), &ask);
+                        }
+                    }
+                    Kind::Bot | Kind::Error | Kind::Working => {
+                        ui.p.icon(
+                            Icon::Sparkle,
+                            Rect::centered(area.x + 16.0, y + 16.0, 15.0, 15.0),
+                            GEM.lerp(Color::white(1.0), 0.3),
+                        );
+                        let b = Rect::new(area.x + bot_x, y, w, h);
+                        ui.p.fill_rounded(b, rad, Color::white(0.08));
+                        let inner = Rect::new(b.x + px, b.y + py, b.w - 2.0 * px, b.h - 2.0 * py);
+                        match kind {
+                            Kind::Bot => {
+                                if let Some(t) = t {
+                                    ui.p.text(&t.assistant, inner, &answer);
+                                }
+                            }
+                            Kind::Error => {
+                                if let Some(e) = &self.error {
+                                    ui.p.text(e, inner, &answer.color(palette::RED));
+                                }
+                            }
+                            _ => {
+                                let now = crate::ui::epoch_secs();
+                                for d in 0..3 {
+                                    let ph = (now * 5.0 - d as f32 * 0.8).sin() * 0.5 + 0.5;
+                                    ui.p.fill_circle(
+                                        b.x + 22.0 + d as f32 * 14.0,
+                                        b.cy() - 3.0 * ph,
+                                        3.4 + ph,
+                                        Color::white(0.45 + 0.5 * ph),
+                                    );
+                                }
+                                ui.animate();
+                            }
+                        }
+                    }
+                }
+            }
+            y += h + gap;
+        }
+        ui.p.pop_clip();
     }
 }

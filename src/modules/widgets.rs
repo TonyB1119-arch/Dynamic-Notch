@@ -216,13 +216,17 @@ pub fn switch(ui: &mut Ui, r: Rect, on: bool, _accent: Color) -> bool {
     }
     // the knob slides and the colour fades instead of snapping
     let t = ui.glide(rect_key(r, "switch"), if on { 1.0 } else { 0.0 });
-    ui.p.fill_rounded(track, 12.0, Color::white(0.15).lerp(palette::GREEN, t));
+    // Alcove keeps to black and white: a white track with a dark knob when on
+    let al = crate::ui::look_alcove();
+    let on_col = if al { Color::white(0.92) } else { palette::GREEN };
+    ui.p.fill_rounded(track, 12.0, Color::white(0.15).lerp(on_col, t));
     if t < 0.98 {
         ui.p.stroke_rounded(track.inset(0.5), 12.0, 1.0, Color::white(0.08 * (1.0 - t)));
     }
     let kx = (track.x + 12.0) + (track.w - 24.0) * t;
     ui.p.fill_circle(kx, track.cy() + 0.6, 9.0, Color::black(0.18));
-    ui.p.fill_circle(kx, track.cy(), 9.0, Color::white(1.0));
+    let knob = if al { Color::white(1.0).lerp(palette::INK, t) } else { Color::white(1.0) };
+    ui.p.fill_circle(kx, track.cy(), 9.0, knob);
     ui.clicked(r)
 }
 

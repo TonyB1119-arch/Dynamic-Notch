@@ -69,6 +69,40 @@ pub fn create() -> Result<HWND> {
     }
 }
 
+/// The dock's window: same class and look as the notch's, a different job.
+pub fn create_dock() -> Result<HWND> {
+    unsafe {
+        let hinst = GetModuleHandleW(None)?;
+        let hwnd = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            CLASS_NAME,
+            w!("Dynamic Notch Dock"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst.into()),
+            None,
+        )?;
+        let no_round = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &no_round as *const _ as _,
+            std::mem::size_of_val(&no_round) as u32,
+        );
+        let on = BOOL(1);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, &on as *const _ as _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, &on as *const _ as _, 4);
+        let none: u32 = 0xFFFF_FFFE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const _ as _, 4);
+        Ok(hwnd)
+    }
+}
+
 /// Run `f` with the app if it is not already borrowed.
 pub fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|a| match a.try_borrow_mut() {
@@ -90,6 +124,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 }
 
 fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // The dock window has its own messages (and no tray menu).
+    if hwnd.0 as isize == crate::dock::hwnd_value() {
+        if let Some(Some(r)) = with_app(|app| app.dock_message(msg, wp, lp)) {
+            return r;
+        }
+        return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+    }
     // Context menus run a modal loop, so they must be shown *outside* the
     // app borrow; otherwise frames/timers arriving meanwhile would be lost.
     let menu_request = match msg {

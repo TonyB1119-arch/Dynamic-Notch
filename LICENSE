@@ -1,3 +1,25 @@
+Dynamic Notch (Extended)
+
+PART 1 - ADDITIONS IN THIS BUILD
+
+Copyright (c) 2026 <YOUR NAME>. All rights reserved.
+
+Everything added to this project in this build (including the Settings tab,
+Weather, Control Center, Notifications, Gemini tab, Notes, USB drive peek, the
+unlock animation, tab transitions and the "beam" visual language, together with
+their code, designs, text and documentation) is proprietary. You may not copy,
+modify, distribute, sublicense, publish or sell these additions, in whole or in
+part, without the prior written permission of the copyright holder. Permission
+to run the compiled program for personal use is granted to the person who
+received it from the copyright holder.
+
+PART 2 - EARLIER WORK (MIT LICENSE)
+
+Parts of this software are derived from earlier work that was released under
+the MIT License. That license requires its notice to stay with copies and
+substantial portions of that work, so it is reproduced here unchanged. Part 1
+does not reduce the rights this notice grants for that earlier work.
+
 MIT License
 
 Copyright (c) 2026 Eigenesf

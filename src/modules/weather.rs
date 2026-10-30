@@ -97,6 +97,31 @@ enum Cmd {
     Quit,
 }
 
+/// The latest forecast in short form, for the Alcove home page.
+#[derive(Clone)]
+pub struct Brief {
+    pub temp: f32,
+    pub place: String,
+    pub label: &'static str,
+    cond: Cond,
+    night: bool,
+}
+
+impl Brief {
+    pub fn draw_icon(&self, p: &mut Painter, r: Rect) {
+        draw_condition(p, self.cond, r, self.night);
+    }
+}
+
+thread_local! {
+    static BRIEF: std::cell::RefCell<Option<std::rc::Rc<Brief>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What the weather is now, when a forecast has arrived.
+pub fn brief() -> Option<std::rc::Rc<Brief>> {
+    BRIEF.with(|b| b.borrow().clone())
+}
+
 pub struct Weather {
     tx: Option<Sender<Cmd>>,
     data: Option<std::sync::Arc<Forecast>>,
@@ -117,6 +142,7 @@ impl Weather {
         let imperial = cx_cfg.weather.units.eq_ignore_ascii_case("imperial");
         if city.is_empty() {
             self.data = None;
+            BRIEF.with(|b| *b.borrow_mut() = None);
             self.error = None;
             self.loading = false;
             return;
@@ -169,6 +195,9 @@ impl Module for Weather {
         self.loading = false;
         match *m {
             WMsg::Data(d) => {
+                let brief =
+                    Brief { temp: d.temp, place: d.place.clone(), label: d.cond.label(), cond: d.cond, night: d.night };
+                BRIEF.with(|b| *b.borrow_mut() = Some(std::rc::Rc::new(brief)));
                 self.data = Some(std::sync::Arc::new(d));
                 self.error = None;
             }
@@ -247,7 +276,11 @@ impl Module for Weather {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        238.0
+        if crate::ui::look_alcove() {
+            164.0
+        } else {
+            238.0
+        }
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
@@ -273,6 +306,10 @@ impl Module for Weather {
             }
             return;
         };
+
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r, &d);
+        }
 
         // top: the weather now. Icon and temperature, the details beside them,
         // humidity and wind as beam gauges on the right.
@@ -361,6 +398,72 @@ impl Module for Weather {
                     &format!("{p:.0}% rain"),
                     Rect::new(inner.x, c.y + 98.0, inner.w, 16.0),
                     &TextStyle::new(11.0, palette::BLUE).semibold().center(),
+                );
+            }
+        }
+    }
+}
+
+impl Weather {
+    /// Alcove: the weather now on the left, the days as rounded tiles on the right.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect, d: &Forecast) {
+        // the left block is as wide as the temperature needs, so it is never cut short
+        let temp = format!("{:.0}°", d.temp);
+        let big = TextStyle::new(54.0, palette::TEXT).weight(700);
+        let (temp_w, _) = ui.p.measure(&temp, &big);
+        let left_w = (r.w * 0.34).min(250.0).max(68.0 + temp_w + 10.0).min(r.w * 0.45);
+        draw_condition(ui.p, d.cond, Rect::new(r.x, r.y + 4.0, 56.0, 56.0), d.night);
+        ui.p.text(&temp, Rect::new(r.x + 68.0, r.y - 2.0, left_w - 68.0, 64.0), &big);
+        ui.p.text(
+            d.cond.label(),
+            Rect::new(r.x, r.y + 68.0, left_w, 24.0),
+            &TextStyle::new(17.0, palette::TEXT).semibold(),
+        );
+        ui.p.text(
+            &format!("{} · Feels like {:.0}°", d.place, d.feels),
+            Rect::new(r.x, r.y + 92.0, left_w, 20.0),
+            &TextStyle::new(12.5, palette::TEXT_DIM),
+        );
+        let wind_unit = if d.imperial { "mph" } else { "km/h" };
+        let facts = [format!("Humidity {:.0}%", d.humidity), format!("Wind {:.0} {wind_unit}", d.wind)];
+        let mut fx = r.x;
+        for f in &facts {
+            let (w, _) = ui.p.measure(f, &TextStyle::new(12.0, palette::TEXT).medium());
+            let b = Rect::new(fx, r.y + 122.0, w + 22.0, 28.0);
+            if b.right() > r.x + left_w + 8.0 {
+                break;
+            }
+            ui.p.text(f, Rect::new(b.x + 11.0, b.y, w + 4.0, b.h), &TextStyle::new(12.0, palette::TEXT).medium());
+            fx = b.right() + 8.0;
+        }
+        // the days
+        let fc = Rect::new(r.x + left_w + 22.0, r.y, r.w - left_w - 22.0, r.h);
+        let n = d.days.len().max(1) as f32;
+        let gap = 10.0;
+        let tw = (fc.w - gap * (n - 1.0)) / n;
+        for (i, day) in d.days.iter().enumerate() {
+            let t = Rect::new(fc.x + i as f32 * (tw + gap), fc.y, tw, fc.h);
+            ui.p.text(
+                &day.label,
+                Rect::new(t.x, t.y + 12.0, t.w, 18.0),
+                &TextStyle::new(12.5, palette::TEXT_DIM).semibold().center(),
+            );
+            draw_condition(ui.p, day.cond, Rect::centered(t.cx(), t.y + 54.0, 32.0, 32.0), false);
+            ui.p.text(
+                &format!("{:.0}°", day.hi),
+                Rect::new(t.x, t.y + 78.0, t.w, 22.0),
+                &TextStyle::new(16.0, palette::TEXT).semibold().center(),
+            );
+            ui.p.text(
+                &format!("{:.0}°", day.lo),
+                Rect::new(t.x, t.y + 100.0, t.w, 20.0),
+                &TextStyle::new(13.5, palette::TEXT_FAINT).medium().center(),
+            );
+            if let Some(p) = day.rain.filter(|p| *p >= 20.0) {
+                ui.p.text(
+                    &format!("{p:.0}%"),
+                    Rect::new(t.x, t.y + 128.0, t.w, 18.0),
+                    &TextStyle::new(11.5, palette::TEAL).semibold().center(),
                 );
             }
         }

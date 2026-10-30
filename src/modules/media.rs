@@ -6,6 +6,7 @@
 //! events and pushes immutable snapshots to the UI thread.
 
 use std::any::Any;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ use super::{Activity, CardSize, Cx, Module, ModuleId, Peek, Slot, SystemEvent};
 use crate::anim::smoothstep;
 use crate::bus::Bus;
 use crate::gfx::{image, Icon, ImageData, TextStyle};
+use crate::sys::http::{self, Timeouts};
 use crate::ui::{ButtonStyle, Ui};
 use crate::util::{format_duration, palette, Color, Rect};
 
@@ -59,6 +61,13 @@ pub struct Media {
     stamp: Instant,
     tx: Option<Sender<Cmd>>,
     paused_at: Option<Instant>,
+    /// A different track (or none) that has not lasted long enough yet, and since when: closing a
+    /// tab makes browsers flash their last few sessions for a moment, and those must not show.
+    pending: Option<(Instant, Snapshot)>,
+    /// Set while a settled snapshot is replayed from `on_tick`.
+    settled: bool,
+    /// When the player last started playing (a browser must play steadily before it counts).
+    play_since: Option<Instant>,
     expanded: bool,
     linger: Duration,
     first: bool,
@@ -75,6 +84,41 @@ pub struct Media {
     /// The track that was playing before the last change, and when it changed.
     prev: Option<(String, String, Option<ImageData>)>,
     changed_at: Option<Instant>,
+    /// Synced lyrics of the current track (seconds, text), once found.
+    lyrics: Vec<(f64, String)>,
+    /// The track the lyrics were asked for, so a late answer for an old track is dropped.
+    lyrics_key: String,
+    /// Lyrics or controls on the media page (click the cover to switch).
+    show_lyrics: bool,
+    /// The line shown now and when it changed (for the scroll).
+    ly_idx: usize,
+    ly_at: Instant,
+}
+
+/// A lyrics answer from the worker thread.
+struct Lyrics {
+    key: String,
+    lines: Vec<(f64, String)>,
+}
+
+/// How long the cover flip takes when the track changes (seconds).
+/// How long a browser must have been playing before the notch believes it.
+const PLAY_GATE: Duration = Duration::from_millis(800);
+
+fn is_browser(app: &str) -> bool {
+    matches!(app, "Chrome" | "Microsoft Edge" | "Firefox" | "Brave" | "Opera" | "Vivaldi")
+}
+
+/// How long a paused browser tab stays on the notch.
+const BROWSER_LINGER: Duration = Duration::from_secs(3);
+
+/// How long a different track (or the player going away) must last before the notch follows.
+const SETTLE: Duration = Duration::from_millis(700);
+
+const FLIP_SECS: f32 = 0.6;
+
+fn track_key(title: &str, artist: &str) -> String {
+    format!("{title}\u{1}{artist}")
 }
 
 /// How long the switch to the next track animates (seconds).
@@ -87,6 +131,9 @@ impl Media {
             stamp: Instant::now(),
             tx: None,
             paused_at: None,
+            pending: None,
+            settled: false,
+            play_since: None,
             expanded: false,
             linger: Duration::from_secs(20),
             first: true,
@@ -97,6 +144,11 @@ impl Media {
             peeked: false,
             prev: None,
             changed_at: None,
+            lyrics: Vec::new(),
+            lyrics_key: String::new(),
+            show_lyrics: true,
+            ly_idx: 0,
+            ly_at: Instant::now(),
         }
     }
 
@@ -109,8 +161,13 @@ impl Media {
     fn playing(&self) -> bool {
         match self.pending_playing {
             Some((p, t)) if t.elapsed() < Duration::from_millis(1500) => p,
-            _ => self.snap.playing,
+            _ => self.snap.playing && self.stable_play(),
         }
+    }
+
+    /// Browsers flash half-second "plays" from tabs that are going away; only steady playing counts.
+    fn stable_play(&self) -> bool {
+        !is_browser(&self.snap.app) || self.play_since.is_none_or(|t| t.elapsed() >= PLAY_GATE)
     }
 
     fn position(&self) -> f64 {
@@ -124,8 +181,24 @@ impl Media {
         p.max(0.0)
     }
 
+    /// Progress (0..1) of the cover flip after a track change, while it runs.
+    fn flip(&self) -> Option<f32> {
+        let t = self.changed_at?.elapsed().as_secs_f32() / FLIP_SECS;
+        (t < 1.0 && crate::ui::look_alcove()).then_some(t)
+    }
+
+    /// How long a paused player stays on the notch. A browser tab that paused (leaving YouTube
+    /// Shorts, say) is not worth keeping for long.
+    fn linger_now(&self) -> Duration {
+        if is_browser(&self.snap.app) {
+            self.linger.min(BROWSER_LINGER)
+        } else {
+            self.linger
+        }
+    }
+
     fn visible(&self) -> bool {
-        self.snap.active && (self.playing() || self.paused_at.is_some_and(|t| t.elapsed() < self.linger))
+        self.snap.active && (self.playing() || self.paused_at.is_some_and(|t| t.elapsed() < self.linger_now()))
     }
 
     fn accent(&self) -> Color {
@@ -173,8 +246,48 @@ impl Module for Media {
     }
 
     fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
+        let msg = match msg.downcast::<Lyrics>() {
+            Ok(l) => {
+                if l.key == self.lyrics_key {
+                    self.lyrics = l.lines;
+                    cx.fx.redraw = true;
+                }
+                return;
+            }
+            Err(m) => m,
+        };
         let Ok(s) = msg.downcast::<Snapshot>() else { return };
         let s = *s;
+        // a new track (or the player going away) only counts once it has lasted a moment; play and
+        // pause and the progress apply at once
+        let settled = std::mem::take(&mut self.settled);
+        let same = |a: &Snapshot, b: &Snapshot| a.active == b.active && a.title == b.title && a.artist == b.artist;
+        if !settled && !self.first && !same(&s, &self.snap) {
+            let since = match &self.pending {
+                Some((t, p)) if same(p, &s) => *t,
+                _ => Instant::now(),
+            };
+            if since.elapsed() < SETTLE {
+                self.pending = Some((since, s));
+                cx.fx.redraw = true;
+                return;
+            }
+        }
+        self.pending = None;
+        let key = track_key(&s.title, &s.artist);
+        if key != self.lyrics_key {
+            self.lyrics.clear();
+            self.ly_idx = 0;
+            self.lyrics_key = key.clone();
+            if !s.title.is_empty() {
+                let (bus, title, artist, dur) = (cx.bus.clone(), s.title.clone(), s.artist.clone(), s.duration);
+                let _ = std::thread::Builder::new().name("lyrics".into()).spawn(move || {
+                    if let Some(lines) = fetch_lyrics(&title, &artist, dur) {
+                        bus.to_module(ID, Lyrics { key, lines });
+                    }
+                });
+            }
+        }
         let track_changed = s.title != self.snap.title || s.artist != self.snap.artist;
         if track_changed && !self.snap.title.is_empty() && !s.title.is_empty() {
             self.prev = Some((self.snap.title.clone(), self.snap.artist.clone(), self.snap.art.clone()));
@@ -183,10 +296,16 @@ impl Module for Media {
         if !s.active {
             self.peeked = false; // the next time something plays, it gets its peek again
         }
-        if self.snap.playing && !s.playing {
+        if self.snap.playing && !s.playing && self.stable_play() {
             self.paused_at = Some(Instant::now());
         }
-        if s.playing {
+        if s.playing && !self.snap.playing {
+            self.play_since = Some(Instant::now());
+        }
+        if !s.playing {
+            self.play_since = None;
+        }
+        if s.playing && !is_browser(&s.app) {
             self.paused_at = None;
         }
         if !self.first
@@ -255,11 +374,28 @@ impl Module for Media {
                 return Some(Instant::now() + Duration::from_millis(500));
             }
         }
-        // when the paused linger expires the activity disappears
-        self.paused_at.map(|t| t + self.linger).filter(|t| *t > Instant::now())
+        // when the paused linger expires the activity disappears; a waiting change settles then too
+        let now = Instant::now();
+        let linger = self.paused_at.map(|t| t + self.linger_now()).filter(|t| *t > now);
+        let settle = self.pending.as_ref().map(|(t, _)| *t + SETTLE).filter(|t| *t > now);
+        let gate = self
+            .play_since
+            .filter(|_| self.snap.playing && is_browser(&self.snap.app))
+            .map(|t| t + PLAY_GATE)
+            .filter(|t| *t > now);
+        [linger, settle, gate].into_iter().flatten().min()
     }
 
     fn on_tick(&mut self, cx: &mut Cx) {
+        if self.snap.playing && self.stable_play() {
+            self.paused_at = None;
+        }
+        if self.pending.as_ref().is_some_and(|(t, _)| t.elapsed() + Duration::from_millis(5) >= SETTLE) {
+            if let Some((_, snap)) = self.pending.take() {
+                self.settled = true;
+                self.on_message(Box::new(snap), cx);
+            }
+        }
         cx.fx.redraw = true;
     }
 
@@ -267,14 +403,138 @@ impl Module for Media {
         if !self.visible() {
             return None;
         }
-        let left = Slot::Vinyl { color: self.accent(), angle: self.spin, art: self.snap.art.clone() };
+        let flip = self.flip().map(|p| (p, self.prev.as_ref().and_then(|x| x.2.clone())));
+        let left = Slot::Vinyl { color: self.accent(), angle: self.spin, art: self.snap.art.clone(), flip };
         Some(Activity {
             priority: if self.playing() { 50 } else { 10 },
             left,
             right: Slot::Bars { color: self.accent(), playing: self.playing() },
             wing: 1.05,
-            page: None,
+            page: if crate::ui::look_alcove() { Some(ID) } else { None },
         })
+    }
+
+    fn has_page(&self) -> bool {
+        crate::ui::look_alcove() && self.snap.active
+    }
+
+    fn page_height(&self, _width: f32) -> f32 {
+        // taller while the lyrics show
+        if self.show_lyrics && !self.lyrics.is_empty() {
+            186.0
+        } else {
+            132.0
+        }
+    }
+
+    fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        self.last_draw = Some(ui.now);
+        let lyrics_on = self.show_lyrics && !self.lyrics.is_empty();
+
+        // cover (it flips over when the track changes); a click switches lyrics and controls
+        let art_s = 66.0;
+        let art = Rect::new(r.x, r.y + 2.0, art_s, art_s);
+        if !self.lyrics.is_empty() && ui.clicked(art) {
+            self.show_lyrics = !self.show_lyrics;
+        }
+        let (mut shown, mut k) = (self.snap.art.as_ref(), 1.0f32);
+        if let Some(p) = self.flip() {
+            k = (p * std::f32::consts::PI).cos().abs().max(0.02);
+            if p < 0.5 {
+                shown = self.prev.as_ref().and_then(|x| x.2.as_ref());
+            }
+            ui.animate();
+        }
+        let face = Rect::centered(art.cx(), art.cy(), art_s * k, art_s * (0.93 + 0.07 * k));
+        match shown {
+            Some(img) => ui.p.image(img, face, art_s * 0.22 * k.max(0.4), 1.0),
+            None => {
+                ui.p.icon(
+                    Icon::Music,
+                    Rect::centered(face.cx(), face.cy(), face.w * 0.5, art_s * 0.5),
+                    Color::white(0.55),
+                );
+            }
+        }
+
+        // title and artist, and the little level glyph
+        let tx = art.right() + 14.0;
+        let tw = r.right() - tx;
+        let title = if self.snap.title.is_empty() { "Unknown title" } else { &self.snap.title };
+        let sub = if !self.snap.artist.is_empty() { self.snap.artist.clone() } else { self.snap.app.clone() };
+        let glyph_w = 26.0;
+        ui.p.push_clip(Rect::new(tx, r.y, tw - glyph_w - 10.0, 68.0));
+        ui.p.text(title, Rect::new(tx, r.y + 6.0, tw, 28.0), &TextStyle::new(18.0, Color::white(1.0)).semibold());
+        ui.p.text(&sub, Rect::new(tx, r.y + 34.0, tw, 24.0), &TextStyle::new(15.0, palette::TEXT_DIM));
+        ui.p.pop_clip();
+        let playing = self.playing();
+        let secs = crate::ui::epoch_secs();
+        for i in 0..4 {
+            let lvl = if playing {
+                0.35 + 0.65 * ((secs * (3.1 + i as f32 * 1.3) + i as f32 * 1.7).sin() * 0.5 + 0.5)
+            } else {
+                0.25
+            };
+            let h = 4.0 + 16.0 * lvl;
+            let x = r.right() - glyph_w + i as f32 * 7.0;
+            ui.p.fill_rounded(Rect::new(x, r.y + 18.0 - h * 0.5, 4.0, h), 2.0, Color::white(0.85));
+        }
+        if playing {
+            ui.animate();
+        }
+
+        let pos = self.position();
+        let dur = self.snap.duration;
+        let mut y = r.y + 74.0;
+
+        // the line being sung (and the next one)
+        if lyrics_on {
+            self.draw_lyrics(ui, Rect::new(r.x, y, r.w, 50.0), pos);
+            y += 56.0;
+        }
+
+        // time, thin bar, time
+        let ts = TextStyle::new(12.5, palette::TEXT_DIM).medium();
+        let tw_t = 46.0;
+        ui.p.text(&format_duration(pos), Rect::new(r.x, y, tw_t, 18.0), &ts);
+        if dur > 0.0 {
+            ui.p.text(&format_duration(dur), Rect::new(r.right() - tw_t, y, tw_t, 18.0), &ts.right());
+        }
+        let bar = Rect::new(r.x + tw_t + 6.0, y + 6.0, (r.w - 2.0 * (tw_t + 6.0)).max(40.0), 5.0);
+        let frac = if dur > 0.0 { (pos / dur) as f32 } else { 0.0 };
+        ui.p.fill_rounded(bar, 2.5, Color::white(0.18));
+        if frac > 0.0 {
+            ui.p.fill_rounded(Rect::new(bar.x, bar.y, (bar.w * frac).max(5.0), bar.h), 2.5, Color::white(0.95));
+        }
+        if self.snap.can_seek && dur > 0.0 {
+            if let Some(f) = ui.clicked_at(bar.inset_xy(-4.0, -9.0)) {
+                let target = f as f64 * dur;
+                self.snap.position = target;
+                self.stamp = Instant::now();
+                self.send(Cmd::Seek(target));
+            }
+        }
+        y += 26.0;
+
+        // controls: back, play or pause, forward - plain white glyphs
+        let cy = (y + (r.bottom() - y) * 0.5).min(y + 24.0);
+        let cx = r.cx();
+        let dim = |on: bool| if on { Color::white(0.97) } else { Color::white(0.35) };
+        let side = ButtonStyle::default().scale(0.85);
+        if ui.icon_button(Rect::centered(cx - 76.0, cy, 44.0, 40.0), Icon::Prev, side.fg(dim(self.snap.can_prev))) {
+            self.send(Cmd::Prev);
+        }
+        let pp = if playing { Icon::Pause } else { Icon::Play };
+        if ui.icon_button(
+            Rect::centered(cx, cy, 52.0, 44.0),
+            pp,
+            ButtonStyle::default().fg(Color::white(1.0)).scale(0.9),
+        ) {
+            self.toggle();
+        }
+        if ui.icon_button(Rect::centered(cx + 76.0, cy, 44.0, 40.0), Icon::Next, side.fg(dim(self.snap.can_next))) {
+            self.send(Cmd::Next);
+        }
     }
 
     fn card(&self) -> Option<CardSize> {
@@ -398,6 +658,127 @@ impl Module for Media {
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
+
+impl Media {
+    /// Two lines of the song: the one being sung and the next, scrolling up as it moves on.
+    fn draw_lyrics(&mut self, ui: &mut Ui, area: Rect, pos: f64) {
+        let idx = self.lyrics.partition_point(|(t, _)| *t <= pos + 0.25).saturating_sub(1);
+        if idx != self.ly_idx {
+            self.ly_idx = idx;
+            self.ly_at = ui.now;
+        }
+        let t = (ui.now.saturating_duration_since(self.ly_at).as_secs_f32() / 0.38).min(1.0);
+        let e = smoothstep(0.0, 1.0, t);
+        if t < 1.0 {
+            ui.animate();
+        }
+        ui.p.push_clip(area);
+        let pitch = 25.0;
+        let started = pos + 0.25 >= self.lyrics.first().map_or(0.0, |l| l.0);
+        for k in -1i32..=2 {
+            let i = idx as i32 + k;
+            if i < 0 || i as usize >= self.lyrics.len() || (!started && k <= 0) {
+                continue;
+            }
+            let text = self.lyrics[i as usize].1.trim();
+            let text = if text.is_empty() { "♪" } else { text };
+            let kf = k as f32 + (1.0 - e);
+            let w = (1.0 - kf.abs()).clamp(0.0, 1.0);
+            let alpha = if kf < 0.0 { w } else { 0.34 + 0.66 * w };
+            let size = 14.5 + 4.5 * w;
+            let style = TextStyle::new(size, Color::white(alpha)).weight(if w > 0.5 { 600 } else { 500 });
+            ui.p.text(text, Rect::new(area.x, area.y + 1.0 + kf * pitch, area.w, 26.0), &style);
+        }
+        ui.p.pop_clip();
+    }
+}
+
+/// Look the lyrics up on LRCLIB (free, no key). Only synced lyrics are used.
+fn fetch_lyrics(title: &str, artist: &str, duration: f64) -> Option<Vec<(f64, String)>> {
+    let (title, artist) = clean_track(title, artist);
+    let enc = |s: &str| {
+        let mut o = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+                _ => o.push_str(&format!("%{b:02X}")),
+            }
+        }
+        o
+    };
+    let cancel = AtomicBool::new(false);
+    let headers = [("User-Agent", "DynamicNotch (https://github.com/eigenes/DynamicNotch)".to_string())];
+    let get = |url: &str| -> Option<serde_json::Value> {
+        let (status, body) = http::fetch("GET", url, &headers, &[], Timeouts::DEFAULT, 1024 * 1024, &cancel).ok()?;
+        if status != 200 {
+            return None;
+        }
+        serde_json::from_slice(&body).ok()
+    };
+    let mut url = format!("https://lrclib.net/api/get?track_name={}&artist_name={}", enc(&title), enc(&artist));
+    if duration > 1.0 {
+        url.push_str(&format!("&duration={:.0}", duration));
+    }
+    let mut synced = get(&url).and_then(|v| v["syncedLyrics"].as_str().map(str::to_string));
+    if synced.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        // fall back to a search and take the closest synced hit
+        let v = get(&format!("https://lrclib.net/api/search?q={}", enc(&format!("{artist} {title}"))))?;
+        synced = v.as_array()?.iter().find_map(|h| {
+            let ok = duration < 1.0 || h["duration"].as_f64().is_none_or(|d| (d - duration).abs() < 6.0);
+            h["syncedLyrics"].as_str().filter(|s| ok && !s.trim().is_empty()).map(str::to_string)
+        });
+    }
+    let lines = parse_lrc(&synced?);
+    (lines.len() > 2).then_some(lines)
+}
+
+/// "Song (feat. X) - Remastered 2011" → "Song"; "Artist - Topic" → "Artist".
+fn clean_track(title: &str, artist: &str) -> (String, String) {
+    let mut t = title.to_string();
+    let mut a = artist.trim_end_matches(" - Topic").trim().to_string();
+    if let Some((x, y)) = title.split_once(" - ") {
+        // browsers often put "Artist - Song" in the title
+        if a.is_empty() || x.trim().eq_ignore_ascii_case(&a) {
+            a = x.trim().to_string();
+            t = y.to_string();
+        } else {
+            t = x.to_string();
+        }
+    }
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in t.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = (depth - 1).max(0),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    (out.trim().to_string(), a)
+}
+
+fn parse_lrc(s: &str) -> Vec<(f64, String)> {
+    let mut v = Vec::new();
+    for line in s.lines() {
+        let mut rest = line.trim();
+        let mut stamps = Vec::new();
+        while let Some(r) = rest.strip_prefix('[') {
+            let Some((tag, after)) = r.split_once(']') else { break };
+            if let Some((m, sec)) = tag.split_once(':') {
+                if let (Ok(m), Ok(sec)) = (m.parse::<f64>(), sec.parse::<f64>()) {
+                    stamps.push(m * 60.0 + sec);
+                }
+            }
+            rest = after;
+        }
+        for t in stamps {
+            v.push((t, rest.trim().to_string()));
+        }
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v
+}
 
 fn worker(rx: Receiver<Cmd>, tx: Sender<Cmd>, bus: Bus) {
     unsafe {

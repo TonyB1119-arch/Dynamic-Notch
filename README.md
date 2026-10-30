@@ -83,33 +83,52 @@ Small, short-lived messages that slide out of the closed notch and drain away on
 
 ---
 
-## Beams
+## Looks
 
-Every gauge, loader and countdown is built from the same row of small bars, so the whole app feels like one thing.
+Settings → Appearance → **Look** has four choices:
+
+- **Beams** (default): rows of small glowing bars carry every level, progress and signal: volume and brightness, the media scrubber, system stats, signal strength, battery gauges, downloads, the timer and more.
+- **Calm**: beams stay only on the volume and brightness bars and the battery gauges. Everything else is one of three quieter looks: a **glow bar** whose lit end turns white and swells gradually (progress, sliders, ranges, shimmers), **pill segments** (small meters and graphs) and a **dot ring** (every circular gauge).
+- **Minimal**: no glow and no swell. Gauges are thin plain lines, rings are hairline arcs, "working on it" is one short line gliding along its rail, and the scrubber shows a small dot only when you hover it. Motion has no bounce at all, so everything arrives and settles quietly.
+
+- **Nothing**: inspired by Nothing OS. Everything is white on black with a single red accent, drawn as dot-matrix "glyph" lights. Gauges are rows of LED dots with a red leading dot, "working on it" is a little comet of dots stepping along, rings are circles of dots, graphs are columns of dots, the tab marker is one red dot, and the home clock is a 5x7 dot-matrix display with a red colon. Motion is crisp, mechanical and bounce-free.
+- **Bloom**: soft and rounded, in the spirit of the Bloom AI app. Gauges are thick capsules on a faint track, rings are thick with round ends, graphs are rounded bars, the scrubber is a capsule with a round knob that appears on hover, and lists and cards sit in bordered, translucent groups. The accent is a clear iOS blue, and motion is a smooth ease-out with hardly any overshoot. Everything else (Gemini, clipboard, shelf, ports and the rest) picks the look up automatically.
+
+Every feature is available in all four. The look changes as soon as you press it.
+
+How beams behave:
 
 - Lit beams are blue; unlit ones are a quiet grey.
-- The beams at the leading edge of any value shine white, and **the whiter a beam is, the larger it is**.
+- The beams at the leading edge shine white, and **the whiter a beam is, the larger it is**.
 - Values glide to their new level instead of jumping.
 - Beams are only redrawn while something is moving, so a resting notch costs next to nothing.
 - Prefer white beams? There is a switch for that in Settings.
 
 ---
 
-## Install and build
+## Install and update
 
-You need Windows and the Rust toolchain.
+**Installer (easiest).** Download `DynamicNotch-Setup.exe` from the Releases page and run it. It installs for your user only, so there is no administrator prompt, and it adds a Start menu shortcut and an uninstaller. It installs no service and no scheduled task: whether the notch starts with Windows is a setting inside the app.
+
+**Portable.** The release zip holds a single `dynamic-notch.exe`. Unzip it anywhere and run it.
+
+**The dock.** Switch it on under Settings → Dock. It sits at the bottom of the screen with your pinned apps and every app that is running: icons grow near the pointer, a bar under the icon shows what is open (a long one for the focused window), resting the pointer on an app shows live previews of its windows (click one to switch, the small cross closes it), click an icon to open, focus or minimize, scroll over it to step through windows, right-click to pin, unpin or close, and drag icons to reorder. "Hide the Windows taskbar" makes it a full taskbar replacement: maximized windows stop above the dock, and the taskbar comes back when you switch it off, quit, or start the app again after a crash. The dock hides itself while a full-screen app is in front. `[dock]` in the config.
+
+**Updating.** Open Settings → General → Updates and press **Check for updates**. The app asks GitHub for the newest release once, then stops. If there is a newer one, press **Install**: it downloads the installer, runs it quietly, and the notch restarts on the new version. Nothing is ever checked in the background or at start-up. The repository it looks at is `[update] repo` in the config.
+
+**Build it yourself.** You need Windows and the Rust toolchain:
 
 ```
 cargo build --release
 ```
 
-The program ends up in `target\release\dynamic-notch.exe`. Run it; a notch appears at the top of the main screen and an icon appears in the tray.
-
-To build for Windows from another system:
+The program ends up in `target\release\dynamic-notch.exe`. To build for Windows from another system:
 
 ```
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+To make the installer yourself, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and compile `installer/DynamicNotch.iss`. Pushing a release tag such as `v3` builds the zips and the installer on GitHub automatically.
 
 ---
 
@@ -145,7 +164,7 @@ dynamic-notch toggle | expand | collapse | ai | reload | quit
 
 Open the gear in the header. The tabs cover:
 
-- **General**: where the notch sits, which screen, what it does when idle, the unlock greeting, the name it says hello to, the hello font, and a few handy buttons (edit the config file, open the data folder).
+- **General**: where the notch sits, which screen, what it does when idle, the unlock greeting, the name it says hello to, the hello font, a few handy buttons (edit the config file, open the data folder), and the **Updates** button.
 - **Look**: glass, opacity, sizes, bounce, speed, accent colour, beam style, the home clock style, and a switch for lighter animations.
 - **Home**: choose and order the home widgets.
 - **Modules**: switch whole features on or off. A feature that is off does not run at all.
@@ -190,7 +209,7 @@ You can paste the Gemini key straight into the app; the others go in `.env`.
 ## Built to stay light
 
 - Drawn directly with Direct2D and DirectWrite. There is no web view.
-- The notch only redraws when something changes, and drops to a gentle frame rate for ambient effects.
+- The notch only redraws when something changes. Ambient effects (shimmers, sweeps) run at your screen's refresh rate up to 60 fps, and nothing is drawn while everything is still.
 - Opening, closing and page slides draw the finished content once as a picture and just move it, which keeps those moments cheap. This can be turned off in Settings.
 - Text layouts, images and shapes are cached with size limits, and idle memory is trimmed after the notch has been quiet for a while.
 - Background workers (stats, dev servers, notifications) slow down or stop when nobody is looking at them.

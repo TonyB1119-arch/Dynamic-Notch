@@ -18,6 +18,9 @@ use crate::gfx::{Icon, TextStyle};
 use crate::ui::Ui;
 use crate::util::{palette, Color, Rect};
 
+/// A tab the control center should show next (0 = Wi-Fi, 1 = Bluetooth, -1 = none): set by its pills.
+pub static WANT_TAB: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 const ID: ModuleId = "control";
 const BAR_H: f32 = 40.0;
 const BAR_GAP: f32 = 12.0;
@@ -141,6 +144,10 @@ impl Module for ControlCenter {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        let want = WANT_TAB.swap(-1, std::sync::atomic::Ordering::Relaxed);
+        if want == 0 || want == 1 {
+            self.tab = want as usize;
+        }
         // glide toward the selected tab
         let dt = ui.now.saturating_duration_since(self.last).as_secs_f32().min(0.05);
         self.last = ui.now;
@@ -156,25 +163,38 @@ impl Module for ControlCenter {
 
         // --- the two buttons ---------------------------------------------------
         let bar = Rect::new(r.x, r.y, r.w, BAR_H);
-        // minimal: two quiet labels over a hairline, with one blue beam gliding under the open one
-        let half = bar.w * 0.5;
-        ui.p.fill_rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), Color::white(0.07));
-        let bx = bar.x + self.pos * half + half * 0.5;
-        ui.p.fill_rounded(Rect::new(bx - 22.0, bar.bottom() - 2.5, 44.0, 2.5), 1.25, palette::BLUE);
-        for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
-            let b = Rect::new(bar.x + i as f32 * half, bar.y, half, bar.h);
-            if ui.hovered(b) {
-                ui.hot = true;
+        if crate::ui::look_alcove() {
+            // two capsules; the open one is white
+            let mut x = bar.x;
+            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
+                let w = crate::alcove::chip_w(ui, label, Some(*icon)) + 10.0;
+                let b = Rect::new(x, bar.y + 4.0, w, 30.0);
+                if crate::alcove::chip(ui, b, label, Some(*icon), self.tab == i) {
+                    self.tab = i;
+                }
+                x += w + 8.0;
             }
-            let near = (1.0 - (self.pos - i as f32).abs()).clamp(0.0, 1.0);
-            let col = palette::TEXT_FAINT.lerp(palette::TEXT, near);
-            let st = TextStyle::new(13.0, col).medium();
-            let (tw, _) = ui.p.measure(label, &st);
-            let x = b.cx() - (16.0 + 8.0 + tw) * 0.5;
-            ui.p.icon(*icon, Rect::new(x, b.cy() - 8.0 - 1.0, 16.0, 16.0), col);
-            ui.p.text(label, Rect::new(x + 24.0, b.y - 1.0, tw + 4.0, b.h), &st);
-            if ui.clicked(b) {
-                self.tab = i;
+        } else {
+            // minimal: two quiet labels over a hairline, with one blue beam gliding under the open one
+            let half = bar.w * 0.5;
+            ui.p.fill_rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), Color::white(0.07));
+            let bx = bar.x + self.pos * half + half * 0.5;
+            ui.p.fill_rounded(Rect::new(bx - 22.0, bar.bottom() - 2.5, 44.0, 2.5), 1.25, palette::BLUE);
+            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
+                let b = Rect::new(bar.x + i as f32 * half, bar.y, half, bar.h);
+                if ui.hovered(b) {
+                    ui.hot = true;
+                }
+                let near = (1.0 - (self.pos - i as f32).abs()).clamp(0.0, 1.0);
+                let col = palette::TEXT_FAINT.lerp(palette::TEXT, near);
+                let st = TextStyle::new(13.0, col).medium();
+                let (tw, _) = ui.p.measure(label, &st);
+                let x = b.cx() - (16.0 + 8.0 + tw) * 0.5;
+                ui.p.icon(*icon, Rect::new(x, b.cy() - 8.0 - 1.0, 16.0, 16.0), col);
+                ui.p.text(label, Rect::new(x + 24.0, b.y - 1.0, tw + 4.0, b.h), &st);
+                if ui.clicked(b) {
+                    self.tab = i;
+                }
             }
         }
         // wheel over the buttons: down = next, up = previous
@@ -191,16 +211,20 @@ impl Module for ControlCenter {
         ui.p.push_clip(area);
         for i in 0..2usize {
             let d = i as f32 - self.pos;
-            let off = d * step;
-            if off.abs() >= area.w {
+            let al = crate::ui::look_alcove();
+            // Alcove: the lists move up and down and fade, like the pages do
+            let off = if al { 0.0 } else { d * step };
+            let off_y = if al { d * 30.0 } else { 0.0 };
+            if (!al && off.abs() >= area.w) || (al && d.abs() >= 1.0) {
                 continue;
             }
             let alpha = ui.p.alpha;
-            ui.p.alpha = alpha * (1.0 - 0.85 * d.abs().clamp(0.0, 1.0));
+            ui.p.alpha =
+                alpha * if al { (1.0 - d.abs()).clamp(0.0, 1.0) } else { 1.0 - 0.85 * d.abs().clamp(0.0, 1.0) };
             let was = ui.interactive;
             // only the visible, settled list reacts to the mouse
             ui.interactive = was && settled && i == self.tab;
-            let sub = Rect::new(area.x + off, area.y, area.w, area.h);
+            let sub = Rect::new(area.x + off, area.y + off_y, area.w, area.h);
             if i == 0 {
                 self.wifi.draw_page(ui, sub);
             } else {

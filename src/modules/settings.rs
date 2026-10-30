@@ -4,6 +4,7 @@
 //! in config.toml (keeping comments) and lets the normal hot reload apply it.
 //! The Gemini key goes to `%APPDATA%\DynamicNotch\.env`, never to the config.
 
+use std::any::Any;
 use std::time::{Duration, Instant};
 
 use super::gemini;
@@ -13,10 +14,11 @@ use crate::config::{self, Config};
 use crate::gfx::{Icon, TextStyle};
 use crate::sys::{dotenv, shell_open};
 use crate::ui::{ButtonStyle, Ui};
+use crate::updater;
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 8] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs"];
+const TABS: [&str; 9] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock"];
 const ROW_H: f32 = 36.0;
 const ROW_GAP: f32 = 4.0;
 const TAB_H: f32 = 32.0;
@@ -102,14 +104,27 @@ enum Focus {
     Model,
 }
 
+/// Where the "Check for updates" button stands.
+enum Update {
+    Idle,
+    Checking,
+    UpToDate,
+    Available { tag: String, installer: Option<String>, page: String, notes: String },
+    Installing,
+    Failed(String),
+}
+
 pub struct Settings {
     tab: usize,
+    update: Update,
     cfg: Config,
     city: TextField,
     name: TextField,
     key: TextField,
     model: TextField,
     focus: Focus,
+    /// How far the current tab is scrolled (a whole number of rows) when it is taller than the page.
+    scroll: f32,
     has_key: bool,
     status: Option<(String, Instant, bool)>,
     hwnd: SendHwnd,
@@ -119,12 +134,14 @@ impl Settings {
     pub fn new() -> Self {
         Self {
             tab: 0,
+            update: Update::Idle,
             cfg: Config::default(),
             city: TextField::new(80),
             name: TextField::new(24),
             key: TextField::new(200).masked(),
             model: TextField::new(80),
             focus: Focus::None,
+            scroll: 0.0,
             has_key: false,
             status: None,
             hwnd: SendHwnd(0),
@@ -230,6 +247,21 @@ fn tab_order(saved: &[String]) -> Vec<String> {
     out
 }
 
+/// How many rows each tab holds (the page grows to fit, then scrolls once the window is full).
+fn tab_rows(tab: usize) -> f32 {
+    match tab {
+        0 => 14.0,
+        1 => 12.0,
+        2 => 5.6,
+        3 => 5.5,
+        4 => 4.0,
+        5 => 4.0,
+        6 => 5.6,
+        7 => 5.9,
+        _ => 8.6,
+    }
+}
+
 fn row_rect(body: Rect, i: usize) -> Rect {
     Rect::new(body.x, body.y + i as f32 * (ROW_H + ROW_GAP), body.w, ROW_H)
 }
@@ -303,6 +335,17 @@ impl Module for Settings {
         }
     }
 
+    fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
+        let Ok(m) = msg.downcast::<updater::Msg>() else { return };
+        self.update = match *m {
+            updater::Msg::UpToDate => Update::UpToDate,
+            updater::Msg::Available { tag, installer, page, notes } => Update::Available { tag, installer, page, notes },
+            updater::Msg::Installing => Update::Installing,
+            updater::Msg::Failed(why) => Update::Failed(why),
+        };
+        cx.fx.redraw = true;
+    }
+
     fn has_page(&self) -> bool {
         true
     }
@@ -312,17 +355,7 @@ impl Module for Settings {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        let rows = match self.tab {
-            0 => 9.0,
-            1 => 12.0,
-            2 => 5.6,
-            3 => 5.5,
-            4 => 4.0,
-            5 => 4.0,
-            6 => 5.6,
-            _ => 5.9,
-        };
-        TAB_H + 10.0 + rows * (ROW_H + ROW_GAP) + FOOT_H
+        TAB_H + 10.0 + tab_rows(self.tab) * (ROW_H + ROW_GAP) + FOOT_H
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -362,7 +395,7 @@ impl Module for Settings {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
-        let accent = ui.accent;
+        let _accent = ui.accent;
 
         // --- sections ---------------------------------------------------------
         let gap = 6.0;
@@ -375,8 +408,14 @@ impl Module for Settings {
             } else {
                 ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM)
             };
-            if ui.pill_button(b, name, None, style) && !on {
+            let hit = if crate::ui::look_alcove() {
+                crate::alcove::chip(ui, b, name, None, on)
+            } else {
+                ui.pill_button(b, name, None, style)
+            };
+            if hit && !on {
                 self.tab = i;
+                self.scroll = 0.0;
                 self.focus = Focus::None;
                 ui.fx.keyboard_focus = Some(false);
                 ui.fx.layout_changed = true;
@@ -384,6 +423,20 @@ impl Module for Settings {
         }
         let body = Rect::new(r.x, r.y + TAB_H + 10.0, r.w, r.h - TAB_H - 10.0 - FOOT_H);
 
+        // a tab taller than the page scrolls with the wheel, a row at a time
+        let content_h = tab_rows(self.tab) * (ROW_H + ROW_GAP);
+        let long = content_h > body.h + 0.5;
+        let (page, was_live) = (body, ui.interactive);
+        let body = if long {
+            let shown =
+                crate::alcove::scroll_rows(ui, page, &mut self.scroll, content_h, ROW_H + ROW_GAP, "settings-scroll");
+            ui.p.push_clip(page);
+            // rows scrolled out of view must not answer the pointer
+            ui.interactive = was_live && ui.input.mouse.is_some_and(|(x, y)| page.contains(x, y));
+            Rect::new(page.x, page.y - shown, page.w, content_h)
+        } else {
+            body
+        };
         match self.tab {
             0 => self.general(ui, body),
             1 => self.look(ui, body),
@@ -392,7 +445,12 @@ impl Module for Settings {
             4 => self.weather(ui, body),
             5 => self.gemini(ui, body),
             6 => self.notch(ui, body),
-            _ => self.tabs(ui, body),
+            7 => self.tabs(ui, body),
+            _ => self.dock(ui, body),
+        }
+        if long {
+            ui.p.pop_clip();
+            ui.interactive = was_live;
         }
 
         // --- status line ------------------------------------------------------
@@ -405,7 +463,7 @@ impl Module for Settings {
             }
         } else {
             ui.p.text(
-                "Changes apply right away",
+                "Build v3.0.1 · Changes apply right away",
                 Rect::new(r.x, r.bottom() - FOOT_H, r.w, FOOT_H),
                 &TextStyle::new(11.0, palette::TEXT_FAINT).right(),
             );
@@ -433,6 +491,10 @@ impl Settings {
             "general",
             "hide_in_fullscreen",
         );
+        toggle_row(ui, row_rect(body, 10), "Show bubbles beside the notch", g.bubbles, "general", "bubbles");
+        toggle_row(ui, row_rect(body, 11), "Quiet sound with bubbles", g.bubble_sounds, "general", "bubble_sounds");
+        toggle_row(ui, row_rect(body, 12), "Round dial for volume and brightness", g.hud_ring, "general", "hud_ring");
+        toggle_row(ui, row_rect(body, 13), "Round dials fill clockwise", g.hud_clockwise, "general", "hud_clockwise");
         toggle_row(ui, row_rect(body, 2), "Start with Windows", g.start_with_windows, "general", "start_with_windows");
 
         let row = row_rect(body, 3);
@@ -507,6 +569,54 @@ impl Settings {
         if ui.pill_button(b(2.0), "Reset home", Some(Icon::Refresh), style) {
             let d = crate::config::HomeCfg::default();
             put(ui, "home", "widgets", list_value(&d.widgets));
+        }
+
+        // updates: only ever checked when this button is pressed
+        let row = row_rect(body, 9);
+        label(ui, row, "Updates");
+        let btn = Rect::new(row.right() - 150.0, row.y + 2.0, 142.0, row.h - 4.0);
+        let (note, action) = match &self.update {
+            Update::Idle => (format!("Version {}", updater::VERSION), "Check for updates".to_string()),
+            Update::Checking => ("Looking…".to_string(), String::new()),
+            Update::UpToDate => ("You're up to date".to_string(), "Check again".to_string()),
+            Update::Available { tag, installer, notes, .. } => {
+                let verb = if installer.is_some() { "Install" } else { "Open page" };
+                // the first real line of the release notes: what's new
+                let line = notes
+                    .lines()
+                    .map(|l| l.trim().trim_start_matches(['#', '-', '*', ' ']).trim())
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("");
+                let short: String = if line.chars().count() > 44 {
+                    line.chars().take(43).collect::<String>() + "…"
+                } else {
+                    line.to_string()
+                };
+                let what = if short.is_empty() { format!("{tag} is available") } else { format!("{tag}: {short}") };
+                (what, verb.to_string())
+            }
+            Update::Installing => ("Installing, the notch will restart".to_string(), String::new()),
+            Update::Failed(why) => (why.clone(), "Try again".to_string()),
+        };
+        ui.p.text(
+            &note,
+            Rect::new(row.x + 90.0, row.y, (btn.x - row.x - 100.0).max(40.0), row.h),
+            &TextStyle::new(11.5, palette::TEXT_DIM).right(),
+        );
+        if !action.is_empty() && ui.pill_button(btn, &action, None, ButtonStyle::inverted()) {
+            match &self.update {
+                Update::Available { installer: Some(url), .. } => {
+                    updater::install(url, ui.bus);
+                    self.update = Update::Installing;
+                }
+                Update::Available { page, .. } => {
+                    shell_open(page);
+                }
+                _ => {
+                    updater::check(&self.cfg.update.repo, ui.bus);
+                    self.update = Update::Checking;
+                }
+            }
         }
     }
 
@@ -598,18 +708,23 @@ impl Settings {
             x += 26.0;
         }
 
-        // beam style: exactly one of the two is on; pressing the one that is on keeps it on
-        let white = a.white_beams;
-        for (i, (text, on)) in
-            [("Blue beams, a hint of white", !white), ("White beams, a hint of blue", white)].into_iter().enumerate()
-        {
-            let row = row_rect(body, 8 + i);
-            label(ui, row, text);
-            let sw = Rect::new(row.right() - 56.0, row.y, 48.0, row.h);
-            if switch(ui, sw, on, accent) && !on {
-                put(ui, "appearance", "white_beams", (i == 1).to_string());
-            }
+        // overall look: beams everywhere, calm (beams only where a level matters) or minimal
+        let row = row_rect(body, 8);
+        label(ui, row, "Look");
+        let sel = match a.look.trim().to_ascii_lowercase().as_str() {
+            "calm" => 1,
+            "minimal" => 2,
+            "nothing" => 3,
+            "bloom" => 4,
+            "alcove" => 5,
+            _ => 0,
+        };
+        let seg = Rect::new(row.right() - 520.0, row.y + 3.0, 512.0, row.h - 6.0);
+        let labels = ["Beams", "Calm", "Minimal", "Nothing", "Bloom", "Alcove"];
+        if let Some(i) = segmented(ui, seg, &labels, Some(sel), accent) {
+            put(ui, "appearance", "look", toml_str(["beams", "calm", "minimal", "nothing", "bloom", "alcove"][i]));
         }
+        toggle_row(ui, row_rect(body, 9), "White beams (a hint of blue)", a.white_beams, "appearance", "white_beams");
 
         let row = row_rect(body, 10);
         label(ui, row, "Home clock");
@@ -777,6 +892,31 @@ impl Settings {
         );
     }
 
+    fn dock(&mut self, ui: &mut Ui, body: Rect) {
+        let d = self.cfg.dock.clone();
+        toggle_row(ui, row_rect(body, 0), "Show the dock", d.enabled, "dock", "enabled");
+        toggle_row(ui, row_rect(body, 1), "Hide the Windows taskbar", d.hide_taskbar, "dock", "hide_taskbar");
+        toggle_row(ui, row_rect(body, 2), "Auto-hide (show on hover)", d.auto_hide, "dock", "auto_hide");
+        toggle_row(ui, row_rect(body, 3), "Icons grow near the pointer", d.magnify, "dock", "magnify");
+        slider_row(
+            ui,
+            row_rect(body, 4),
+            "Growth",
+            d.magnify_amount,
+            (0.1, 1.0),
+            format!("{:.0}%", d.magnify_amount * 100.0),
+            "dock",
+            "magnify_amount",
+        );
+        toggle_row(ui, row_rect(body, 5), "Window previews on hover", d.previews, "dock", "previews");
+        slider_row(ui, row_rect(body, 6), "Icon size", d.size, (32.0, 80.0), format!("{:.0}", d.size), "dock", "size");
+        ui.p.text(
+            "Right-click an icon to pin, unpin or close. Drag icons to reorder. Scroll over an app to step through its windows.",
+            Rect::new(body.x + 2.0, row_rect(body, 7).y + 4.0, body.w - 4.0, 34.0),
+            &TextStyle::new(11.5, palette::TEXT_FAINT).wrap(),
+        );
+    }
+
     fn tabs(&mut self, ui: &mut Ui, body: Rect) {
         let order = tab_order(&self.cfg.tabs.order);
         ui.p.text(
@@ -802,7 +942,7 @@ impl Settings {
     }
 
     fn gemini(&mut self, ui: &mut Ui, body: Rect) {
-        let accent = ui.accent;
+        let _accent = ui.accent;
         let blue = Color::hex(0x4285F4);
 
         let row = row_rect(body, 0);

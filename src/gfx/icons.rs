@@ -4,6 +4,8 @@
 //! the gauges and rings are made of (equalizer, signal, volume, keys, stats). Crisp at any DPI, and no font or
 //! asset ships with the binary.
 
+#![allow(dead_code)]
+
 use super::{q, uq, Painter};
 use crate::util::{Color, Rect};
 
@@ -60,9 +62,47 @@ pub enum Icon {
     Chat,
     Control,
     Unlock,
+    Moon,
+    Grid,
+    Cpu,
+    Ram,
 }
 
+/// Every icon is a glyph from the Phosphor set (see `pack.rs`), filled from cached geometry.
 pub fn draw(p: &mut Painter, icon: Icon, r: Rect, c: Color) {
+    // the Phosphor glyphs fill more of their box than the old hand-drawn set did
+    let s = r.w.min(r.h) * 0.94;
+    let b = r.center_square(s);
+    let key = (150u8, icon as i32, q(s), 0, 0);
+    p.fill_cached(key, b.x, b.y, c, |pb| {
+        let k = uq(key.2) / super::pack::GRID;
+        let d = super::pack::data(icon);
+        let mut i = 0;
+        while i < d.len() {
+            match d[i] as i32 {
+                0 => {
+                    pb.move_to(d[i + 1] * k, d[i + 2] * k);
+                    i += 3;
+                }
+                1 => {
+                    pb.line_to(d[i + 1] * k, d[i + 2] * k);
+                    i += 3;
+                }
+                2 => {
+                    pb.cubic_to(d[i + 1] * k, d[i + 2] * k, d[i + 3] * k, d[i + 4] * k, d[i + 5] * k, d[i + 6] * k);
+                    i += 7;
+                }
+                _ => {
+                    pb.close();
+                    i += 1;
+                }
+            }
+        }
+    });
+}
+
+#[allow(dead_code)]
+fn draw_hand_drawn(p: &mut Painter, icon: Icon, r: Rect, c: Color) {
     if outline(p, icon, r, c) {
         return;
     }
@@ -529,6 +569,37 @@ fn outline(p: &mut Painter, icon: Icon, r: Rect, c: Color) -> bool {
         Icon::Chat => {
             pen.rr(3.0, 4.5, 18.0, 12.5, 5.0);
             pen.rpoly(&[(8.2, 17.0), (7.2, 20.4), (11.8, 17.0)], false, 0.9);
+        }
+        Icon::Moon => {
+            // a crescent: the outside of one circle and the inside of another
+            pen.arc(12.0, 12.0, 8.5, 1.752, 4.349);
+            pen.arc(15.5, 8.5, 7.0, 2.374, 3.107);
+        }
+        Icon::Grid => {
+            pen.rr(4.0, 4.0, 6.5, 6.5, 2.0);
+            pen.rr(13.5, 4.0, 6.5, 6.5, 2.0);
+            pen.rr(4.0, 13.5, 6.5, 6.5, 2.0);
+            pen.rr(13.5, 13.5, 6.5, 6.5, 2.0);
+        }
+        Icon::Cpu => {
+            pen.rr(6.0, 6.0, 12.0, 12.0, 2.5);
+            pen.rr(9.5, 9.5, 5.0, 5.0, 1.0);
+            for v in [9.5, 14.5] {
+                pen.ln(v, 3.0, v, 6.0);
+                pen.ln(v, 18.0, v, 21.0);
+                pen.ln(3.0, v, 6.0, v);
+                pen.ln(18.0, v, 21.0, v);
+            }
+        }
+        Icon::Ram => {
+            pen.rr(2.5, 6.5, 19.0, 9.5, 1.8);
+            pen.ln(6.0, 16.0, 6.0, 18.5);
+            pen.ln(10.0, 16.0, 10.0, 18.5);
+            pen.ln(14.0, 16.0, 14.0, 18.5);
+            pen.ln(18.0, 16.0, 18.0, 18.5);
+            pen.ln(6.5, 10.0, 6.5, 12.5);
+            pen.ln(12.0, 10.0, 12.0, 12.5);
+            pen.ln(17.5, 10.0, 17.5, 12.5);
         }
         _ => return false,
     }

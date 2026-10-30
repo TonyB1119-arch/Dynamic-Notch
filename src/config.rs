@@ -33,6 +33,8 @@ pub struct Config {
     pub weather: WeatherCfg,
     pub gemini: GeminiCfg,
     pub greeting: GreetingCfg,
+    pub update: UpdateCfg,
+    pub dock: DockCfg,
     pub notch: NotchCfg,
     pub tabs: TabsCfg,
 }
@@ -43,6 +45,17 @@ pub struct General {
     /// "primary", "active" (follows the focused window) or a 1-based monitor number.
     pub monitor: String,
     pub expand_on_hover: bool,
+    /// Short, quiet tick on hover and click.
+    pub haptics: bool,
+    /// Alcove: music and finished peeks leave small bubbles beside the notch.
+    pub bubbles: bool,
+    /// A very quiet blip as a bubble pops out and again as it goes.
+    pub bubble_sounds: bool,
+    /// Alcove: volume and brightness show as one big round dial (false: the line). Battery and
+    /// Bluetooth are always dials.
+    pub hud_ring: bool,
+    /// Round dials (volume, brightness, battery, Bluetooth) fill clockwise (false: counter-clockwise).
+    pub hud_clockwise: bool,
     pub hover_delay_ms: u32,
     pub collapse_delay_ms: u32,
     pub hide_in_fullscreen: bool,
@@ -55,7 +68,12 @@ impl Default for General {
     fn default() -> Self {
         Self {
             monitor: "primary".into(),
-            expand_on_hover: true,
+            expand_on_hover: false,
+            haptics: true,
+            bubbles: true,
+            bubble_sounds: false,
+            hud_ring: true,
+            hud_clockwise: false,
             hover_delay_ms: 140,
             collapse_delay_ms: 60,
             hide_in_fullscreen: true,
@@ -84,6 +102,10 @@ pub struct Appearance {
     pub animation_speed: f32,
     /// "auto" (from album art) or "#RRGGBB".
     pub accent: String,
+    /// Overall look: "beams" (glowing beams everywhere), "calm" (beams only on volume, brightness
+    /// and battery; glow bars, pills and dot rings elsewhere), "minimal" (thin plain lines and
+    /// quiet, bounce-free motion) or "nothing" (dot-matrix glyph lights, red accent).
+    pub look: String,
     /// false = blue beams with a hint of white (default), true = white beams with a hint of blue.
     pub white_beams: bool,
     /// Home clock: "roll" (digits slide up and are replaced from below) or "flip" (flip-clock tiles).
@@ -108,6 +130,7 @@ impl Default for Appearance {
             bounce: 0.3,
             animation_speed: 1.0,
             accent: "auto".into(),
+            look: "alcove".into(),
             white_beams: false,
             clock_style: "roll".into(),
             motion_cache: true,
@@ -500,6 +523,56 @@ impl Default for GeminiCfg {
     }
 }
 
+/// Where "Check for updates" (Settings → General) looks for new releases.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateCfg {
+    /// GitHub `owner/name` whose newest release is offered.
+    pub repo: String,
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        Self { repo: "TonyB1119-arch/Notch".into() }
+    }
+}
+
+/// The dock: pinned and running apps along the bottom edge, in place of the taskbar if you like.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockCfg {
+    pub enabled: bool,
+    /// Icon size in pixels (32 – 80).
+    pub size: f32,
+    /// Icons near the pointer grow.
+    pub magnify: bool,
+    /// How much icons grow near the pointer (0.1 – 1.0; 0.5 = one and a half times).
+    pub magnify_amount: f32,
+    /// Slide the dock away and bring it back when the pointer touches the bottom edge.
+    pub auto_hide: bool,
+    /// Window previews when you rest the pointer on an app.
+    pub previews: bool,
+    /// Hide the Windows taskbar while the dock is on (it comes back when the dock is switched off or the app quits).
+    pub hide_taskbar: bool,
+    /// Pinned programs: full paths, or bare names such as "notepad.exe".
+    pub pinned: Vec<String>,
+}
+
+impl Default for DockCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            size: 48.0,
+            magnify: true,
+            magnify_amount: 0.5,
+            auto_hide: false,
+            previews: true,
+            hide_taskbar: false,
+            pinned: vec!["explorer.exe".into(), "notepad.exe".into(), "calc.exe".into(), "mspaint.exe".into()],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GreetingCfg {
@@ -603,6 +676,8 @@ pub fn set_value(section: &str, key: &str, value: &str) {
 
 impl Config {
     fn sanitized(mut self) -> Self {
+        self.dock.size = self.dock.size.clamp(32.0, 80.0);
+        self.dock.magnify_amount = self.dock.magnify_amount.clamp(0.1, 1.0);
         let a = &mut self.appearance;
         a.notch_width = a.notch_width.clamp(80.0, 600.0);
         a.notch_height = a.notch_height.clamp(18.0, 64.0);
@@ -629,7 +704,18 @@ pub const DEFAULT_TEMPLATE: &str = r##"# Dynamic Notch configuration
 [general]
 # "primary", "active" (follow the focused window) or a monitor number (1, 2, ...)
 monitor = "primary"
-expand_on_hover = true
+# hovering only grows the notch slightly; a click opens it (set true to open on hover)
+expand_on_hover = false
+# short, quiet tick on hover and click
+haptics = true
+# Alcove: music and finished peeks leave small bubbles beside the notch
+bubbles = true
+# a very quiet blip as a bubble pops out and again as it goes
+bubble_sounds = false
+# Alcove: volume and brightness as one big round dial (false: the line)
+hud_ring = true
+# round dials fill clockwise (false: counter-clockwise)
+hud_clockwise = false
 hover_delay_ms = 140
 collapse_delay_ms = 60
 hide_in_fullscreen = true
@@ -648,6 +734,10 @@ shadow = false
 # 0 = no overshoot ... 1 = very bouncy
 bounce = 0.3
 animation_speed = 1.0
+# "alcove" (island layouts, clock and weather home, page dots), "beams" (beams everywhere),
+# "calm" (beams only on volume, brightness and battery), "minimal" (thin plain lines and quiet motion),
+# "nothing" (dot-matrix glyph lights, red accent) or "bloom" (capsule gauges, control center)
+look = "alcove"
 # false = blue beams with a hint of white, true = white beams with a hint of blue
 white_beams = false
 # "roll" (digits slide up, the next one rises in) or "flip" (flip-clock tiles)
@@ -802,6 +892,29 @@ model = "gemini-2.5-flash"
 endpoint = "https://generativelanguage.googleapis.com/v1beta"
 max_tokens = 2048
 system_prompt = "You are a helpful assistant living in a small desktop notch. Keep answers short and clear. Plain text, no markdown headings."
+
+[update]
+# "Check for updates" in Settings → General looks at the newest release of this GitHub repo (owner/name).
+# Nothing is checked unless you press that button.
+repo = "TonyB1119-arch/Notch"
+
+[dock]
+# A dock along the bottom of the screen with your pinned and running apps. Also in Settings → Dock.
+enabled = false
+# Icon size in pixels (32 - 80).
+size = 48
+# Icons near the pointer grow.
+magnify = true
+# How much icons grow near the pointer (0.1 - 1.0; 0.5 = one and a half times).
+magnify_amount = 0.5
+# Slide the dock away and bring it back when the pointer touches the bottom edge.
+auto_hide = false
+# Window previews when you rest the pointer on an app.
+previews = true
+# Hide the Windows taskbar while the dock is on (it comes back when you switch the dock off or quit).
+hide_taskbar = false
+# Pinned programs (full paths or bare names). Drag icons in the dock to reorder; right-click to pin or unpin.
+pinned = ["explorer.exe", "notepad.exe", "calc.exe", "mspaint.exe"]
 
 [greeting]
 # On unlock the notch scans, then writes "Hello" in handwriting (switch it off with greeting = false under [modules]).

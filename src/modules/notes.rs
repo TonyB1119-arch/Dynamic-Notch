@@ -113,7 +113,8 @@ impl Module for Notes {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
-        let accent = palette::YELLOW;
+        let al = crate::ui::look_alcove();
+        let accent = if al { Color::white(0.9) } else { palette::YELLOW };
         let field = Rect::new(r.x, r.y, r.w - 84.0, INPUT_H);
         let add = Rect::new(field.right() + 8.0, field.y + 5.0, 76.0, 32.0);
         if self.input.draw(ui, field, "Write a note and press Enter…", accent, true) {
@@ -122,14 +123,23 @@ impl Module for Notes {
         let can = !self.input.is_empty();
         let style =
             if can { ButtonStyle::inverted() } else { ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_FAINT) };
-        if ui.pill_button(add, "Add", Some(Icon::Plus), style) && can {
+        let pressed = if al {
+            crate::alcove::chip(ui, add, "Add", Some(Icon::Plus), can)
+        } else {
+            ui.pill_button(add, "Add", Some(Icon::Plus), style)
+        };
+        if pressed && can {
             self.add();
             ui.fx.layout_changed = true;
         }
 
         let area = Rect::new(r.x, field.bottom() + 14.0, r.w, LIST_H);
         if self.items.is_empty() {
-            ui.empty_state(area, Icon::Edit, "No notes yet");
+            if al {
+                crate::alcove::empty(ui, area, Icon::Edit, "No notes yet");
+            } else {
+                ui.empty_state(area, Icon::Edit, "No notes yet");
+            }
             return;
         }
         scroll(ui, area, &mut self.scroll, self.items.len() as f32 * ROW_H);
@@ -143,7 +153,17 @@ impl Module for Notes {
             }
             let trash = Rect::new(row.right() - 30.0, row.cy() - 12.0, 24.0, 24.0);
             let body = Rect::new(row.x, row.y, row.w - 36.0, row.h);
-            if ui.card(body, true) {
+            let hit = if al {
+                let hov = ui.hovered(body);
+                if hov {
+                    ui.hot = true;
+                }
+                crate::alcove::tile(ui, body, 20.0, hov);
+                ui.clicked(body)
+            } else {
+                ui.card(body, true)
+            };
+            if hit {
                 copied = Some(n.clone());
             }
             ui.p.text(n, Rect::new(row.x + 12.0, row.y, body.w - 24.0, row.h), &TextStyle::new(13.0, palette::TEXT));

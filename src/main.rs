@@ -2,11 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(unreachable_patterns)]
 
+mod alcove;
 mod anim;
 mod app;
+mod bloom;
 mod bus;
 mod claude;
 mod config;
+mod dock;
 mod gfx;
 mod host;
 mod hotkeys;
@@ -16,6 +19,7 @@ mod pacer;
 mod sys;
 mod tray;
 mod ui;
+mod updater;
 mod util;
 mod window;
 
@@ -50,6 +54,7 @@ fn main() {
     };
 
     util::log_init();
+    updater::tidy();
     std::panic::set_hook(Box::new(|info| {
         log!("PANIC: {info}");
     }));
@@ -82,6 +87,7 @@ fn main() {
 }
 
 fn run(cfg: config::Config, args: Vec<String>) -> windows::core::Result<()> {
+    dock::recover_taskbar();
     let hwnd = window::create()?;
     let app = app::App::new(hwnd, cfg)?;
     window::APP.with(|a| *a.borrow_mut() = Some(app));

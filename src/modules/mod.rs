@@ -14,6 +14,7 @@
 pub mod ai;
 pub mod battery;
 pub mod bluetooth;
+pub mod calendar;
 pub mod clipboard;
 pub mod control;
 pub mod devices;
@@ -72,6 +73,8 @@ pub enum Slot {
         color: Color,
         angle: f32,
         art: Option<ImageData>,
+        /// Alcove: a track change flips the cover over; progress 0..1 and the old cover.
+        flip: Option<(f32, Option<ImageData>)>,
     },
     /// Live level meter (recent 0..1 levels, newest last), drawn across the wing.
     Wave {
@@ -183,6 +186,7 @@ impl Peek {
         }
     }
     /// Icon without a background circle (drawn in the accent colour).
+    #[allow(dead_code)]
     pub fn bare(mut self) -> Self {
         self.bare = true;
         self
@@ -242,6 +246,8 @@ pub struct Effects {
     pub expand: bool,
     pub collapse: bool,
     pub redraw: bool,
+    /// A click landed: the notch gives a little (the Alcove look's haptic feel).
+    pub nudge: bool,
     /// Need another frame right away (caret blink, spinners...).
     pub animate: bool,
     pub keyboard_focus: Option<bool>,
@@ -249,6 +255,11 @@ pub struct Effects {
     pub save_config: Vec<(String, String, String)>,
     /// Start an OLE drag of these files out of the notch.
     pub drag_files: Option<Vec<String>>,
+    /// Read the config file again (the control center's refresh button).
+    pub reload_config: bool,
+    /// Move the output volume (0..1) / set the panel brightness (percent).
+    pub set_volume: Option<f32>,
+    pub set_brightness: Option<u8>,
 }
 
 impl Effects {
@@ -379,6 +390,7 @@ pub fn all() -> Vec<Box<dyn Module>> {
     vec![
         Box::new(media::Media::new()),
         Box::new(timer::Timer::new()),
+        Box::new(calendar::Calendar::new()),
         // right after the timer so its home tile isn't crowded out
         Box::new(stats::Stats::new()),
         Box::new(voice::Voice::new()),

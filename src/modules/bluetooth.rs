@@ -299,6 +299,9 @@ impl Module for Bluetooth {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
+        if crate::ui::look_alcove() {
+            return 48.0 + 12.0 + 186.0;
+        }
         HEADER_H + 12.0 + LIST_H
     }
 
@@ -307,6 +310,10 @@ impl Module for Bluetooth {
             self.scan();
         }
         let accent = palette::BLUE;
+        let al = crate::ui::look_alcove();
+        if al {
+            return self.draw_alcove(ui, r);
+        }
 
         // --- header ---------------------------------------------------------
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
@@ -326,11 +333,15 @@ impl Module for Bluetooth {
                 palette::TEXT,
             ),
         };
-        ui.p.icon(Icon::Bluetooth, Rect::new(head.x + 2.0, head.cy() - 9.0, 18.0, 18.0), palette::TEXT_DIM);
+        if al {
+            ui.p.icon(Icon::Bluetooth, Rect::new(head.x + 6.0, head.cy() - 9.0, 18.0, 18.0), accent);
+        } else {
+            ui.p.icon(Icon::Bluetooth, Rect::new(head.x + 2.0, head.cy() - 9.0, 18.0, 18.0), palette::TEXT_DIM);
+        }
         ui.p.text(
             &head_text,
-            Rect::new(head.x + 28.0, head.y, (rb.x - head.x - 36.0 - hint_w).max(0.0), head.h),
-            &TextStyle::new(13.0, head_col).medium(),
+            Rect::new(head.x + if al { 38.0 } else { 28.0 }, head.y, (rb.x - head.x - 36.0 - hint_w).max(0.0), head.h),
+            &TextStyle::new(if al { 15.0 } else { 13.0 }, head_col).semibold(),
         );
         if hint_w > 0.0 {
             let b = Rect::new(rb.x - hint_w - 6.0, head.y + 3.0, hint_w, 24.0);
@@ -358,7 +369,11 @@ impl Module for Bluetooth {
 
         // tick strip under the header: sweeps while scanning or connecting, otherwise how many of the listed devices are connected
         let strip = Rect::new(r.x + 2.0, head.bottom() + 2.0, r.w - 4.0, 7.0);
-        if self.scanning || self.busy.is_some() {
+        if al {
+            if self.scanning || self.busy.is_some() {
+                ui.progress_indeterminate(Rect::new(r.x + 2.0, head.bottom() + 4.0, r.w - 4.0, 3.0), accent);
+            }
+        } else if self.scanning || self.busy.is_some() {
             ui.ticks_sweep(strip, Color::white(0.9));
         } else {
             let live =
@@ -393,7 +408,7 @@ impl Module for Bluetooth {
                 ui.row_bg(row, rh, None);
                 ui.p.icon(
                     f.kind.icon(),
-                    Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0),
+                    Rect::new(row.x + 10.0, row.cy() - 9.0, 18.0, 18.0).translate(if al { 5.0 } else { 0.0 }, 0.0),
                     if live { accent } else { palette::TEXT_DIM },
                 );
                 let btn = Rect::new(row.right() - 100.0, row.cy() - 12.0, 90.0, 24.0);
@@ -424,7 +439,18 @@ impl Module for Bluetooth {
                         let sw = ui.p.measure(&sub, &TextStyle::new(10.5, palette::GREEN)).0;
                         let gx = row.x + 38.0 + sw + 8.0;
                         if gx + 44.0 < row.x + 38.0 + text_w {
-                            ui.ticks(Rect::new(gx, row.y + 21.0, 44.0, 9.0), b as f32 / 100.0, palette::GREEN);
+                            if al {
+                                crate::alcove::meter(
+                                    ui,
+                                    Rect::new(gx, row.y + 20.0, 44.0, 6.0),
+                                    b as f32 / 100.0,
+                                    palette::GREEN,
+                                );
+                            } else {
+                                ui.beams(|ui| {
+                                    ui.ticks(Rect::new(gx, row.y + 21.0, 44.0, 9.0), b as f32 / 100.0, palette::GREEN)
+                                });
+                            }
                         }
                     }
                 }
@@ -1125,5 +1151,161 @@ mod tests {
         assert_eq!(name_kind("Sony WH-1000XM5"), Kind::Audio);
         assert_eq!(name_kind("Xbox Wireless Controller"), Kind::Gamepad);
         assert_eq!(name_kind("Thing"), Kind::Other);
+    }
+}
+
+impl Bluetooth {
+    /// Alcove: a status strip, then the devices as soft cards, two to a row.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        // one quiet white instead of blue: a connected device is simply the brightest tile
+        let accent = Color::white(0.92);
+        let connected = self.devices.len();
+        let live_status = self.status.clone().filter(|(_, at, _)| at.elapsed() < Duration::from_secs(8));
+        let hint_on = self.settings_hint && live_status.is_some();
+        let (mut head_text, head_col) = match &live_status {
+            Some((t, _, good)) => (t.clone(), if *good { palette::GREEN } else { palette::ORANGE }),
+            None => (
+                match (self.radio_on, connected) {
+                    (Some(false), _) => "Bluetooth is off".to_string(),
+                    (_, 0) => "No devices connected".to_string(),
+                    (_, 1) => "1 device connected".to_string(),
+                    (_, n) => format!("{n} devices connected"),
+                },
+                palette::TEXT,
+            ),
+        };
+        if hint_on {
+            head_text.push_str("  ·  tap for Windows settings");
+        }
+        if live_status.is_none() && self.status.is_some() {
+            self.status = None;
+            self.settings_hint = false;
+        }
+        let head = Rect::new(r.x, r.y, r.w, 48.0);
+        let tint = if self.radio_on == Some(false) { Color::white(0.5) } else { accent };
+        let (refresh, toggled) = crate::alcove::status_tile(
+            ui,
+            head,
+            Icon::Bluetooth,
+            tint,
+            &head_text,
+            head_col,
+            self.radio_on,
+            self.scanning,
+        );
+        if refresh {
+            self.scan();
+        }
+        if toggled {
+            if let Some(on) = self.radio_on {
+                self.radio_on = Some(!on);
+                self.send(Ctl::Radio(!on));
+            }
+        }
+        if hint_on && ui.clicked(Rect::new(head.x + 48.0, head.y, head.w - 150.0, head.h)) {
+            shell_open("ms-settings:bluetooth");
+        }
+
+        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, 186.0);
+        if let Some(p) = self.problem.clone() {
+            crate::alcove::empty(ui, area, Icon::Bluetooth, &p);
+            return;
+        }
+        if self.radio_on == Some(false) {
+            crate::alcove::empty(ui, area, Icon::Bluetooth, "Turn Bluetooth on to find devices");
+            return;
+        }
+        if self.found.is_empty() {
+            let msg = if self.scanning { "Looking for devices…" } else { "No devices found" };
+            crate::alcove::empty(ui, area, Icon::Bluetooth, msg);
+            return;
+        }
+        let gap = 10.0;
+        let pitch = 62.0;
+        let cw = (area.w - gap) * 0.5;
+        let rows = self.found.len().div_ceil(2);
+        let shown = crate::alcove::scroll_rows(ui, area, &mut self.scroll, rows as f32 * pitch - 8.0, pitch, "bt-list");
+        ui.p.push_clip(area);
+        let mut action: Option<Ctl> = None;
+        for (i, f) in self.found.iter().enumerate() {
+            let (c, rw) = (i % 2, i / 2);
+            let card = Rect::new(area.x + c as f32 * (cw + gap), area.y + rw as f32 * pitch - shown, cw, pitch - 8.0);
+            if card.bottom() < area.y || card.y > area.bottom() {
+                continue;
+            }
+            let live = f.connected || self.devices.values().any(|d| d.name == f.name);
+            let hover = ui.hovered(card) && ui.hovered(area);
+            if hover {
+                ui.hot = true;
+            }
+            let bg = if live {
+                Color::white(if hover { 0.26 } else { 0.2 })
+            } else {
+                Color::white(if hover { 0.12 } else { 0.07 })
+            };
+            ui.p.fill_rounded(card, 26.0, bg);
+            let ic = Rect::centered(card.x + 31.0, card.cy(), 38.0, 38.0);
+            ui.p.icon(f.kind.icon(), ic.inset(10.0), if live { Color::white(1.0) } else { Color::white(0.75) });
+            let battery = if live { self.battery_of(&f.name) } else { None };
+            let right_w = if battery.is_some() { 50.0 } else { 14.0 };
+            let tx = card.x + 60.0;
+            let tw = (card.right() - tx - right_w - 8.0).max(0.0);
+            ui.p.text(&f.name, Rect::new(tx, card.y + 8.0, tw, 20.0), &TextStyle::new(14.0, palette::TEXT).semibold());
+            let (sub, subc) = if live {
+                ("Connected", Color::white(0.9))
+            } else if f.paired {
+                ("Paired", palette::TEXT_DIM)
+            } else {
+                ("Available", palette::TEXT_FAINT)
+            };
+            ui.p.text(sub, Rect::new(tx, card.y + 28.0, tw, 18.0), &TextStyle::new(12.0, subc));
+            if let Some(b) = battery {
+                crate::alcove::battery_glyph(
+                    ui,
+                    Rect::new(card.right() - 56.0, card.y + 10.0, 34.0, 16.0),
+                    b as f32 / 100.0,
+                    false,
+                );
+                ui.p.text(
+                    &format!("{b}%"),
+                    Rect::new(card.right() - 62.0, card.y + 28.0, 46.0, 18.0),
+                    &TextStyle::new(12.0, Color::white(0.85)).semibold().right(),
+                );
+            }
+            if self.busy.as_deref() == Some(f.id.as_str()) {
+                ui.ring_spin(card.right() - 24.0, card.cy(), 20.0, 3.0, accent);
+                ui.animate();
+                continue;
+            }
+            let remove = f.paired
+                && hover
+                && !live
+                && crate::alcove::round_button(
+                    ui,
+                    Rect::new(card.right() - 38.0, card.cy() - 14.0, 28.0, 28.0),
+                    Icon::Trash,
+                    false,
+                );
+            if remove {
+                action = Some(Ctl::Remove(f.id.clone()));
+            } else if ui.clicked(card) && ui.hovered(area) {
+                action = Some(if live {
+                    Ctl::Disconnect(f.id.clone())
+                } else if f.paired {
+                    Ctl::Connect(f.id.clone())
+                } else {
+                    Ctl::Pair(f.id.clone())
+                });
+            }
+        }
+        ui.p.pop_clip();
+        if let Some(a) = action {
+            self.busy = match &a {
+                Ctl::Pair(id) | Ctl::Connect(id) | Ctl::Disconnect(id) | Ctl::Remove(id) => Some(id.clone()),
+                _ => None,
+            };
+            self.settings_hint = false;
+            self.send(a);
+        }
     }
 }

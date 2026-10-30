@@ -33,6 +33,20 @@ const INTERVAL: Duration = Duration::from_secs(1);
 const HISTORY: usize = 20;
 const FIRST: Duration = Duration::from_millis(250);
 
+/// Latest CPU and memory load in percent (-1 until the first reading), for the notch header.
+static LOAD_CPU: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static LOAD_RAM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+pub fn cpu_percent() -> Option<i32> {
+    let v = LOAD_CPU.load(std::sync::atomic::Ordering::Relaxed);
+    (v >= 0).then_some(v)
+}
+
+pub fn ram_percent() -> Option<i32> {
+    let v = LOAD_RAM.load(std::sync::atomic::Ordering::Relaxed);
+    (v >= 0).then_some(v)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Sample {
     cpu: f32,
@@ -98,6 +112,8 @@ impl Module for Stats {
                 h.push(v);
             }
             self.sample = Some(*s);
+            LOAD_CPU.store((s.cpu * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
+            LOAD_RAM.store((s.ram * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
             cx.fx.redraw = true;
         }
     }
@@ -111,11 +127,18 @@ impl Module for Stats {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
-        158.0
+        if crate::ui::look_alcove() {
+            150.0
+        } else {
+            158.0
+        }
     }
 
     /// Three big tick rings with a short history graph of ticks under each.
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r);
+        }
         let s = self.sample;
         let gauges: [(&str, Option<f32>); 3] =
             [("CPU", s.map(|s| s.cpu)), ("RAM", s.map(|s| s.ram)), ("GPU", s.and_then(|s| s.gpu))];
@@ -178,6 +201,56 @@ impl Module for Stats {
             let tw = (cw - d - 9.0).max(0.0);
             ui.p.text(name, Rect::new(tx, cy - 14.0, tw, 14.0), &label);
             ui.p.text(&text, Rect::new(tx, cy, tw, 15.0), &value);
+        }
+    }
+}
+
+impl Stats {
+    /// Alcove: three soft tiles, each with a big number and a little bar history.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let s = self.sample;
+        let gauges: [(&str, Icon, Option<f32>); 3] = [
+            ("Processor", Icon::Cpu, s.map(|s| s.cpu)),
+            ("Memory", Icon::Ram, s.map(|s| s.ram)),
+            ("Graphics", Icon::Pulse, s.and_then(|s| s.gpu)),
+        ];
+        let gap = 12.0;
+        let tw = (r.w - 2.0 * gap) / 3.0;
+        for (i, (name, icon, frac)) in gauges.iter().enumerate() {
+            let t = Rect::new(r.x + i as f32 * (tw + gap), r.y, tw, r.h);
+            let f = ui.glide(gkey("stats-al", i), frac.unwrap_or(0.0));
+            let col = if f >= 0.85 { palette::RED } else { Color::white(0.95) };
+            ui.p.icon(*icon, Rect::new(t.x + 16.0, t.y + 15.0, 17.0, 17.0), Color::white(0.55));
+            ui.p.text(
+                name,
+                Rect::new(t.x + 40.0, t.y + 12.0, tw - 50.0, 22.0),
+                &TextStyle::new(13.0, palette::TEXT_DIM).semibold(),
+            );
+            let big = TextStyle::new(40.0, col).weight(650);
+            let num = if frac.is_some() { format!("{:.0}", f * 100.0) } else { "–".to_string() };
+            let (nw, _) = ui.p.measure(&num, &big);
+            ui.p.text(&num, Rect::new(t.x + 16.0, t.y + 36.0, nw + 6.0, 52.0), &big);
+            if frac.is_some() {
+                ui.p.text(
+                    "%",
+                    Rect::new(t.x + 18.0 + nw, t.y + 48.0, 30.0, 28.0),
+                    &TextStyle::new(17.0, palette::TEXT_DIM).semibold(),
+                );
+            }
+            // the last readings as little rounded bars
+            let area = Rect::new(t.x + 16.0, t.bottom() - 40.0, tw - 32.0, 26.0);
+            let n = HISTORY;
+            let bg = 3.0;
+            let bw = (area.w - bg * (n as f32 - 1.0)) / n as f32;
+            let hist = &self.history[i];
+            for k in 0..n {
+                let idx = k as isize - (n - hist.len()) as isize;
+                let v = if idx >= 0 { hist[idx as usize] } else { 0.0 };
+                let bh = (v.clamp(0.0, 1.0) * area.h).max(3.0);
+                let x = area.x + k as f32 * (bw + bg);
+                let a = if idx >= 0 { 0.35 + 0.6 * (k as f32 / n as f32) } else { 0.12 };
+                ui.p.fill_rounded(Rect::new(x, area.bottom() - bh, bw, bh), bw * 0.5, col.with_a(a));
+            }
         }
     }
 }

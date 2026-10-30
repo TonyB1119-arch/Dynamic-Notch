@@ -34,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::{lerp, smoothstep, Spring};
 use crate::bus::{Bus, Msg};
 use crate::config::{self, Config, LoadResult};
+use crate::dock::{self, Dock};
 use crate::gfx::{self, icons, Gfx, Icon, Painter, Res, Snapshot, TextStyle};
 use crate::host::Host;
 use crate::hotkeys::{self, Action};
@@ -53,6 +54,47 @@ use windows::Win32::UI::Input::{
 };
 
 const HEADER_H: f32 = 54.0;
+
+/// Height of the header (and the tab strip under it in the Bloom look).
+fn top_h() -> f32 {
+    if crate::ui::look_alcove() {
+        crate::alcove::TOP
+    } else if crate::ui::look_bloom() {
+        crate::bloom::TOP_H
+    } else {
+        HEADER_H
+    }
+}
+
+/// Space left and right of the expanded content, and below it.
+fn side_pad() -> f32 {
+    if crate::ui::look_alcove() {
+        crate::alcove::LEFT
+    } else if crate::ui::look_bloom() {
+        crate::bloom::SIDE
+    } else {
+        PAD
+    }
+}
+
+/// Space right of the content (Alcove leaves room for its page dots).
+fn right_pad() -> f32 {
+    if crate::ui::look_alcove() {
+        crate::alcove::RIGHT
+    } else {
+        side_pad()
+    }
+}
+
+fn bottom_pad() -> f32 {
+    if crate::ui::look_alcove() {
+        crate::alcove::BOTTOM
+    } else if crate::ui::look_bloom() {
+        crate::bloom::BOTTOM
+    } else {
+        BOTTOM_PAD
+    }
+}
 const PAD: f32 = 28.0;
 const BOTTOM_PAD: f32 = 28.0;
 const MARGIN: f32 = 48.0;
@@ -74,6 +116,8 @@ const CLOCK_STRIP_H: f32 = 52.0;
 /// How long the notch must be idle before GPU scratch memory is handed back.
 /// Trimming right after every burst made the next open re-allocate everything.
 const TRIM_DELAY: Duration = Duration::from_secs(10);
+/// Minimum time between purely ambient frames (see `frame`).
+const AMBIENT_GAP: Duration = Duration::from_millis(12);
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// A peek would be visible right now (not hidden, not expanded).
@@ -99,6 +143,147 @@ struct ActivePeek {
     swap: Option<(Instant, Box<Peek>)>,
 }
 
+/// A small round bubble that pops out beside the notch, stays a moment and is pulled back in.
+#[derive(Clone, Copy)]
+struct Bubble {
+    at: Instant,
+    icon: Icon,
+    color: Color,
+    /// Drawn with a slash through the icon (caps lock off, microphone muted).
+    off: bool,
+    /// Page opened when the bubble is clicked.
+    page: Option<ModuleId>,
+    in_played: bool,
+    out_played: bool,
+}
+
+/// How many bubbles can sit side by side.
+const MAX_BUBBLES: usize = 3;
+/// Seconds a bubble takes to pop out, when it starts to leave, and when it is gone.
+const BUBBLE_OUT: f32 = 0.3;
+const BUBBLE_HOLD: f32 = 1.1;
+const BUBBLE_END: f32 = 1.5;
+
+/// Add a bubble starting at `at`; the oldest goes when there are too many.
+fn push_bubble(list: &mut Vec<Bubble>, at: Instant, icon: Icon, color: Color, off: bool, page: Option<ModuleId>) {
+    list.push(Bubble { at, icon, color, off, page, in_played: false, out_played: false });
+    if list.len() > MAX_BUBBLES {
+        list.remove(0);
+    }
+}
+
+/// How far out (0..1+), how visible, how big and how much room a bubble `t` seconds old takes.
+fn bubble_curve(t: f32) -> Option<(f32, f32, f32, f32)> {
+    if t >= BUBBLE_END {
+        return None;
+    }
+    Some(if t < BUBBLE_OUT {
+        let u = t / BUBBLE_OUT;
+        // ease-out with a touch of overshoot
+        let c = 1.5;
+        let e = 1.0 + (c + 1.0) * (u - 1.0).powi(3) + c * (u - 1.0).powi(2);
+        (e, u.min(1.0), 0.6 + 0.4 * u, 1.0)
+    } else if t < BUBBLE_HOLD {
+        (1.0, 1.0, 1.0, 1.0)
+    } else {
+        let u = (t - BUBBLE_HOLD) / (BUBBLE_END - BUBBLE_HOLD);
+        let e = u * u * u;
+        (1.0 - e, 1.0 - u * u, 1.0 - 0.55 * e, 1.0 - e)
+    })
+}
+
+/// Peeks that Alcove shows as one small bubble instead: caps lock and the microphone switch.
+fn small_bubble(p: &Peek) -> bool {
+    match p.key {
+        Some("osd-mic") => true,
+        Some("locks") => matches!(&p.trailing, Trailing::Level { text: Some(t), .. } if t.starts_with("Caps")),
+        _ => false,
+    }
+}
+
+/// Whether such a bubble shows the "off" state (a slash through the icon).
+fn bubble_off(p: &Peek) -> bool {
+    match p.key {
+        Some("osd-mic") => p.subtitle == "Muted",
+        Some("locks") => matches!(&p.trailing, Trailing::Level { frac, .. } if *frac < 0.5),
+        _ => false,
+    }
+}
+
+/// Alcove shows some notices as one big round dial. This is how much taller than the notch the
+/// dial is for this notice, or `None` when it is shown the usual way. Volume and brightness can
+/// be switched back to the line (Settings, General); battery and Bluetooth are always dials.
+fn dial_height(p: &Peek, cfg: &Config) -> Option<f32> {
+    if !crate::ui::look_alcove() {
+        return None;
+    }
+    match p.key {
+        Some("osd-volume" | "osd-brightness") if cfg.general.hud_ring => Some(172.0),
+        // these two have a status line under the value
+        Some("battery" | "bluetooth") => Some(196.0),
+        _ => None,
+    }
+}
+
+/// How wide each page wants the open notch, as a share of the widest setting (Appearance, width).
+/// A short list needs far less room than the dashboard, so the notch only opens as wide as the
+/// page it shows.
+fn page_share(id: ModuleId) -> f32 {
+    match id {
+        "notifications" | "timer" => 0.72,
+        "downloads" | "clipboard" | "mirror" | "notes" => 0.74,
+        "control" | "shelf" => 0.76,
+        "media" | "stats" | "weather" => 0.78,
+        "calendar" | "ports" | "voice" | "ai" => 0.84,
+        "gemini" => 0.86,
+        _ => 1.0,
+    }
+}
+
+/// How wide the open notch is for a page (the widest setting outside the Alcove look).
+fn page_width_of(cfg: &Config, id: ModuleId) -> f32 {
+    let max = cfg.appearance.expanded_width;
+    if !crate::ui::look_alcove() {
+        return max;
+    }
+    (max * page_share(id)).max(420.0_f32.min(max))
+}
+
+/// The height a page wants under the header, for the given content width.
+fn page_content_h(cfg: &Config, modules: &[Box<dyn Module>], started: &[bool], id: ModuleId, content_w: f32) -> f32 {
+    if id == HOME && crate::ui::look_alcove() {
+        crate::alcove::HOME_H
+    } else if id == HOME && crate::ui::look_bloom() {
+        crate::bloom::HOME_H
+    } else if id == HOME {
+        if home_tiles(modules, started, cfg).len() >= HOME_TILES {
+            HOME_HEIGHT_TALL
+        } else {
+            HOME_HEIGHT
+        }
+    } else {
+        modules
+            .iter()
+            .position(|m| m.id() == id)
+            .map(|i| modules[i].page_height(content_w))
+            .unwrap_or(HOME_HEIGHT)
+            .clamp(60.0, WIN_H - MARGIN - top_h() - bottom_pad())
+    }
+}
+
+/// The size of the open notch showing a page: (width, height). Every page is laid out at its own
+/// size, also while another page is sliding in or out, so nothing reflows to the wrong width.
+fn page_size(cfg: &Config, modules: &[Box<dyn Module>], started: &[bool], id: ModuleId) -> (f32, f32) {
+    let w = page_width_of(cfg, id);
+    (w, top_h() + page_content_h(cfg, modules, started, id, w - side_pad() - right_pad()) + bottom_pad())
+}
+
+/// The area a page draws in, for an open notch of this size centred on `cx`.
+fn page_content(cx: f32, y: f32, (w, h): (f32, f32)) -> Rect {
+    let full = Rect::new(cx - w * 0.5, y, w, h);
+    Rect::new(full.x + side_pad(), full.y + top_h(), full.w - side_pad() - right_pad(), full.h - top_h() - bottom_pad())
+}
+
 /// How long a quiet peek swap (next track) takes to play.
 const SWAP_SECS: f32 = 0.55;
 
@@ -119,6 +304,8 @@ struct Anim {
     shown: Spring,
     /// Secondary live-activity bubble (0 hidden .. 1 fully out).
     sec: Spring,
+    /// Alcove media: cover and level bars sit in their own bubbles beside a blank notch (0..1).
+    split: Spring,
     /// Page switch progress 0..1 (slow and soft on purpose).
     page: Spring,
 }
@@ -136,7 +323,8 @@ impl Anim {
             exp: Spring::unit(0.0, 0.22, 1.0),
             shown: Spring::unit(0.0, 0.5, 0.8),
             sec: Spring::unit(0.0, 0.45, 0.8),
-            page: Spring::unit(1.0, 0.46, 1.0),
+            split: Spring::unit(0.0, 0.5, 0.78),
+            page: Spring::unit(1.0, 0.64, 1.0),
         }
         .with_h(h)
     }
@@ -157,6 +345,7 @@ impl Anim {
             &mut self.exp,
             &mut self.shown,
             &mut self.sec,
+            &mut self.split,
             &mut self.page,
         ] {
             m |= s.step(dt);
@@ -218,6 +407,12 @@ pub struct App {
     /// Page being faded out while the next one slides in, and the slide direction.
     page_from: Option<(ModuleId, f32)>,
     peek: Option<ActivePeek>,
+    /// Alcove: a finished clipboard / notification / download peek lingers as a bubble, then is sucked in.
+    bubbles: Vec<Bubble>,
+    /// A bubble to show once the notch has closed again (files just parked on the shelf).
+    pending_bubble: Option<(Icon, Color)>,
+    /// When the notch last opened (drives the light sweep across it).
+    opened_at: Option<Instant>,
     peek_queue: VecDeque<Peek>,
 
     hovering: bool,
@@ -240,6 +435,7 @@ pub struct App {
     region: Option<(i32, i32, i32, i32)>,
     region_anim: Option<Rect>,
     fs_hidden: bool,
+    dock: Option<Dock>,
     user_hidden: bool,
     shown_once: bool,
 
@@ -281,6 +477,7 @@ impl App {
         let n = modules.len();
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Release);
         crate::ui::set_white_beams(cfg.appearance.white_beams);
+        crate::ui::set_look(&cfg.appearance.look);
         let anim = Anim::new(cfg.appearance.notch_width, cfg.appearance.notch_height);
         Ok(Box::new(App {
             hwnd,
@@ -304,6 +501,9 @@ impl App {
             page: HOME,
             page_from: None,
             peek: None,
+            bubbles: Vec::new(),
+            pending_bubble: None,
+            opened_at: None,
             peek_queue: VecDeque::new(),
             hovering: false,
             hover_since: None,
@@ -321,6 +521,7 @@ impl App {
             region: None,
             region_anim: None,
             fs_hidden: false,
+            dock: None,
             user_hidden: false,
             shown_once: false,
             tray: None,
@@ -347,6 +548,7 @@ impl App {
     /// Second-stage init once the app is reachable from the window proc.
     pub fn start(&mut self) {
         self.place();
+        self.sync_dock();
         self.tray = Some(Tray::new(self.hwnd));
         self.register_hotkeys();
         unsafe {
@@ -391,6 +593,44 @@ impl App {
         log!("started: scale={} monitor={:?}", self.scale, self.win_px);
     }
 
+    /// Create, update or remove the dock to match the settings.
+    fn sync_dock(&mut self) {
+        let cfg = self.cfg.dock.clone();
+        let scale = self.cfg.appearance.scale;
+        if !cfg.enabled {
+            self.dock = None;
+            return;
+        }
+        match self.dock.as_mut() {
+            Some(d) => d.set_config(&cfg, scale),
+            None => {
+                let created = crate::window::create_dock()
+                    .ok()
+                    .and_then(|h| Dock::new(h, &self.gfx, &self.host.compositor, &cfg, scale));
+                if created.is_none() {
+                    log!("could not start the dock");
+                }
+                self.dock = created;
+            }
+        }
+    }
+
+    /// Messages for the dock's window (see `window::wndproc_inner`).
+    pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let d = self.dock.as_mut()?;
+        if msg == WM_TIMER && wp.0 == dock::TIMER_FRAME {
+            if !d.frame(&self.gfx, Instant::now()) {
+                d.stop_timer();
+            }
+            return Some(LRESULT(0));
+        }
+        let (r, frame) = d.handle(msg, wp, lp);
+        if frame {
+            d.start_timer();
+        }
+        r
+    }
+
     pub fn shutdown(&mut self) {
         for (i, m) in self.modules.iter_mut().enumerate() {
             if self.started[i] {
@@ -413,6 +653,7 @@ impl App {
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
         }
         dragdrop::revoke_target(self.hwnd);
+        self.dock = None;
         self.tray = None;
         self.pacer.stop();
     }
@@ -473,6 +714,12 @@ impl App {
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16;
                 self.input.wheel += delta as f32 / 120.0;
+                self.request_frame();
+                Some(LRESULT(0))
+            }
+            WM_MOUSEHWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16;
+                self.input.hwheel += delta as f32 / 120.0;
                 self.request_frame();
                 Some(LRESULT(0))
             }
@@ -588,6 +835,9 @@ impl App {
                 if let Some(t) = self.tray.as_mut() {
                     t.readd();
                 }
+                if let Some(d) = self.dock.as_mut() {
+                    d.explorer_restarted();
+                }
                 Some(LRESULT(0))
             }
             _ => None,
@@ -653,6 +903,7 @@ impl App {
                 self.leave_since = None;
                 self.auto_close = Some(Instant::now() + Duration::from_secs(4));
                 self.broadcast(SystemEvent::DragHover(false));
+                self.pending_bubble = Some((Icon::Package, palette::YELLOW));
                 self.broadcast(SystemEvent::Dropped(files));
             }
         }
@@ -737,11 +988,26 @@ impl App {
     }
 
     fn apply_effects(&mut self, fx: Effects) {
+        if fx.nudge && self.cfg.general.haptics && crate::ui::look_alcove() && self.mode == Mode::Expanded {
+            // a tiny give, like a key travelling down and back up
+            self.anim.w.velocity -= 30.0;
+            self.anim.h.velocity -= 10.0;
+            self.request_frame();
+        }
         for (s, k, v) in &fx.save_config {
             config::set_value(s, k, v);
         }
         for p in fx.peeks {
             self.push_peek(p);
+        }
+        if let Some(v) = fx.set_volume {
+            modules::osd::set_volume(&self.bus, v);
+        }
+        if let Some(b) = fx.set_brightness {
+            modules::osd::set_brightness(b);
+        }
+        if fx.reload_config {
+            self.reload_config();
         }
         if let Some(page) = fx.open_page {
             self.expand(Some(page));
@@ -830,6 +1096,12 @@ impl App {
         self.gfx.font_installed(self.cfg.greeting.font_name())
     }
 
+    /// How wide the open notch is for the page shown: the page's own share of the widest setting,
+    /// or the full width on the home page.
+    fn page_width(&self) -> f32 {
+        page_width_of(&self.cfg, self.page)
+    }
+
     fn module_index(&self, id: ModuleId) -> Option<usize> {
         self.modules.iter().position(|m| m.id() == id)
     }
@@ -849,8 +1121,17 @@ impl App {
         // stable sort: equal priorities keep module order
         acts.sort_by_key(|a| std::cmp::Reverse(a.priority));
         let mut it = acts.into_iter();
+        let before = self.activity.is_some() as u8 + self.secondary.is_some() as u8;
         self.activity = it.next();
         self.secondary = it.next();
+        // Alcove: a small give in the notch when a live activity starts or ends
+        if crate::ui::look_alcove()
+            && self.mode == Mode::Idle
+            && before != self.activity.is_some() as u8 + self.secondary.is_some() as u8
+        {
+            self.anim.w.velocity += 70.0;
+            self.anim.h.velocity += 22.0;
+        }
         // accent from album art if configured
         self.accent = match Color::parse(&self.cfg.appearance.accent) {
             Some(c) => c,
@@ -862,7 +1143,13 @@ impl App {
                     Slot::Image(img) => img.accent,
                     _ => None,
                 })
-                .unwrap_or(Color::white(0.92)),
+                .unwrap_or(if crate::ui::look_nothing() {
+                    crate::ui::NOTHING_RED
+                } else if crate::ui::look_bloom() {
+                    crate::ui::BLOOM_BLUE
+                } else {
+                    Color::white(0.92)
+                }),
         };
     }
 
@@ -958,10 +1245,13 @@ impl App {
     }
 
     fn process_timeouts(&mut self, now: Instant) {
-        let g = self.cfg.general.clone();
-        if self.mode != Mode::Expanded && self.hovering && g.expand_on_hover && !self.user_hidden {
+        let (expand_on_hover, hover_delay_ms, collapse_delay_ms) = {
+            let g = &self.cfg.general;
+            (g.expand_on_hover, g.hover_delay_ms, g.collapse_delay_ms)
+        };
+        if self.mode != Mode::Expanded && self.hovering && expand_on_hover && !self.user_hidden {
             if let Some(h) = self.hover_since {
-                if now >= h + Duration::from_millis(g.hover_delay_ms as u64) {
+                if now >= h + Duration::from_millis(hover_delay_ms as u64) {
                     self.hover_since = None;
                     let page = self.peek.as_ref().and_then(|p| p.peek.page);
                     self.expand(page);
@@ -969,13 +1259,20 @@ impl App {
             }
         }
         if self.mode == Mode::Expanded && !self.hovering && !self.keyboard && !self.drag_hover {
-            let leave = self.leave_since.map(|l| l + Duration::from_millis(g.collapse_delay_ms as u64));
+            let leave = self.leave_since.map(|l| l + Duration::from_millis(collapse_delay_ms as u64));
             if leave.into_iter().chain(self.auto_close).any(|t| now >= t) {
                 self.collapse();
             }
         }
         if let Some(p) = &self.peek {
             if now >= p.until && !(self.hovering && self.mode == Mode::Peek) {
+                if crate::ui::look_alcove()
+                    && self.cfg.general.bubbles
+                    && matches!(p.peek.key, Some("notify" | "clipboard" | "download"))
+                    && !p.peek.is_hud()
+                {
+                    push_bubble(&mut self.bubbles, now, p.peek.icon, p.peek.accent, false, p.peek.page);
+                }
                 self.peek = None;
                 self.next_peek();
             }
@@ -1006,6 +1303,7 @@ impl App {
         self.leave_since = None;
         self.auto_close = if self.hovering { None } else { Some(Instant::now() + Duration::from_secs(8)) };
         if was != Mode::Expanded {
+            self.opened_at = Some(Instant::now());
             self.broadcast(SystemEvent::Expanded(true));
         }
         self.request_frame();
@@ -1024,6 +1322,19 @@ impl App {
             self.set_keyboard(false);
         }
         self.broadcast(SystemEvent::Expanded(false));
+        // files were just parked on the shelf: a bubble once the notch has closed
+        if let Some((icon, color)) = self.pending_bubble.take() {
+            if crate::ui::look_alcove() && self.cfg.general.bubbles {
+                push_bubble(
+                    &mut self.bubbles,
+                    Instant::now() + Duration::from_millis(350),
+                    icon,
+                    color,
+                    false,
+                    Some("shelf"),
+                );
+            }
+        }
         self.next_peek();
         self.request_frame();
         self.schedule_wake();
@@ -1044,8 +1355,28 @@ impl App {
         if self.user_hidden || self.fs_hidden {
             return;
         }
+        // Do not disturb (the moon in the control center): only volume and brightness still show
+        if crate::bloom::dnd() && !p.is_hud() {
+            return;
+        }
         if self.mode == Mode::Expanded {
             return; // the user is already looking at the notch
+        }
+        // A new track only changes the closed notch (cover and bars); it never pops a peek
+        if p.key == Some("media") {
+            return;
+        }
+        // Alcove: a finished copy or download is just a bubble that pops out beside the notch and
+        // is pulled back in, not a full notification
+        if self.peek.is_none()
+            && (small_bubble(&p) || (matches!(p.key, Some("clipboard" | "download")) && !p.is_hud()))
+            && crate::ui::look_alcove()
+            && self.cfg.general.bubbles
+        {
+            push_bubble(&mut self.bubbles, Instant::now(), p.icon, p.accent, bubble_off(&p), p.page);
+            self.request_frame();
+            self.schedule_wake();
+            return;
         }
         if p.quiet {
             // a follow-up (the next track): swap the visible peek with an animation, never pop a new one
@@ -1099,6 +1430,11 @@ impl App {
             Some(p) => {
                 self.peek = Some(ActivePeek { until: Instant::now() + p.duration, peek: p, swap: None });
                 self.mode = Mode::Peek;
+                if crate::ui::look_alcove() {
+                    // a small pulse as it arrives
+                    self.anim.w.velocity += 90.0;
+                    self.anim.h.velocity += 30.0;
+                }
             }
             None => {
                 self.peek = None;
@@ -1115,6 +1451,9 @@ impl App {
         self.hovering = on;
         let now = Instant::now();
         if on {
+            if self.cfg.general.haptics && self.mode != Mode::Expanded && !self.user_hidden {
+                sys::haptic(false);
+            }
             self.hover_since = Some(now);
             self.leave_since = None;
             self.auto_close = None;
@@ -1201,6 +1540,50 @@ impl App {
         Rect::new(self.win_w * 0.5 - w * 0.5, -shift, w, h)
     }
 
+    /// Alcove: a playing track shows its cover and level bars as two bubbles beside the notch.
+    fn split_media(&self) -> bool {
+        crate::ui::look_alcove()
+            && self.cfg.general.bubbles
+            && self.mode != Mode::Expanded
+            && self.activity.as_ref().is_some_and(|a| matches!(a.left, Slot::Vinyl { .. }))
+    }
+
+    /// The two media bubbles (left, right); they slide out from under the notch edges.
+    fn split_rects(&self) -> (Rect, Rect) {
+        let s = self.cfg.appearance.notch_height;
+        let b = self.body_rect();
+        let k = self.anim.split.value;
+        let y = b.y.min(0.0);
+        (Rect::new(b.x - (s + 8.0) * k, y, s, s), Rect::new(b.right() - s + (s + 8.0) * k, y, s, s))
+    }
+
+    /// The lingering bubbles (oldest nearest the notch): rect, opacity, icon and colour. Each pops
+    /// out beside the notch, stays about a second, then shrinks back under the edge as if the
+    /// notch pulled it in; the ones further out slide in to fill the gap as it goes.
+    fn bubble_states(&self, now: Instant) -> Vec<(Rect, f32, Icon, Color, bool, Option<ModuleId>)> {
+        let mut out = Vec::new();
+        // the common case (no bubble showing) is asked on every mouse move and every frame
+        if self.bubbles.is_empty() || self.mode != Mode::Idle || self.peek.is_some() {
+            return out;
+        }
+        let s = self.cfg.appearance.notch_height;
+        // Anchored to the full-size notch, so a bubble looks the same whatever the idle style
+        // (notch, pill or hidden); beside the music bubble when there is one
+        let right = self.body_rect().right().max(self.win_w * 0.5 + self.cfg.appearance.notch_width * 0.5);
+        let split = self.anim.split.value;
+        let mut off = 0.0;
+        for b in &self.bubbles {
+            let Some((k, alpha, scale, room)) = bubble_curve(now.saturating_duration_since(b.at).as_secs_f32()) else {
+                continue;
+            };
+            let x = right - s + (s + 8.0) * ((1.0 + off) * k + split);
+            let r = Rect::new(x, 0.0, s, s);
+            out.push((Rect::centered(r.cx(), r.cy(), r.w * scale, r.h * scale), alpha, b.icon, b.color, b.off, b.page));
+            off += room;
+        }
+        out
+    }
+
     /// The secondary activity bubble slides out from under the right edge.
     fn bubble_rect(&self) -> Rect {
         let s = self.cfg.appearance.notch_height;
@@ -1215,11 +1598,20 @@ impl App {
         let strip = Rect::new(self.win_w * 0.5 - strip_w * 0.5, 0.0, strip_w, 5.0);
         let b = Rect::new(b.x, 0.0, b.w, b.bottom().max(0.0));
         let z = b.union(&strip);
-        if self.anim.sec.value > 0.5 {
-            z.union(&self.bubble_rect())
+        let z = if self.anim.split.value > 0.5 {
+            let (l, r) = self.split_rects();
+            z.union(&l).union(&r)
         } else {
             z
+        };
+        let mut z = if self.anim.sec.value > 0.5 { z.union(&self.bubble_rect()) } else { z };
+        // a bubble that opens a page on click counts as part of the notch while it shows
+        for b in self.bubble_states(Instant::now()) {
+            if b.5.is_some() {
+                z = z.union(&b.0);
+            }
         }
+        z
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
@@ -1270,12 +1662,37 @@ impl App {
                 }
             },
             Mode::Idle => {
-                if self.anim.sec.value > 0.5 && self.bubble_rect().contains(p.0, p.1) {
+                let hit = self
+                    .bubble_states(Instant::now())
+                    .into_iter()
+                    .find(|b| b.5.is_some() && b.1 > 0.4 && b.0.expand(4.0).contains(p.0, p.1))
+                    .and_then(|b| b.5);
+                if let Some(page) = hit {
+                    // a click on a lingering bubble opens what it is about
+                    self.bubbles.clear();
+                    self.user_hidden = false;
+                    if self.cfg.general.haptics {
+                        sys::haptic(true);
+                    }
+                    self.expand(Some(page));
+                } else if self.anim.split.value > 0.5 && {
+                    let (l, r) = self.split_rects();
+                    l.contains(p.0, p.1) || r.contains(p.0, p.1)
+                } {
+                    let page = self.activity.as_ref().and_then(|a| a.page);
+                    self.expand(page);
+                } else if self.anim.sec.value > 0.5 && self.bubble_rect().contains(p.0, p.1) {
                     let page = self.secondary.as_ref().and_then(|a| a.page);
                     self.expand(page);
                 } else if inside || self.hover_zone().contains(p.0, p.1) {
                     self.user_hidden = false;
-                    self.expand(None);
+                    if self.cfg.general.haptics {
+                        sys::haptic(true);
+                    }
+                    // with the media split into two bubbles the notch between them is blank: a click
+                    // there opens Home, while the bubbles themselves open the media page
+                    let page = if self.anim.split.value > 0.5 { Some(HOME) } else { None };
+                    self.expand(page);
                 }
             }
         }
@@ -1433,12 +1850,14 @@ impl App {
                 let autostart_changed = c.general.start_with_windows != self.cfg.general.start_with_windows;
                 self.cfg = c;
                 crate::ui::set_white_beams(self.cfg.appearance.white_beams);
+                crate::ui::set_look(&self.cfg.appearance.look);
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
                 }
                 self.register_hotkeys();
                 self.sync_modules();
                 self.place();
+                self.sync_dock();
                 self.broadcast(SystemEvent::ConfigReloaded);
                 log!("config reloaded");
             }
@@ -1580,6 +1999,9 @@ impl App {
             if hide {
                 self.collapse();
             }
+            if let Some(d) = self.dock.as_mut() {
+                d.set_hidden(hide);
+            }
             log!("fullscreen hidden = {hide}");
             self.request_frame();
         }
@@ -1612,30 +2034,26 @@ impl App {
         };
         match self.mode {
             Mode::Expanded => {
-                let content_w = ap.expanded_width - 2.0 * PAD;
-                let content_h = if self.page == HOME {
-                    let tiles = home_tiles(&self.modules, &self.started, &self.cfg).len();
-                    if tiles >= HOME_TILES {
-                        HOME_HEIGHT_TALL
-                    } else {
-                        HOME_HEIGHT
-                    }
-                } else {
-                    self.module_index(self.page)
-                        .map(|i| self.modules[i].page_height(content_w))
-                        .unwrap_or(HOME_HEIGHT)
-                        .clamp(60.0, WIN_H - MARGIN - HEADER_H - BOTTOM_PAD)
-                };
-                t.w = ap.expanded_width;
-                t.h = HEADER_H + content_h + BOTTOM_PAD;
-                t.r = 34.0;
-                t.ear = 14.0;
+                let page_w = self.page_width();
+                let content_w = page_w - side_pad() - right_pad();
+                let content_h = page_content_h(&self.cfg, &self.modules, &self.started, self.page, content_w);
+                t.w = page_w;
+                t.h = top_h() + content_h + bottom_pad();
+                t.r = if crate::ui::look_alcove() { 46.0 } else { 34.0 };
+                t.ear = 30.0;
                 t.glass = 1.0;
                 t.exp = true;
             }
             Mode::Peek => {
                 let pk = self.peek.as_ref().map(|a| &a.peek);
-                if pk.is_some_and(|p| p.scan) {
+                if pk.is_some_and(|p| p.scan) && crate::ui::look_alcove() {
+                    // unlock: a round dial like the volume one, with "Hello" and the name under it
+                    let name = hello_name(pk.map_or("", |p| p.title.as_str()));
+                    t.w = crate::alcove::hello_stage(name).0.min(ap.expanded_width);
+                    t.h = base_h + if name.is_empty() { 172.0 } else { 184.0 };
+                    t.r = 44.0;
+                    t.ear = 26.0;
+                } else if pk.is_some_and(|p| p.scan) {
                     // unlock scan: the notch grows into a small square stage, then
                     // settles into a smaller one for the handwritten hello
                     let prog = self.peek.as_ref().map_or(0.0, |a| {
@@ -1644,7 +2062,11 @@ impl App {
                     });
                     if prog > SCAN_HELLO_AT {
                         let title = pk.map_or("", |p| p.title.as_str());
-                        let (w, h) = hello_stage(title, self.hello_custom());
+                        let (w, h) = if crate::ui::look_alcove() {
+                            crate::alcove::hello_stage(hello_name(title))
+                        } else {
+                            hello_stage(title, self.hello_custom())
+                        };
                         t.w = w.min(ap.expanded_width);
                         t.h = h;
                     } else {
@@ -1652,19 +2074,48 @@ impl App {
                         t.h = 168.0;
                     }
                     t.r = 34.0;
-                    t.ear = 14.0;
+                    t.ear = 28.0;
+                } else if let Some(dh) = pk.and_then(|p| dial_height(p, &self.cfg)) {
+                    // volume / brightness / battery / Bluetooth as one big round dial
+                    t.w = 190.0_f32.min(ap.expanded_width);
+                    t.h = base_h + dh;
+                    t.r = 44.0;
+                    t.ear = 26.0;
                 } else if pk.is_some_and(|p| p.is_hud()) {
                     // volume / brightness: one row, icon + beams + value
                     t.w = 300.0_f32.min(ap.expanded_width);
                     t.h = base_h + 34.0;
                     t.r = 26.0;
-                    t.ear = 12.0;
+                    t.ear = 18.0;
                 } else if pk.is_some_and(|p| p.is_compact()) {
                     // icon-only pill, like the unlock animation
                     t.w = (base_w + 70.0).max(250.0).min(ap.expanded_width);
                     t.h = base_h + 10.0;
                     t.r = 21.0;
                     t.ear = 10.0;
+                } else if pk.is_some_and(crate::alcove::peek_notify) && crate::ui::look_alcove() {
+                    // a message: avatar, name and two lines of text
+                    t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
+                    t.h = base_h + 58.0;
+                    t.r = 40.0;
+                    t.ear = 24.0;
+                } else if pk.is_some_and(crate::alcove::peek_conn) && crate::ui::look_alcove() {
+                    // a device or network: small and left-weighted
+                    t.w = (base_w + 70.0).max(280.0).min(ap.expanded_width);
+                    t.h = base_h + 24.0;
+                    t.r = 30.0;
+                    t.ear = 18.0;
+                } else if pk.is_some_and(crate::alcove::peek_tall) && crate::ui::look_alcove() {
+                    // a notice with a message: the text sits in its own box under the title
+                    t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
+                    t.h = base_h + 92.0;
+                    t.r = 40.0;
+                    t.ear = 24.0;
+                } else if crate::ui::look_alcove() {
+                    t.w = (base_w + 170.0).max(400.0).min(ap.expanded_width);
+                    t.h = base_h + 46.0;
+                    t.r = 32.0;
+                    t.ear = 22.0;
                 } else {
                     t.w = (base_w + 150.0).max(360.0).min(ap.expanded_width);
                     t.h = base_h + 44.0;
@@ -1676,7 +2127,7 @@ impl App {
             }
             Mode::Idle => {
                 if let Some(a) = &self.activity {
-                    t.w = base_w + 2.0 * a.wing * base_h;
+                    t.w = if self.split_media() { base_w } else { base_w + 2.0 * a.wing * base_h };
                     t.compact = true;
                     t.sec = self.secondary.is_some() && t.shown;
                 } else {
@@ -1698,10 +2149,14 @@ impl App {
                         t.w = t.w.max(26.0 + 66.0 * n);
                     }
                 }
-                if self.hovering && !self.user_hidden {
-                    t.w += 14.0;
-                    t.h += 4.0;
-                    t.r += 1.5;
+                if self.hovering && !self.user_hidden && crate::ui::look_alcove() && self.input.down.is_some() {
+                    // pressed: the notch gives a little under the finger, then springs open on release
+                    t.w -= 4.0;
+                    t.h -= 2.0;
+                } else if self.hovering && !self.user_hidden {
+                    t.w += 10.0;
+                    t.h += 3.0;
+                    t.r += 1.0;
                 }
             }
         }
@@ -1710,21 +2165,60 @@ impl App {
 
     fn retarget(&mut self) {
         let t = self.targets();
+        let split = self.split_media();
         let ap = &self.cfg.appearance;
         let speed = ap.animation_speed;
-        let bounce = ap.bounce;
+        // minimal look: no overshoot anywhere, and a touch more patience in every move
+        let minimal = crate::ui::look_minimal();
+        let nothing = crate::ui::look_nothing();
+        let alcove = crate::ui::look_alcove();
+        let bloom = crate::ui::look_bloom() && !alcove;
+        // Bloom settles like a smooth ease-out: almost no overshoot
+        let bounce = if minimal || nothing {
+            0.0
+        } else if bloom {
+            ap.bounce * 0.35
+        } else {
+            ap.bounce
+        };
+        // minimal is a touch slower and softer; Nothing is crisp and mechanical
+        let speed = if minimal {
+            speed * 0.9
+        } else if nothing {
+            speed * 1.15
+        } else if alcove {
+            speed * 1.1
+        } else if bloom {
+            speed * 1.05
+        } else {
+            speed
+        };
         let a = &mut self.anim;
+        // page changes follow the animation speed setting too
+        a.page.set_params(1.05 / speed, 1.0);
         let grow = t.w > a.w.value + 0.5 || t.h > a.h.value + 0.5;
         // One spring character for the whole body (size, corner radius and ears move as one
         // object): a little softer on the way out, snappier on the way back in.
         let (resp, damp) = if grow {
-            (BODY_RESPONSE / speed, 1.0 - 0.45 * bounce)
+            // Alcove: a visible but gentle overshoot on the way out
+            (BODY_RESPONSE / speed, if alcove { 1.0 - 0.8 * bounce } else { 1.0 - 0.45 * bounce })
         } else {
             (BODY_RESPONSE * 0.7 / speed, 1.0 - 0.1 * bounce)
         };
-        for s in [&mut a.w, &mut a.h, &mut a.r, &mut a.ear] {
-            s.set_params(resp, damp);
+        // Shape morphing: height leads, width follows a beat later and the corners keep
+        // catching up, so the notch flows from one form to the other instead of scaling.
+        let (kh, kw, kr) = if alcove { (0.9, 1.08, 1.3) } else { (1.0, 1.0, 1.0) };
+        if t.exp && a.exp.value > 0.9 {
+            // moving between open pages: the body resizes with the very same slow, smooth motion
+            // as the page sliding up or down, so the two read as one movement
+            a.h.set_params(0.77 / speed, 1.0);
+            a.w.set_params(0.77 / speed, 1.0);
+        } else {
+            a.h.set_params(resp * kh, damp);
+            a.w.set_params(resp * kw, damp);
         }
+        a.r.set_params(resp * kr, damp.max(0.9));
+        a.ear.set_params(resp * kr, damp.max(0.9));
         // Staged like the Mac apps: when closing, the content fades first and the body only then
         // shrinks around the empty space; when opening, the body leads and the content follows.
         let closing = !grow && !t.exp && a.exp.value > 0.05;
@@ -1736,6 +2230,8 @@ impl App {
         a.glass.set_target(t.glass);
         a.shown.set_params(0.5 / speed, 1.0 - 0.5 * bounce);
         a.shown.set_target(if t.shown { 1.0 } else { 0.0 });
+        a.split.set_params(0.5 / speed, 1.0 - 0.7 * bounce);
+        a.split.set_target(if split && t.shown { 1.0 } else { 0.0 });
         a.sec.set_params(0.45 / speed, 1.0 - 0.6 * bounce);
         a.sec.set_target(if t.sec { 1.0 } else { 0.0 });
         let fade = |s: &mut Spring, on: bool, delay: f32| {
@@ -1754,9 +2250,11 @@ impl App {
 
     fn frame(&mut self) {
         let now = Instant::now();
-        // Ambient animation only (a sweeping beam, the record turning): nothing is being moved by a
-        // spring and nobody touched anything, so ~30 frames a second look the same for half the work.
-        if !self.dirty && self.settled && now.duration_since(self.last_frame) < Duration::from_millis(20) {
+        // Ambient animation only (a sweeping shimmer, the record turning): nothing is being moved by
+        // a spring and nobody touched anything. Frames closer together than AMBIENT_GAP are skipped,
+        // which only trims displays faster than 60 Hz; on a 60 Hz screen every frame is drawn, since
+        // halving to 30 fps made sweeps and shimmers look choppy.
+        if !self.dirty && self.settled && now.duration_since(self.last_frame) < AMBIENT_GAP {
             return;
         }
         let dt = (now - self.last_frame).as_secs_f32().min(1.0 / 20.0);
@@ -1782,6 +2280,7 @@ impl App {
         self.input.click = None;
         self.input.right_click = None;
         self.input.wheel = 0.0;
+        self.input.hwheel = 0.0;
         if self.debug {
             let st = &mut self.stats;
             st.0.get_or_insert(now);
@@ -1821,11 +2320,19 @@ impl App {
         let t = self.targets();
         let shown = t.shown;
         let bubble = if t.sec { self.cfg.appearance.notch_height + 8.0 + ear } else { 0.0 };
-        let tb = Rect::new(self.win_w * 0.5 - t.w * 0.5 - ear, 0.0, t.w + 2.0 * ear + bubble, t.h);
+        let side = if self.split_media() { self.cfg.appearance.notch_height + 8.0 } else { 0.0 };
+        let tb = Rect::new(self.win_w * 0.5 - t.w * 0.5 - ear - side, 0.0, t.w + 2.0 * (ear + side) + bubble, t.h);
         let cur = self.body_rect();
         let mut cb = Rect::new(cur.x - ear, 0.0, cur.w + 2.0 * ear, cur.bottom().max(0.0));
         if self.anim.sec.value > 0.01 {
             cb = cb.union(&self.bubble_rect().expand(ear));
+        }
+        for (r, ..) in self.bubble_states(Instant::now()) {
+            cb = cb.union(&r.expand(ear + 6.0));
+        }
+        if self.anim.split.value > 0.01 {
+            let (l, r) = self.split_rects();
+            cb = cb.union(&l.expand(ear)).union(&r.expand(ear));
         }
         let strip_w = self.cfg.appearance.notch_width;
         let strip = Rect::new(self.win_w * 0.5 - strip_w * 0.5, 0.0, strip_w, 5.0);
@@ -1833,7 +2340,12 @@ impl App {
             None
         } else if settled {
             self.region_anim = None;
-            Some(if shown { tb.union(&strip) } else { strip })
+            let mut r = if shown { tb.union(&strip) } else { strip };
+            // the lingering bubble sits outside the resting notch
+            for (lr, ..) in self.bubble_states(Instant::now()) {
+                r = r.union(&lr.expand(ear + 6.0));
+            }
+            Some(r)
         } else {
             let mut r = tb.expand(16.0).union(&cb).union(&strip);
             if let Some(prev) = self.region_anim {
@@ -1901,10 +2413,17 @@ impl App {
             return;
         }
         let scale = self.scale;
-        let tw = self.cfg.appearance.expanded_width;
+        let tw = self.page_width();
         let body = self.body_rect();
         let target_h = self.targets().h;
-        let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, target_h.max(body.h));
+        let full = Rect::new(
+            body.cx() - tw * 0.5,
+            body.y,
+            tw,
+            // an open page is laid out at its own height even while the body is still catching up, so
+            // nothing drifts or stretches mid-resize; while closing the page keeps the body's height
+            if self.mode == Mode::Expanded { target_h } else { target_h.max(body.h) },
+        );
         let page = self.page;
         let accent = self.accent;
         let input = Input::default();
@@ -1946,6 +2465,7 @@ impl App {
                     draw_expanded(
                         &mut ui,
                         full,
+                        full,
                         &mut self.modules,
                         &self.started,
                         &tabs,
@@ -1960,19 +2480,32 @@ impl App {
 
         if want_pages {
             let Some((from, _)) = self.page_from else { return };
-            let content =
-                Rect::new(full.x + PAD, full.y + HEADER_H, full.w - 2.0 * PAD, full.h - HEADER_H - BOTTOM_PAD);
-            let region = clamp(Rect::new(full.x, content.y - 4.0, full.w, content.h + 8.0));
-            let base = [full.x.round() as i32, full.y.round() as i32, full.w.round() as i32, full.h.round() as i32, sc];
-            let key_of = |id: ModuleId| hash(&[page_id(id), base[0], base[1], base[2], base[3], base[4]]);
-            let (kf, kt) = (key_of(from), key_of(page));
+            // each page is drawn at its own size, centred; the picture is as big as the larger one
+            let (gf, gt) = (
+                page_size(&self.cfg, &self.modules, &self.started, from),
+                page_size(&self.cfg, &self.modules, &self.started, page),
+            );
+            let cx = body.cx();
+            let (cf, ct) = (page_content(cx, full.y, gf), page_content(cx, full.y, gt));
+            let region = clamp(Rect::new(cx - gf.0.max(gt.0) * 0.5, ct.y - 4.0, gf.0.max(gt.0), cf.h.max(ct.h) + 8.0));
+            let key_of = |id: ModuleId, g: (f32, f32)| {
+                hash(&[
+                    page_id(id),
+                    (cx - g.0 * 0.5).round() as i32,
+                    full.y.round() as i32,
+                    g.0.round() as i32,
+                    g.1.round() as i32,
+                    sc,
+                ])
+            };
+            let (kf, kt) = (key_of(from, gf), key_of(page, gt));
             let fresh = self
                 .snap_pages
                 .as_ref()
                 .is_some_and(|(a, b)| a.key == kf && b.key == kt && a.born.elapsed() < Duration::from_millis(1500));
             if !fresh {
                 let mut shots: Vec<Option<Snapshot>> = Vec::with_capacity(2);
-                for (id, key) in [(from, kf), (page, kt)] {
+                for (id, key, content) in [(from, kf, cf), (page, kt, ct)] {
                     let snap = self.res.render_snapshot(&self.gfx, scale, region, key, |p| {
                         let mut ui = Ui {
                             p,
@@ -2026,8 +2559,37 @@ impl App {
         let a_compact = self.anim.compact.value;
         let a_peek = self.anim.peek.value;
         let a_exp = self.anim.exp.value;
+        crate::alcove::set_open(a_exp);
         let target_h = self.targets().h;
+        // read before the painter borrows the window's resources
+        let page_w = self.page_width();
         let bubble = self.bubble_rect();
+        if !self.bubbles.is_empty() {
+            if self.mode != Mode::Idle || self.peek.is_some() {
+                self.bubbles.clear();
+            }
+            self.bubbles.retain(|b| now.saturating_duration_since(b.at).as_secs_f32() < BUBBLE_END);
+            // a quiet sound as a bubble pops out and again as it is pulled in
+            let sounds = self.cfg.general.bubble_sounds;
+            for b in &mut self.bubbles {
+                if !b.in_played && now >= b.at {
+                    b.in_played = true;
+                    if sounds {
+                        crate::sys::bubble_sound(false);
+                    }
+                }
+                if !b.out_played && now.saturating_duration_since(b.at).as_secs_f32() >= BUBBLE_HOLD {
+                    b.out_played = true;
+                    if sounds {
+                        crate::sys::bubble_sound(true);
+                    }
+                }
+            }
+        }
+        let bubble_list = self.bubble_states(now);
+        let split_v = self.anim.split.value;
+        let split_on = split_v > 0.01 && self.mode != Mode::Expanded;
+        let (lb, rb) = self.split_rects();
         let secondary = self.secondary.clone();
         let glances = self.idle_glances();
         let mut bars: Option<(Rect, Color, bool)> = None;
@@ -2040,7 +2602,7 @@ impl App {
         {
             let mut p = Painter::new(dc.clone(), &self.gfx, &mut self.res, scale, off.x as f32, off.y as f32);
             p.clear();
-            if body.bottom() > 0.25 {
+            if body.bottom() > 0.25 || !bubble_list.is_empty() {
                 // shadow
                 if ap.shadow && a_glass > 0.01 {
                     // extend above the window so only the sides/bottom show
@@ -2074,6 +2636,47 @@ impl App {
                         ui.p.alpha = 1.0;
                     }
                 }
+                for &(br, alpha, icon, accent, off, _) in &bubble_list {
+                    if let Some(g) = gfx::notch_path(&p, br, br.w * 0.5, a_ear.min(6.0)) {
+                        p.fill_geometry(&g, Color::black(ap.collapsed_opacity * alpha));
+                    }
+                    p.alpha = alpha;
+                    let ic = br.center_square(br.w * 0.5);
+                    let tint = accent.lerp(Color::white(1.0), 0.3);
+                    p.icon(icon, ic, tint);
+                    if off {
+                        // a slash through the icon, with a dark edge so it reads on the icon
+                        p.line(ic.x - 1.0, ic.y - 1.0, ic.right() + 1.0, ic.bottom() + 1.0, 4.6, Color::black(0.95));
+                        p.line(ic.x - 1.0, ic.y - 1.0, ic.right() + 1.0, ic.bottom() + 1.0, 2.2, tint);
+                    }
+                    p.alpha = 1.0;
+                    fx.animate = true;
+                }
+                if split_on {
+                    if let Some(act) = self.activity.clone() {
+                        let input = self.input.clone();
+                        let mut ui = Ui {
+                            p: &mut p,
+                            input: &input,
+                            fx: &mut fx,
+                            cfg: &self.cfg,
+                            bus: &self.bus,
+                            now,
+                            accent: self.accent,
+                            hot: false,
+                            interactive: false,
+                        };
+                        for (br, slot, left) in [(lb, &act.left, true), (rb, &act.right, false)] {
+                            if let Some(g) = gfx::notch_path(ui.p, br, br.w * 0.5, a_ear.min(6.0)) {
+                                ui.p.fill_geometry(&g, Color::black(ap.collapsed_opacity));
+                            }
+                            ui.p.alpha = split_v.clamp(0.0, 1.0);
+                            let inner = br.inset(br.w * 0.2);
+                            draw_slot(&mut ui, slot, inner, inner, left, &mut bars);
+                        }
+                        ui.p.alpha = 1.0;
+                    }
+                }
                 let opaque = if ap.blur { ap.expanded_opacity } else { ap.expanded_opacity.max(0.95) };
                 let bg_alpha = lerp(ap.collapsed_opacity, opaque, a_glass);
                 // no blur while moving: stay a little more solid so it doesn't flash
@@ -2100,7 +2703,8 @@ impl App {
                 // compact live activity / idle indicators
                 if a_compact > 0.003 || self.mode == Mode::Idle {
                     ui.p.alpha = if self.activity.is_some() { a_compact } else { 1.0 - a_peek.max(a_exp) };
-                    draw_compact(&mut ui, body, self.activity.as_ref(), &self.indicators, ap.notch_height, &mut bars);
+                    let acts = if split_on { None } else { self.activity.as_ref() };
+                    draw_compact(&mut ui, body, acts, &self.indicators, ap.notch_height, &mut bars);
                     if self.activity.is_none() && !glances.is_empty() {
                         draw_idle_widgets(&mut ui, body, &glances, ap.notch_height);
                     }
@@ -2128,8 +2732,15 @@ impl App {
                     let s = 0.94 + 0.06 * a_exp;
                     ui.p.set_local(s, body.cx(), 0.0, 0.0, 0.0);
                     ui.interactive = a_exp > 0.85 && self.mode == Mode::Expanded;
-                    let tw = self.cfg.appearance.expanded_width;
-                    let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, target_h.max(body.h));
+                    let tw = page_w;
+                    let full = Rect::new(
+                        body.cx() - tw * 0.5,
+                        body.y,
+                        tw,
+                        // an open page is laid out at its own height even while the body is still catching up, so
+                        // nothing drifts or stretches mid-resize; while closing the page keeps the body's height
+                        if self.mode == Mode::Expanded { target_h } else { target_h.max(body.h) },
+                    );
                     match &self.snap_all {
                         // opening or closing: the finished picture is only faded and scaled
                         Some(snap) => {
@@ -2143,6 +2754,7 @@ impl App {
                             draw_expanded(
                                 &mut ui,
                                 full,
+                                body,
                                 &mut self.modules,
                                 &self.started,
                                 &tabs,
@@ -2156,6 +2768,30 @@ impl App {
                     ui.p.reset_local();
                 }
                 ui.p.alpha = 1.0;
+                if crate::ui::look_alcove() {
+                    if let Some(t0) = self.opened_at {
+                        let t = now.saturating_duration_since(t0).as_secs_f32() / 0.6;
+                        if t < 1.0 && self.mode == Mode::Expanded {
+                            // a soft band of light crosses the top of the notch as it opens
+                            let e = 1.0 - (1.0 - t).powi(3);
+                            let cx = body.x - 90.0 + (body.w + 180.0) * e;
+                            let band = [
+                                (0.0, Color::white(0.0)),
+                                (0.5, Color::white(0.13 * (1.0 - t))),
+                                (1.0, Color::white(0.0)),
+                            ];
+                            let h = (body.h * 0.55).min(70.0);
+                            let pts = [
+                                (cx - 90.0, body.y),
+                                (cx + 90.0, body.y),
+                                (cx + 60.0, body.y + h),
+                                (cx - 120.0, body.y + h),
+                            ];
+                            ui.p.fill_gradient_poly(&pts, &band, cx - 90.0, cx + 90.0);
+                            ui.fx.animate = true;
+                        }
+                    }
+                }
                 p.pop_clip();
             }
         }
@@ -2208,6 +2844,9 @@ impl App {
             self.snap_pages = None;
             if let Ok(r) = Res::new(&self.gfx) {
                 self.res = r;
+            }
+            if let Some(d) = self.dock.as_mut() {
+                d.recover(&self.gfx);
             }
         }
         self.request_frame();
@@ -2265,27 +2904,46 @@ fn draw_idle_widgets(ui: &mut Ui, body: Rect, items: &[Glance], base_h: f32) {
     let n = items.len().min(3);
     let slot_w = ((body.w - 20.0) / n as f32).min(86.0);
     let x0 = body.cx() - slot_w * n as f32 * 0.5;
-    let base = TextStyle::new((base_h * 0.42).clamp(11.0, 14.0), palette::TEXT).semibold().display();
+    let al = crate::ui::look_alcove();
+    let base = if al {
+        // Alcove: plain white text, a little larger, no dividers and no tick gauges
+        TextStyle::new((base_h * 0.46).clamp(12.0, 15.0), Color::white(0.96)).semibold()
+    } else {
+        TextStyle::new((base_h * 0.42).clamp(11.0, 14.0), palette::TEXT).semibold().display()
+    };
     for (i, (icon, text, color, gauge)) in items.iter().take(3).enumerate() {
-        let st = base.color(*color);
+        let st = if al { base } else { base.color(*color) };
         let slot = Rect::new(x0 + i as f32 * slot_w, body.y, slot_w, h);
         // a single faint tick between neighbours
-        if i > 0 {
+        if i > 0 && !al {
             ui.p.fill_rounded(Rect::new(slot.x - 0.75, cy - 5.0, 1.5, 10.0), 0.75, Color::white(0.16));
         }
         let isz = 13.0;
         let (iw, gap) = if icon.is_some() { (isz, 4.0) } else { (0.0, 0.0) };
         let (tw, _) = ui.p.measure(text, &st);
-        let gw = if gauge.is_some() { 30.0 } else { 0.0 };
+        let gw = if gauge.is_some() {
+            if al {
+                28.0
+            } else {
+                30.0
+            }
+        } else {
+            0.0
+        };
         let gg = if gauge.is_some() { 6.0 } else { 0.0 };
         let tw = tw.min((slot_w - iw - gap - gw - gg - 6.0).max(0.0));
         let x = slot.cx() - (iw + gap + tw + gg + gw) * 0.5;
         if let Some(ic) = icon {
-            ui.p.icon(*ic, Rect::new(x, cy - isz * 0.5, isz, isz), color.with_a(0.9));
+            let ic_color = if al { Color::white(0.85) } else { color.with_a(0.9) };
+            ui.p.icon(*ic, Rect::new(x, cy - isz * 0.5, isz, isz), ic_color);
         }
         ui.p.text(text, Rect::new(x + iw + gap, body.y, tw + 2.0, h), &st);
         if let Some(g) = gauge {
-            ui.ticks(Rect::new(x + iw + gap + tw + gg, cy - 4.0, gw, 8.0), *g, *color);
+            if al {
+                crate::alcove::battery_glyph(ui, Rect::new(x + iw + gap + tw + gg, cy - 6.5, gw, 13.0), *g, false);
+            } else {
+                ui.beams(|ui| ui.ticks(Rect::new(x + iw + gap + tw + gg, cy - 4.0, gw, 8.0), *g, *color));
+            }
         }
     }
     ui.p.alpha = alpha;
@@ -2331,7 +2989,28 @@ fn draw_slot(ui: &mut Ui, slot: &Slot, sq: Rect, wing: Rect, left: bool, bars: &
             let c = battery_color(*level, *charging);
             icons::battery(ui.p, sq.inset_xy(0.0, sq.h * 0.18), *level, *charging, c);
         }
-        Slot::Vinyl { color, angle, art } => ui.vinyl(sq.inset(sq.w * 0.04), *angle, *color, art.as_ref()),
+        Slot::Vinyl { color, angle, art, flip } if crate::ui::look_alcove() => {
+            // Alcove: no record, the cover itself (or a note) in a rounded square
+            let (mut img, mut k) = (art.as_ref(), 1.0f32);
+            if let Some((p, old)) = flip {
+                let th = p.clamp(0.0, 1.0) * std::f32::consts::PI;
+                k = th.cos().abs().max(0.02);
+                if *p < 0.5 {
+                    img = old.as_ref();
+                }
+                ui.animate();
+            }
+            let s = sq.inset(sq.w * 0.06);
+            let r = Rect::centered(s.cx(), s.cy(), s.w * k, s.h * (0.94 + 0.06 * k));
+            match img {
+                Some(i) => ui.p.image(i, r, s.w * 0.26 * k.max(0.4), 1.0),
+                None => {
+                    ui.p.fill_rounded(r, s.w * 0.26 * k.max(0.4), color.lerp(Color::black(1.0), 0.6));
+                    ui.p.icon(Icon::Music, Rect::centered(r.cx(), r.cy(), r.w * 0.55, s.h * 0.55), Color::white(0.95));
+                }
+            }
+        }
+        Slot::Vinyl { color, angle, art, .. } => ui.vinyl(sq.inset(sq.w * 0.04), *angle, *color, art.as_ref()),
         Slot::Wave { levels, color } => {
             let r = Rect::new(wing.x, wing.y + wing.h * 0.12, wing.w, wing.h * 0.76);
             modules::voice::draw_wave(ui, r, levels, *color);
@@ -2353,6 +3032,7 @@ pub fn battery_color(level: f32, charging: bool) -> Color {
 
 /// Glyph inside a peek's status badge: a check for green, a "!" style info
 /// mark for warnings, nothing (a plain dot) for other colours.
+#[allow(dead_code)]
 fn badge_glyph(c: Color) -> Option<Icon> {
     if c == palette::GREEN {
         Some(Icon::Check)
@@ -2363,18 +3043,72 @@ fn badge_glyph(c: Color) -> Option<Icon> {
     }
 }
 
-/// Volume / brightness: the icon top left, the value top right and a bar of
-/// thin ticks underneath.
-/// Pointer dwell on the volume peek's speaker icon: (since, already switched).
+// Volume / brightness: the icon top left, the value top right and a bar of
+// thin ticks underneath.
+// Pointer dwell on the volume peek's speaker icon: (since, already switched).
 thread_local! {
     static HUD_DWELL: std::cell::Cell<(Option<Instant>, bool)> = const { std::cell::Cell::new((None, false)) };
 }
 const HUD_DWELL_SECS: f32 = 0.7;
 
+/// The sweep of a dial's ring for a level (0..1): clockwise or counter-clockwise by the setting.
+fn dial_sweep(cfg: &Config, level: f32) -> f32 {
+    let sweep = std::f32::consts::TAU * level;
+    if cfg.general.hud_clockwise {
+        sweep
+    } else {
+        -sweep
+    }
+}
+
+/// A device connecting or leaving as one big round dial: the device's icon in a ring that shows
+/// its battery (full when connected without a reading, empty when gone), the name and the state.
+fn draw_device_dial(ui: &mut Ui, body: Rect, pk: &Peek) {
+    let on = pk.subtitle.starts_with("Connected");
+    let battery = match &pk.trailing {
+        Trailing::Battery { level, .. } => Some(*level),
+        _ => None,
+    };
+    let (cx, cy) = (body.cx(), body.y + ui.cfg.appearance.notch_height + 66.0);
+    let target = battery.unwrap_or(if on { 1.0 } else { 0.0 });
+    let level = ui.glide(gkey("alcove-device-dial", 0), target);
+    let fill = if !on {
+        Color::white(0.38)
+    } else if battery.is_some_and(|l| l < 0.2) {
+        palette::RED
+    } else {
+        Color::white(0.97)
+    };
+    ui.p.stroke_circle(cx, cy, 46.0, 12.0, Color::white(0.12));
+    ui.p.arc(cx, cy, 46.0, 0.0, dial_sweep(ui.cfg, level), 12.0, fill);
+    let ic = Rect::centered(cx, cy, 40.0, 40.0);
+    let tint = if on { Color::white(0.97) } else { Color::white(0.5) };
+    ui.p.icon(pk.icon, ic, tint);
+    if !on {
+        // a slash through the icon when the device has gone
+        ui.p.line(ic.x + 4.0, ic.y + 4.0, ic.right() - 4.0, ic.bottom() - 4.0, 4.6, Color::black(0.95));
+        ui.p.line(ic.x + 4.0, ic.y + 4.0, ic.right() - 4.0, ic.bottom() - 4.0, 2.2, tint);
+    }
+    ui.p.text(
+        &pk.title,
+        Rect::new(body.x + 10.0, cy + 58.0, body.w - 20.0, 28.0),
+        &TextStyle::new(20.0, Color::white(0.95)).semibold().center(),
+    );
+    ui.p.text(
+        &pk.subtitle,
+        Rect::new(body.x + 10.0, cy + 88.0, body.w - 20.0, 20.0),
+        &TextStyle::new(13.0, palette::TEXT_DIM).medium().center(),
+    );
+}
+
 fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: Option<&str>) {
     let pad = 24.0;
     let row_y = body.bottom() - 36.0;
-    let ir = Rect::new(body.x + pad, row_y, 24.0, 24.0);
+    // Alcove: one big round dial instead of the slider (setting: General, round dial)
+    let dial = dial_height(pk, ui.cfg).is_some();
+    let dial_cy = body.y + ui.cfg.appearance.notch_height + 66.0;
+    let ir =
+        if dial { Rect::centered(body.cx(), dial_cy, 40.0, 40.0) } else { Rect::new(body.x + pad, row_y, 24.0, 24.0) };
     // Volume only: rest the pointer on the speaker for a moment to move to the next output device
     let mut hint = false;
     if pk.key == Some("osd-volume") {
@@ -2408,12 +3142,83 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
             if go.0 < 1.0 {
                 ui.animate();
             }
-            // a soft disc fills in behind the icon while the dwell runs
-            ui.p.fill_circle(ir.cx(), ir.cy(), 17.0 * go.0.max(0.35), Color::white(0.10 * go.0.max(0.4)));
         }
         if go.1 {
             modules::osd::request_next_output(ui.bus);
         }
+    }
+    if dial {
+        let fill = if color.a < 0.9 {
+            Color::white(0.38)
+        } else if color == palette::GREEN || color == palette::RED || color == palette::ORANGE {
+            color
+        } else {
+            Color::white(0.97)
+        };
+        let level = ui.glide(gkey("alcove-hud", 0), frac.clamp(0.0, 1.0));
+        // a thick ring with round ends that fills from the top, in the direction chosen in Settings
+        ui.p.stroke_circle(body.cx(), dial_cy, 46.0, 12.0, Color::white(0.12));
+        ui.p.arc(body.cx(), dial_cy, 46.0, 0.0, dial_sweep(ui.cfg, level), 12.0, fill);
+        let battery = pk.key == Some("battery");
+        if battery {
+            // a battery in the middle of the ring (with a bolt while charging)
+            let charging = text.is_some_and(|t| t.starts_with("Charging") || t.starts_with("Fully"));
+            crate::alcove::battery_glyph(ui, Rect::centered(body.cx(), dial_cy, 46.0, 24.0), frac, charging);
+        } else {
+            ui.p.icon(pk.icon, ir, fill.lerp(Color::white(1.0), 0.2));
+        }
+        let label = Rect::new(body.x + 8.0, dial_cy + 60.0, body.w - 16.0, 30.0);
+        // the big line, and a small one under it ("Charging" over "45%")
+        let pct = format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0);
+        let (big, small) = match text {
+            Some(t) if battery => match t.split_once(" · ") {
+                Some((status, p)) => (p.to_string(), Some(status.to_string())),
+                None => (pct, Some(t.to_string())),
+            },
+            Some(t) => (t.to_string(), None),
+            None => (pct, None),
+        };
+        if hint {
+            ui.p.text("Switch output", label, &TextStyle::new(13.0, palette::TEXT_DIM).medium().center());
+        } else {
+            ui.p.text(&big, label, &TextStyle::new(24.0, Color::white(0.95)).semibold().display().center());
+            if let Some(sm) = small {
+                let line = Rect::new(body.x + 8.0, dial_cy + 90.0, body.w - 16.0, 20.0);
+                ui.p.text(&sm, line, &TextStyle::new(13.0, palette::TEXT_DIM).medium().center());
+            }
+        }
+        return;
+    }
+    if crate::ui::look_alcove() {
+        // a round, quiet pill: the icon, then one thick capsule that fills with the level
+        let fill = if color.a < 0.9 {
+            Color::white(0.38)
+        } else if color == palette::GREEN || color == palette::RED || color == palette::ORANGE {
+            color
+        } else {
+            Color::white(0.97)
+        };
+        ui.p.icon(pk.icon, ir, fill.lerp(Color::white(1.0), 0.2));
+        let level = ui.glide(gkey("alcove-hud", 0), frac.clamp(0.0, 1.0));
+        let bx = ir.right() + 16.0;
+        if hint {
+            ui.p.text("Switch output", Rect::new(bx, ir.y, 140.0, ir.h), &TextStyle::new(12.5, palette::TEXT_DIM));
+        } else {
+            let tw = match text {
+                Some(t) => ui.p.measure(t, &TextStyle::new(13.0, Color::white(0.85)).medium()).0 + 14.0,
+                None => 0.0,
+            };
+            let bar = Rect::new(bx, ir.cy() - 6.5, (body.right() - pad - tw - bx).max(30.0), 13.0);
+            crate::alcove::meter(ui, bar, level, fill);
+            if let Some(t) = text {
+                ui.p.text(
+                    t,
+                    Rect::new(bar.right() + 10.0, ir.y, tw, ir.h),
+                    &TextStyle::new(13.0, Color::white(0.85)).medium().right(),
+                );
+            }
+        }
+        return;
     }
     ui.p.icon(pk.icon, ir, color);
     let frac = frac.clamp(0.0, 1.0);
@@ -2429,7 +3234,7 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
         if color.a >= 0.9 {
             ui.ticks_hud(bar, frac); // blue with white highlights
         } else {
-            ui.ticks_ex(bar, frac, color, true); // muted: stays quiet
+            ui.beams(|ui| ui.ticks_ex(bar, frac, color, true)); // muted: stays quiet
         }
     }
 }
@@ -2441,6 +3246,57 @@ thread_local! {
 
 /// When (0..1 of the peek) the scan gives way to the handwritten hello.
 const SCAN_HELLO_AT: f32 = 0.46;
+
+/// The unlock greeting in the Alcove look: a big open padlock in the middle of the same thick ring
+/// the volume dial uses. The ring fills, the lock opens, then "Hello" and the name come in below.
+fn draw_scan_alcove(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
+    let alpha = ui.p.alpha;
+    let cx = body.cx();
+    let cy = body.y + ui.cfg.appearance.notch_height + 66.0;
+    let pop = smoothstep(0.0, 0.12, t);
+    let fade = 1.0 - smoothstep(0.90, 1.0, t);
+    let fill = smoothstep(0.06, 0.42, t);
+    let done = smoothstep(0.40, 0.48, t);
+
+    // the ring: a faint track and a thick arc with round ends, in the direction chosen in Settings
+    let r = 46.0 * (0.9 + 0.1 * pop);
+    ui.p.alpha = alpha * pop * fade;
+    ui.p.stroke_circle(cx, cy, r, 12.0, Color::white(0.12));
+    ui.p.arc(cx, cy, r, 0.0, dial_sweep(ui.cfg, fill), 12.0, Color::white(0.97));
+
+    // the closed lock gives way to the open one
+    ui.p.alpha = alpha * pop * fade * (1.0 - done);
+    ui.p.icon(Icon::Lock, Rect::centered(cx, cy, 40.0, 40.0), Color::white(0.97));
+    let k = 0.75 + 0.25 * done;
+    ui.p.alpha = alpha * fade * done;
+    ui.p.icon(Icon::Unlock, Rect::centered(cx, cy, 44.0 * k, 44.0 * k), Color::white(1.0));
+
+    // "Hello" first, the name a beat later
+    let hello = smoothstep(0.50, 0.62, t);
+    ui.p.alpha = alpha * hello * fade;
+    ui.p.text(
+        "Hello",
+        Rect::new(body.x + 8.0, cy + 60.0 + 8.0 * (1.0 - hello), body.w - 16.0, 34.0),
+        &TextStyle::new(28.0, Color::white(0.97)).semibold().display().center(),
+    );
+    let name = hello_name(&pk.title);
+    if !name.is_empty() {
+        let nm = smoothstep(0.62, 0.74, t);
+        ui.p.alpha = alpha * nm * fade;
+        let mut size = 20.0;
+        let (nw, _) = ui.p.measure(name, &TextStyle::new(size, Color::white(1.0)).semibold());
+        size *= ((body.w - 36.0) / nw.max(1.0)).min(1.0);
+        ui.p.text(
+            name,
+            Rect::new(body.x + 8.0, cy + 96.0 + 8.0 * (1.0 - nm), body.w - 16.0, 28.0),
+            &TextStyle::new(size, Color::white(0.62)).semibold().center(),
+        );
+    }
+    ui.p.alpha = alpha;
+    if t < 0.95 {
+        ui.animate();
+    }
+}
 
 /// The name after "Hello" in the peek title ("" for a plain hello).
 fn hello_name(title: &str) -> &str {
@@ -2581,6 +3437,9 @@ fn hello_points() -> &'static [(f32, f32)] {
 /// a check, then the stage shrinks and "Hello" (or "Hello <name>") is written
 /// out in handwriting with a beam at the pen's edge. `t` runs 0..1 over the peek.
 fn draw_scan(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
+    if crate::ui::look_alcove() {
+        return draw_scan_alcove(ui, body, pk, t);
+    }
     let blue = palette::BLUE;
     let cx = body.cx();
     let cy = body.y + 66.0;
@@ -2799,8 +3658,12 @@ fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek, left: f32, swap: Option<(f32, &
         draw_hud(ui, body, pk, *frac, *color, text.as_deref());
         return;
     }
+    if dial_height(pk, ui.cfg).is_some() {
+        draw_device_dial(ui, body, pk);
+        return;
+    }
     // text peeks carry a rail of ticks along the bottom that drains while the peek is up
-    let rail = !pk.is_compact();
+    let rail = !pk.is_compact() && !crate::ui::look_alcove();
     let inner = Rect::new(body.x + 22.0, body.y + 8.0, body.w - 44.0, body.h - 16.0 - if rail { 12.0 } else { 0.0 });
     if rail {
         let c = pk.accent.lerp(Color::white(1.0), 0.35);
@@ -2829,11 +3692,22 @@ fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek, left: f32, swap: Option<(f32, &
 
 /// Icon or cover, title, subtitle and trailing part of a text peek, inside `inner`.
 fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
+    if crate::ui::look_alcove() {
+        return crate::alcove::peek_content(ui, inner, pk);
+    }
     let is = if pk.is_compact() { 22.0 } else { 26.0 };
     let ir = Rect::new(inner.x, inner.cy() - is * 0.5, is, is);
     match &pk.image {
         Some(img) => ui.p.image(img, ir, 8.0, 1.0),
-        None => ui.p.icon(pk.icon, ir.inset(is * 0.04), Color::white(0.96)),
+        None => {
+            if crate::ui::look_alcove() {
+                // a round tint of the accent with the icon inside
+                ui.p.fill_circle(ir.cx(), ir.cy(), is * 0.62, pk.accent.with_a(0.24));
+                ui.p.icon(pk.icon, ir.inset(is * 0.06), pk.accent.lerp(Color::white(1.0), 0.25));
+            } else {
+                ui.p.icon(pk.icon, ir.inset(is * 0.04), Color::white(0.96))
+            }
+        }
     }
     let badge = false;
     if pk.is_compact() {
@@ -2875,8 +3749,67 @@ fn draw_peek_content(ui: &mut Ui, inner: Rect, pk: &Peek) {
     }
 }
 
+/// The open notch. In the Alcove look the page dots sit on top of it, and while their page list
+/// is open the page underneath does not react to the mouse.
 #[allow(clippy::too_many_arguments)]
 fn draw_expanded(
+    ui: &mut Ui,
+    full: Rect,
+    view: Rect,
+    modules: &mut [Box<dyn Module>],
+    started: &[bool],
+    tabs: &[(ModuleId, Icon, String)],
+    page: ModuleId,
+    trans: Option<(ModuleId, f32, f32)>,
+    indicators: &[Indicator],
+    snaps: Option<(&Snapshot, &Snapshot)>,
+) {
+    if !crate::ui::look_alcove() {
+        return draw_expanded_core(ui, full, modules, started, tabs, page, trans, indicators, snaps);
+    }
+    crate::ui::reset_wheel_taken();
+    draw_expanded_core(ui, full, modules, started, tabs, page, trans, indicators, snaps);
+    crate::alcove::rail(ui, view, tabs, page);
+
+    // anywhere on the notch: a swipe sideways, or the wheel where nothing scrolls, turns the page
+    if tabs.is_empty() || !ui.hovered(full) {
+        return;
+    }
+    let (h, v) = (ui.input.hwheel, ui.input.wheel);
+    let dir = if h != 0.0 {
+        if h > 0.0 {
+            1
+        } else {
+            -1
+        }
+    } else if v != 0.0 && !crate::ui::wheel_taken() {
+        if v < 0.0 {
+            1
+        } else {
+            -1
+        }
+    } else {
+        0
+    };
+    if dir == 0 {
+        return;
+    }
+    let ready = WHEEL_FLIP.with(|c| c.get().is_none_or(|t| t.elapsed() > Duration::from_millis(450)));
+    if !ready {
+        return;
+    }
+    let n = tabs.len();
+    let next = match tabs.iter().position(|t| t.0 == page) {
+        Some(i) if dir > 0 => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None => 0,
+    };
+    ui.fx.open_page = Some(tabs[next].0);
+    WHEEL_FLIP.with(|c| c.set(Some(Instant::now())));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_expanded_core(
     ui: &mut Ui,
     full: Rect,
     modules: &mut [Box<dyn Module>],
@@ -2887,141 +3820,172 @@ fn draw_expanded(
     indicators: &[Indicator],
     snaps: Option<(&Snapshot, &Snapshot)>,
 ) {
-    // header: tabs on the left, status and the settings gear on the right
-    let ts = 32.0;
-    let hy = full.y + (HEADER_H - ts) * 0.5 - 2.0;
-    let mut x = full.x + PAD;
-    // bare icons; the open tab is bright with a short lit beam under it
-    let tab_style = |selected: bool| ButtonStyle {
-        fg: if selected { Color::white(1.0) } else { Color::white(0.50) },
-        bg: Color::white(0.0),
-        hover_bg: Color::white(0.0),
-        radius: 999.0,
-        icon_scale: 0.54,
-    };
-    let avail = full.w - 2.0 * PAD - 200.0;
-    let tab = ((avail + 4.0) / tabs.len().max(1) as f32 - 4.0).clamp(22.0, ts);
-    for (id, icon, _title) in tabs {
-        let sel = *id == page;
-        let r = Rect::new(x, hy + (ts - tab) * 0.5, tab, tab);
-        x += tab + 4.0;
-        let hover = ui.hovered(r);
-        if hover {
-            ui.hot = true;
-        }
-        let lit = ui.glide(gkey(id, 11), if sel { 1.0 } else { 0.0 });
-        let fg = Color::white(if hover { 0.85 } else { 0.50 }).lerp(Color::white(1.0), lit);
-        ui.p.icon(*icon, r.center_square(ts * 0.52), fg);
-        if lit > 0.02 {
-            let bw = tab * 0.62 * lit;
-            ui.ticks(Rect::new(r.cx() - bw * 0.5, hy + ts + 1.0, bw, 3.0), 1.0, Color::white(0.9 * lit));
-        }
-        if !sel && ui.clicked(r) {
-            ui.fx.open_page = Some(id);
-        }
-    }
-    // scroll the wheel over the header to flip through the tabs
-    let wheel = ui.wheel(Rect::new(full.x, full.y, full.w, HEADER_H));
-    if wheel != 0.0 && !tabs.is_empty() {
-        let ready = WHEEL_FLIP.with(|c| c.get().is_none_or(|t| t.elapsed() > Duration::from_millis(450)));
-        if ready {
-            let cur = tabs.iter().position(|t| t.0 == page);
-            let next = match cur {
-                Some(i) if wheel < 0.0 => (i + 1).min(tabs.len() - 1),
-                Some(i) => i.saturating_sub(1),
-                // e.g. on the settings page: jump back into the tabs
-                None => 0,
-            };
-            if cur != Some(next) {
-                ui.fx.open_page = Some(tabs[next].0);
+    if crate::ui::look_alcove() {
+        // no header: the page dots on the right edge do the navigating
+    } else if crate::ui::look_bloom() {
+        crate::bloom::header(ui, full, modules, tabs, page, indicators);
+    } else {
+        // header: tabs on the left, status and the settings gear on the right
+        let ts = 32.0;
+        let hy = full.y + (HEADER_H - ts) * 0.5 - 2.0;
+        let mut x = full.x + PAD;
+        // bare icons; the open tab is bright with a short lit beam under it
+        let tab_style = |selected: bool| ButtonStyle {
+            fg: if selected { Color::white(1.0) } else { Color::white(0.50) },
+            bg: Color::white(0.0),
+            hover_bg: Color::white(0.0),
+            radius: 999.0,
+            icon_scale: 0.54,
+        };
+        let avail = full.w - 2.0 * PAD - 200.0;
+        let tab = ((avail + 4.0) / tabs.len().max(1) as f32 - 4.0).clamp(22.0, ts);
+        for (id, icon, _title) in tabs {
+            let sel = *id == page;
+            let r = Rect::new(x, hy + (ts - tab) * 0.5, tab, tab);
+            x += tab + 4.0;
+            let hover = ui.hovered(r);
+            if hover {
+                ui.hot = true;
             }
-            WHEEL_FLIP.with(|c| c.set(Some(Instant::now())));
+            let lit = ui.glide(gkey(id, 11), if sel { 1.0 } else { 0.0 });
+            let fg = Color::white(if hover { 0.85 } else { 0.50 }).lerp(Color::white(1.0), lit);
+            ui.p.icon(*icon, r.center_square(ts * 0.52), fg);
+            if lit > 0.02 {
+                let bw = tab * 0.62 * lit;
+                ui.underline(Rect::new(r.cx() - bw * 0.5, hy + ts + 1.0, bw, 3.0), Color::white(0.9 * lit));
+            }
+            if !sel && ui.clicked(r) {
+                ui.fx.open_page = Some(id);
+            }
         }
-    }
-    // status (right): the settings gear sits at the far end, next to the battery
-    let mut rx = full.right() - PAD;
-    if modules.iter().enumerate().any(|(i, m)| started[i] && m.id() == "settings") {
-        let g = Rect::new(rx - ts, hy, ts, ts);
-        if ui.icon_button(g, Icon::Settings, tab_style(page == "settings")) {
-            ui.fx.open_page = Some("settings");
-        }
-        if page == "settings" {
-            ui.ticks(Rect::new(g.cx() - ts * 0.31, hy + ts + 1.0, ts * 0.62, 3.0), 1.0, Color::white(0.9));
-        }
-        rx = g.x - 12.0;
-    }
-    for ind in indicators.iter().rev() {
-        if let Some((level, charging)) = ind.battery {
-            let pct = format!("{:.0}%", level * 100.0);
-            let st = TextStyle::new(12.5, palette::TEXT_DIM).medium().right();
-            let (pw, _) = ui.p.measure(&pct, &st);
-            let br = Rect::new(rx - 30.0, hy + ts * 0.5 - 7.0, 30.0, 14.0);
-            icons::battery(ui.p, br, level, charging, battery_color(level, charging));
-            let mut tx = br.x - 8.0;
-            // time left (or an infinity sign while plugged in), always in blue
-            if let Some(extra) = &ind.label {
-                let blue = palette::BLUE;
-                if extra == "\u{221E}" {
-                    let (cx, cy, a) = (tx - 11.0, hy + ts * 0.5, 9.0);
-                    let pt = |t: f32| {
-                        let d = 1.0 + t.sin() * t.sin();
-                        (cx + a * t.cos() / d, cy + a * t.sin() * t.cos() / d)
-                    };
-                    let n = 28;
-                    for k in 0..n {
-                        let t0 = k as f32 / n as f32 * std::f32::consts::TAU;
-                        let t1 = (k + 1) as f32 / n as f32 * std::f32::consts::TAU;
-                        let (x0, y0) = pt(t0);
-                        let (x1, y1) = pt(t1);
-                        ui.p.line(x0, y0, x1, y1, 1.9, blue);
-                    }
-                    tx -= 28.0;
-                } else {
-                    let es = TextStyle::new(12.5, blue).medium().right();
-                    let (ew, _) = ui.p.measure(extra, &es);
-                    ui.p.text(extra, Rect::new(tx - ew - 2.0, hy, ew + 2.0, ts), &es);
-                    tx -= ew + 12.0;
+        // scroll the wheel over the header to flip through the tabs
+        let wheel = ui.wheel(Rect::new(full.x, full.y, full.w, HEADER_H));
+        if wheel != 0.0 && !tabs.is_empty() {
+            let ready = WHEEL_FLIP.with(|c| c.get().is_none_or(|t| t.elapsed() > Duration::from_millis(450)));
+            if ready {
+                let cur = tabs.iter().position(|t| t.0 == page);
+                let next = match cur {
+                    Some(i) if wheel < 0.0 => (i + 1).min(tabs.len() - 1),
+                    Some(i) => i.saturating_sub(1),
+                    // e.g. on the settings page: jump back into the tabs
+                    None => 0,
+                };
+                if cur != Some(next) {
+                    ui.fx.open_page = Some(tabs[next].0);
                 }
+                WHEEL_FLIP.with(|c| c.set(Some(Instant::now())));
             }
-            ui.p.text(&pct, Rect::new(tx - pw - 2.0, hy, pw + 2.0, ts), &st);
-            rx = tx - pw - 14.0;
-        } else if let Some(icon) = ind.icon {
-            let r = Rect::new(rx - 22.0, hy + (ts - 22.0) * 0.5, 22.0, 22.0);
-            ui.p.icon(icon, r.inset(3.0), ind.color);
-            rx -= 28.0;
+        }
+        // status (right): the settings gear sits at the far end, next to the battery
+        let mut rx = full.right() - PAD;
+        if modules.iter().enumerate().any(|(i, m)| started[i] && m.id() == "settings") {
+            let g = Rect::new(rx - ts, hy, ts, ts);
+            if ui.icon_button(g, Icon::Settings, tab_style(page == "settings")) {
+                ui.fx.open_page = Some("settings");
+            }
+            if page == "settings" {
+                ui.underline(Rect::new(g.cx() - ts * 0.31, hy + ts + 1.0, ts * 0.62, 3.0), Color::white(0.9));
+            }
+            rx = g.x - 12.0;
+        }
+        for ind in indicators.iter().rev() {
+            if let Some((level, charging)) = ind.battery {
+                let pct = format!("{:.0}%", level * 100.0);
+                let st = TextStyle::new(12.5, palette::TEXT_DIM).medium().right();
+                let (pw, _) = ui.p.measure(&pct, &st);
+                let br = Rect::new(rx - 30.0, hy + ts * 0.5 - 7.0, 30.0, 14.0);
+                icons::battery(ui.p, br, level, charging, battery_color(level, charging));
+                let mut tx = br.x - 8.0;
+                // time left (or an infinity sign while plugged in), always in blue
+                if let Some(extra) = &ind.label {
+                    let blue = palette::BLUE;
+                    if extra == "\u{221E}" {
+                        let (cx, cy, a) = (tx - 11.0, hy + ts * 0.5, 9.0);
+                        let pt = |t: f32| {
+                            let d = 1.0 + t.sin() * t.sin();
+                            (cx + a * t.cos() / d, cy + a * t.sin() * t.cos() / d)
+                        };
+                        let n = 28;
+                        for k in 0..n {
+                            let t0 = k as f32 / n as f32 * std::f32::consts::TAU;
+                            let t1 = (k + 1) as f32 / n as f32 * std::f32::consts::TAU;
+                            let (x0, y0) = pt(t0);
+                            let (x1, y1) = pt(t1);
+                            ui.p.line(x0, y0, x1, y1, 1.9, blue);
+                        }
+                        tx -= 28.0;
+                    } else {
+                        let es = TextStyle::new(12.5, blue).medium().right();
+                        let (ew, _) = ui.p.measure(extra, &es);
+                        ui.p.text(extra, Rect::new(tx - ew - 2.0, hy, ew + 2.0, ts), &es);
+                        tx -= ew + 12.0;
+                    }
+                }
+                ui.p.text(&pct, Rect::new(tx - pw - 2.0, hy, pw + 2.0, ts), &st);
+                rx = tx - pw - 14.0;
+            } else if let Some(icon) = ind.icon {
+                let r = Rect::new(rx - 22.0, hy + (ts - 22.0) * 0.5, 22.0, 22.0);
+                ui.p.icon(icon, r.inset(3.0), ind.color);
+                rx -= 28.0;
+            }
         }
     }
 
-    let content = Rect::new(full.x + PAD, full.y + HEADER_H, full.w - 2.0 * PAD, full.h - HEADER_H - BOTTOM_PAD);
+    let content = Rect::new(
+        full.x + side_pad(),
+        full.y + top_h(),
+        full.w - side_pad() - right_pad(),
+        full.h - top_h() - bottom_pad(),
+    );
     let Some((from, dir, t)) = trans else {
         draw_body(ui, content, modules, started, page);
         return;
     };
+    // the page that is leaving keeps its own width and height
+    let from_size = page_size(ui.cfg, modules, started, from);
+    let from_content = page_content(full.cx(), full.y, from_size);
     // One page is drawn at a time: the old one slides a little and fades out, then the new one
     // slides in and fades up. (Drawing both at once doubled the work for no visible gain.)
     const SLIDE: f32 = 16.0;
     const SPLIT: f32 = 0.45;
     let base = ui.p.alpha;
     let was_interactive = ui.interactive;
-    let clip = Rect::new(full.x, content.y - 4.0, full.w, content.h + 8.0);
+    let wide = full.w.max(from_size.0);
+    let clip = Rect::new(full.cx() - wide * 0.5, content.y - 4.0, wide, content.h.max(from_content.h) + 8.0);
     ui.p.push_clip(clip);
+    // Alcove: the pages move the way the wheel does (up and down) and smear along that
+    // direction while they move, like a quick scroll
+    let al = crate::ui::look_alcove();
+    let slide = if al { 28.0 } else { SLIDE };
     if t < SPLIT {
         let u = t / SPLIT;
-        ui.p.alpha = base * (1.0 - smoothstep(0.0, 1.0, u));
+        let e = smoothstep(0.0, 1.0, u);
+        ui.p.alpha = base * (1.0 - e);
         ui.interactive = false;
-        let dx = (-dir * SLIDE * smoothstep(0.0, 1.0, u)).round();
+        let (dx, dy) = if al { (0.0, (-dir * slide * e).round()) } else { ((-dir * slide * e).round(), 0.0) };
         match snaps {
-            Some((old, _)) => ui.p.snapshot(old, dx, 0.0, 1.0),
-            None => draw_body(ui, content.translate(dx, 0.0), modules, started, from),
+            Some((old, _)) if al => snapshot_depth(ui, old, 1.0 - 0.04 * e, -dir * slide * 0.6 * e, 0.8 * e),
+            Some((old, _)) => ui.p.snapshot(old, dx, dy, 1.0),
+            None => draw_body(ui, from_content.translate(dx, dy), modules, started, from),
         }
     } else {
         let u = (t - SPLIT) / (1.0 - SPLIT);
-        ui.p.alpha = base * smoothstep(0.0, 0.8, u);
+        // Alcove: the new page is already clearly there while it is still being stretched
+        ui.p.alpha = base * if al { smoothstep(0.0, 0.4, u) } else { smoothstep(0.0, 0.8, u) };
         ui.interactive = was_interactive && u > 0.6;
-        let dx = (dir * SLIDE * (1.0 - smoothstep(0.0, 1.0, u))).round();
+        let e = 1.0 - smoothstep(0.0, 1.0, u);
+        let (dx, dy) = if al { (0.0, (dir * slide * e).round()) } else { ((dir * slide * e).round(), 0.0) };
         match snaps {
-            Some((_, new)) => ui.p.snapshot(new, dx, 0.0, 1.0),
-            None => draw_body(ui, content.translate(dx, 0.0), modules, started, page),
+            // Alcove: the new page rises into place from a little larger and further down, goes a
+            // touch past and settles, a soft blur clearing as it lands
+            Some((_, new)) if al => {
+                let c = 0.6_f32;
+                let back = 1.0 + (c + 1.0) * (u - 1.0).powi(3) + c * (u - 1.0).powi(2);
+                let k = 1.0 - back;
+                snapshot_depth(ui, new, 1.0 + 0.04 * k, dir * slide * 1.2 * k, 0.8 * k.max(0.0));
+            }
+            Some((_, new)) => ui.p.snapshot(new, dx, dy, 1.0),
+            None => draw_body(ui, content.translate(dx, dy), modules, started, page),
         }
     }
     ui.p.alpha = base;
@@ -3029,8 +3993,35 @@ fn draw_expanded(
     ui.p.pop_clip();
 }
 
+/// A page picture drawn between sharp and soft: `blur` 0 is the crisp picture, 1 the blurred
+/// copy. The two are cross-faded, so the page seems to lose or gain focus as it moves.
+/// A page picture scaled about its centre and shifted, drawn between sharp and soft like
+/// `snapshot_motion`: one solid piece, so nothing can look cut while it moves.
+fn snapshot_depth(ui: &mut Ui, s: &Snapshot, scale: f32, dy: f32, blur: f32) {
+    let dy = dy.round();
+    if blur < 0.03 {
+        ui.p.snapshot_scaled(s, scale, 0.0, dy, 1.0, false);
+    } else {
+        ui.p.snapshot_scaled(s, scale, 0.0, dy, 1.0 - blur, false);
+        ui.p.snapshot_scaled(s, scale, 0.0, dy, blur, true);
+    }
+}
+
+fn snapshot_motion(ui: &mut Ui, s: &Snapshot, dx: f32, dy: f32, blur: f32) {
+    if blur < 0.03 {
+        ui.p.snapshot(s, dx, dy, 1.0);
+    } else {
+        ui.p.snapshot(s, dx, dy, 1.0 - blur);
+        ui.p.snapshot_soft(s, dx, dy, blur);
+    }
+}
+
 fn draw_body(ui: &mut Ui, content: Rect, modules: &mut [Box<dyn Module>], started: &[bool], page: ModuleId) {
-    if page == HOME {
+    if page == HOME && crate::ui::look_alcove() {
+        crate::alcove::home(ui, content, modules);
+    } else if page == HOME && crate::ui::look_bloom() {
+        crate::bloom::control_center(ui, content, modules, started);
+    } else if page == HOME {
         draw_home(ui, content, modules, started);
     } else if let Some(i) = modules.iter().position(|m| m.id() == page) {
         modules[i].draw_page(ui, content);
@@ -3096,7 +4087,7 @@ fn draw_home(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], started: &[b
 }
 
 /// Local time pieces for the flip clock: (hour, minute, second, "AM"/"PM" or "", date text).
-fn clock_parts() -> (u8, u8, u8, String, String) {
+pub(crate) fn clock_parts() -> (u8, u8, u8, String, String) {
     let st = unsafe { GetLocalTime() };
     // the formatted time and the date text only change when the minute does: work them out once per minute
     thread_local! {
@@ -3162,7 +4153,11 @@ fn draw_clock_card(ui: &mut Ui, r: Rect) {
     // size the tiles so six digits and the gaps fill the card (but never get huge)
     let tw = ((inner.w - 24.0) / 6.6).clamp(26.0, 50.0);
     let th = (tw * 1.28).min(inner.h - 62.0).max(34.0);
-    let used = ui.clock(inner.x, inner.y, tw, th, h, m, s, 0);
+    let used = if crate::ui::look_nothing() {
+        draw_dot_clock(ui, Rect::new(inner.x, inner.y, inner.w, th), h, m)
+    } else {
+        ui.clock(inner.x, inner.y, tw, th, h, m, s, 0)
+    };
     if !suffix.is_empty() {
         ui.p.text(
             &suffix,
@@ -3174,6 +4169,51 @@ fn draw_clock_card(ui: &mut Ui, r: Rect) {
     let top = inner.y + th + 10.0;
     let strip = Rect::new(inner.x, top, inner.w, (inner.bottom() - top).clamp(30.0, 48.0));
     draw_calendar(ui, strip);
+}
+
+/// 5x7 dot-matrix digits, one row per byte (bit 4 = leftmost column).
+const DOT_DIGITS: [[u8; 7]; 10] = [
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+    [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+];
+
+/// The time as a dot-matrix display (the Nothing look): white dots, a red colon, faint unlit dots.
+/// Returns the width used.
+fn draw_dot_clock(ui: &mut Ui, area: Rect, h: u8, m: u8) -> f32 {
+    // 4 digits of 5 columns, a 1-column gap between digits, and a 3-column colon block
+    const COLS: f32 = 27.0;
+    let pitch = (area.h / 7.0).min(area.w / COLS).max(3.0);
+    let dot = pitch * 0.34;
+    let top = area.y + (area.h - pitch * 7.0).max(0.0) * 0.5;
+    let digits = [h / 10 % 10, h % 10, m / 10 % 10, m % 10];
+    let mut col = 0.0;
+    for (k, d) in digits.iter().enumerate() {
+        if k == 2 {
+            // the colon: two red dots
+            let cx = area.x + (col + 1.5) * pitch;
+            ui.p.fill_circle(cx, top + 2.5 * pitch, dot, crate::ui::NOTHING_RED);
+            ui.p.fill_circle(cx, top + 4.5 * pitch, dot, crate::ui::NOTHING_RED);
+            col += 3.0 + 1.0;
+        }
+        let rows = &DOT_DIGITS[*d as usize];
+        for (ry, bits) in rows.iter().enumerate() {
+            for cx in 0..5 {
+                let on = bits & (0b10000 >> cx) != 0;
+                let c = if on { Color::white(0.96) } else { Color::white(0.07) };
+                ui.p.fill_circle(area.x + (col + cx as f32 + 0.5) * pitch, top + (ry as f32 + 0.5) * pitch, dot, c);
+            }
+        }
+        col += 5.0 + 1.0;
+    }
+    (col - 1.0) * pitch
 }
 
 thread_local! {

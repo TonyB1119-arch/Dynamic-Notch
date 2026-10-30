@@ -45,10 +45,18 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/dynamic-notch.exe", README.md, LICENSE, CHANGELOG.md, .env.example $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+      - name: Installer (x64)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $v = "$env:TAG".TrimStart('v', 'V')
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" "/DExePath=..\target\${{ matrix.target }}\release\dynamic-notch.exe" installer\DynamicNotch.iss
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.arch }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.exe
 
   publish:
     needs: build
@@ -63,7 +71,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: dist
-        run: sha256sum *.zip | tee SHA256SUMS.txt
+        run: sha256sum *.zip *.exe 2>/dev/null | tee SHA256SUMS.txt
       - name: Release notes
         run: |
           version="${TAG#v}"
@@ -77,7 +85,9 @@ jobs:
 
           ### Install
 
-          Download the zip for your PC, unzip it anywhere and run `dynamic-notch.exe`. Nothing else to install.
+          **Installer:** download `DynamicNotch-Setup.exe` and run it. It installs for your user only (no administrator prompt) and adds a Start menu shortcut. Updates later come from Settings → General → Updates.
+
+          **Portable:** download the zip for your PC, unzip it anywhere and run `dynamic-notch.exe`. Nothing else to install.
 
           | Zip | For |
           | --- | --- |

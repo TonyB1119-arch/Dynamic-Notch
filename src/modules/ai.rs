@@ -425,17 +425,23 @@ impl Module for Ai {
         // --- input field ---------------------------------------------------
         let field = Rect::new(r.x, r.y, r.w, INPUT_H);
         let accent = palette::PURPLE;
-        ui.p.fill_rect(
-            Rect::new(field.x, field.bottom() - 1.0, field.w, 1.0),
-            accent.with_a(if focused { 0.60 } else { 0.18 }),
-        );
+        if crate::ui::look_alcove() {
+            // a roomy capsule field
+            ui.p.fill_rounded(field, field.h * 0.5, Color::white(if focused { 0.11 } else { 0.07 }));
+        } else {
+            ui.p.fill_rect(
+                Rect::new(field.x, field.bottom() - 1.0, field.w, 1.0),
+                accent.with_a(if focused { 0.60 } else { 0.18 }),
+            );
+        }
         if ui.clicked(field) {
             ui.fx.keyboard_focus = Some(true);
         }
         if ui.hovered(field) {
             ui.hot = true;
         }
-        let ic = Rect::new(field.x + 12.0, field.cy() - 9.0, 18.0, 18.0);
+        let ic = Rect::new(field.x + 12.0, field.cy() - 9.0, 18.0, 18.0)
+            .translate(if crate::ui::look_alcove() { 8.0 } else { 0.0 }, 0.0);
         ui.p.icon(Icon::Sparkle, ic, accent);
         let btn = Rect::new(field.right() - 34.0, field.cy() - 14.0, 28.0, 28.0);
         let text_r = Rect::new(ic.right() + 10.0, field.y, btn.x - ic.right() - 16.0, field.h);
@@ -598,7 +604,20 @@ impl Module for Ai {
 /// stretch sliding along it, a shimmering label and the elapsed time.
 fn draw_loader(ui: &mut Ui, r: Rect, t: f32, color: Color) {
     let grid = 40.0;
-    ui.ticks_sweep(Rect::new(r.x, r.cy() - 5.0, grid, 10.0), color);
+    if crate::ui::look_alcove() {
+        // three dots that rise and fall one after the other
+        for k in 0..3 {
+            let ph = (t * 4.0 - k as f32 * 0.7).sin() * 0.5 + 0.5;
+            ui.p.fill_circle(
+                r.x + 6.0 + k as f32 * 14.0,
+                r.cy() - 3.0 * ph,
+                3.4 + 1.0 * ph,
+                color.with_a(0.5 + 0.5 * ph),
+            );
+        }
+    } else {
+        ui.ticks_sweep(Rect::new(r.x, r.cy() - 5.0, grid, 10.0), color);
+    }
     let label = "Thinking";
     let st = TextStyle::new(13.0, palette::TEXT_FAINT).medium();
     let (lw, _) = ui.p.measure(label, &st);

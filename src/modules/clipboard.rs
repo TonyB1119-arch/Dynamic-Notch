@@ -64,11 +64,13 @@ pub struct Clipboard {
     max: usize,
     hwnd: SendHwnd,
     self_write: bool,
+    /// Alcove: which items show (0 all, 1 text, 2 images, 3 files).
+    filter: usize,
 }
 
 impl Clipboard {
     pub fn new() -> Self {
-        Self { items: Vec::new(), next_id: 1, max: 8, hwnd: SendHwnd(0), self_write: false }
+        Self { items: Vec::new(), next_id: 1, max: 8, hwnd: SendHwnd(0), self_write: false, filter: 0 }
     }
 
     fn push(&mut self, kind: Kind) -> u64 {
@@ -209,6 +211,9 @@ impl Module for Clipboard {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
+        if crate::ui::look_alcove() {
+            return if self.items.is_empty() { 120.0 } else { 178.0 };
+        }
         if self.items.is_empty() {
             110.0
         } else {
@@ -217,6 +222,9 @@ impl Module for Clipboard {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        if crate::ui::look_alcove() {
+            return self.draw_alcove(ui, r);
+        }
         let (head, body) = r.split_top(24.0, 4.0);
         ui.caption("CLIPBOARD HISTORY", Rect::new(head.x, head.y, 200.0, head.h));
         if self.items.is_empty() {
@@ -264,6 +272,111 @@ impl Module for Clipboard {
                 copy_idx = Some(i);
             }
         }
+        if let Some(i) = copy_idx {
+            self.copy_back(i, &mut peeks);
+        }
+        for p in peeks {
+            ui.fx.peek(p);
+        }
+    }
+}
+
+impl Clipboard {
+    /// Alcove: a row of cards you scroll sideways; a click copies one back.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) {
+        let (head, body) = r.split_top(32.0, 12.0);
+        crate::alcove::title(ui, head, Icon::Clipboard, palette::BLUE, "Clipboard", "");
+        if self.items.is_empty() {
+            crate::alcove::empty(
+                ui,
+                Rect::new(r.x, head.bottom() + 6.0, r.w, r.bottom() - head.bottom() - 6.0),
+                Icon::Clipboard,
+                "Copy something and it shows up here",
+            );
+            return;
+        }
+        let group = |k: &Kind| match k {
+            Kind::Text(_) => 1,
+            Kind::Image { .. } => 2,
+            Kind::Files(_) => 3,
+        };
+        let mut counts = [self.items.len(), 0, 0, 0];
+        for it in &self.items {
+            counts[group(&it.kind)] += 1;
+        }
+        if counts[self.filter] == 0 {
+            self.filter = 0;
+        }
+        let mut x = head.x + crate::alcove::title_w(ui, head, "Clipboard");
+        for (k, name) in ["All", "Text", "Images", "Files"].iter().enumerate() {
+            if k > 0 && counts[k] == 0 {
+                continue;
+            }
+            let w = crate::alcove::chip_w(ui, name, None) + 6.0;
+            if crate::alcove::chip(ui, Rect::new(x, head.y + 2.0, w, 28.0), name, None, self.filter == k) {
+                self.filter = k;
+            }
+            x += w + 8.0;
+        }
+        let cw = crate::alcove::chip_w(ui, "Clear", None);
+        if crate::alcove::chip(ui, Rect::new(head.right() - cw, head.y + 2.0, cw, 28.0), "Clear", None, false) {
+            self.items.clear();
+            return;
+        }
+        let card_w = 176.0;
+        let gap = 10.0;
+        let filter = self.filter;
+        let visible: Vec<usize> = (0..self.items.len())
+            .filter(|&i| filter == 0 || group(&self.items[i].kind) == filter)
+            .take(MAX_ROWS.max(10))
+            .collect();
+        let n = visible.len();
+        let content_w = n as f32 * (card_w + gap) - gap;
+        let off = crate::alcove::scroll_x(ui, body, content_w, "clip-scroll");
+        let mut peeks = Vec::new();
+        let mut copy_idx = None;
+        ui.p.push_clip(body);
+        for (j, &i) in visible.iter().enumerate() {
+            let it = &self.items[i];
+            let c = Rect::new(body.x + j as f32 * (card_w + gap) - off, body.y, card_w, body.h);
+            if c.right() < body.x - 4.0 || c.x > body.right() + 4.0 {
+                continue;
+            }
+            let copyable = !matches!(it.kind, Kind::Image { .. });
+            let hover = copyable && ui.hovered(c) && ui.hovered(body);
+            if hover {
+                ui.hot = true;
+            }
+            if hover {
+                ui.p.fill_rounded(c, 24.0, Color::white(0.08));
+            }
+            // the kind of item in a round chip, and how old it is
+            ui.p.icon(it.icon(), Rect::centered(c.x + 26.0, c.y + 26.0, 15.0, 15.0), Color::white(0.85));
+            ui.p.text(
+                &fmt_age(it.at.elapsed()),
+                Rect::new(c.right() - 80.0, c.y + 14.0, 66.0, 24.0),
+                &TextStyle::new(11.5, palette::TEXT_FAINT).medium().right(),
+            );
+            let area = Rect::new(c.x + 14.0, c.y + 48.0, c.w - 28.0, c.h - 60.0);
+            match &it.thumb {
+                Some(t) => ui.p.image(t, area, 14.0, 1.0),
+                None => {
+                    let st = TextStyle::new(13.0, Color::white(0.93)).wrap().top();
+                    ui.p.push_clip(area);
+                    ui.p.text(&it.summary(), area, &st);
+                    ui.p.pop_clip();
+                }
+            }
+            if hover {
+                let b = Rect::new(c.right() - 54.0, c.bottom() - 40.0, 40.0, 28.0);
+                ui.p.fill_rounded(b, 14.0, Color::white(0.94));
+                ui.p.icon(Icon::Copy, b.center_square(14.0), palette::INK);
+                if ui.clicked(c) {
+                    copy_idx = Some(i);
+                }
+            }
+        }
+        ui.p.pop_clip();
         if let Some(i) = copy_idx {
             self.copy_back(i, &mut peeks);
         }

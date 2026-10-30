@@ -32,6 +32,8 @@ const ID: ModuleId = "control";
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 34.0;
 const LIST_H: f32 = 5.0 * ROW_H;
+/// Alcove: three rows of network cards.
+const ALC_LIST: f32 = 186.0;
 const RESCAN_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
@@ -241,6 +243,9 @@ impl Module for Wifi {
     }
 
     fn page_height(&self, _w: f32) -> f32 {
+        if crate::ui::look_alcove() {
+            return 48.0 + 12.0 + ALC_LIST + if self.prompt.is_some() { 50.0 } else { 0.0 };
+        }
         HEADER_H + 12.0 + LIST_H + if self.prompt.is_some() { 50.0 } else { 0.0 }
     }
 
@@ -264,6 +269,11 @@ impl Module for Wifi {
             self.scan();
         }
         let accent = palette::BLUE;
+        if crate::ui::look_alcove() {
+            let area = self.draw_alcove(ui, r);
+            self.draw_prompt(ui, r, area);
+            return;
+        }
 
         // --- header ---------------------------------------------------------
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
@@ -606,6 +616,163 @@ fn worker(rx: Receiver<Cmd>, bus: Bus) {
                     scan(&mut adapter, &mut avail, &bus);
                 }
             }
+        }
+    }
+}
+
+impl Wifi {
+    /// Alcove: a status strip, then the networks as soft cards, two to a row.
+    /// Returns the area the cards use.
+    fn draw_alcove(&mut self, ui: &mut Ui, r: Rect) -> Rect {
+        // one quiet white instead of blue: a connected network is simply the brightest tile
+        let accent = Color::white(0.92);
+        let live_status = self.status.clone().filter(|(_, at, _)| at.elapsed() < Duration::from_secs(5));
+        let (head_text, head_col) = match &live_status {
+            Some((t, _, good)) => (t.clone(), if *good { palette::GREEN } else { palette::ORANGE }),
+            None => (
+                match (&self.connected, self.radio_on) {
+                    (_, Some(false)) => "Wi-Fi is off".to_string(),
+                    (Some(s), _) => format!("Connected to {s}"),
+                    _ => "Not connected".to_string(),
+                },
+                palette::TEXT,
+            ),
+        };
+        if live_status.is_none() && self.status.is_some() {
+            self.status = None;
+        }
+        let head = Rect::new(r.x, r.y, r.w, 48.0);
+        let tint = if self.radio_on == Some(false) { Color::white(0.5) } else { accent };
+        let (refresh, toggled) =
+            crate::alcove::status_tile(ui, head, Icon::Wifi, tint, &head_text, head_col, self.radio_on, self.scanning);
+        if refresh {
+            self.scan();
+        }
+        if toggled {
+            if let Some(on) = self.radio_on {
+                self.radio_on = Some(!on);
+                self.send(Cmd::Radio(!on));
+            }
+        }
+
+        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, ALC_LIST);
+        if let Some(p) = self.problem.clone() {
+            crate::alcove::empty(ui, area, Icon::Wifi, &p);
+        } else if self.radio_on == Some(false) {
+            crate::alcove::empty(ui, area, Icon::Wifi, "Turn Wi-Fi on to see networks");
+        } else if self.nets.is_empty() {
+            if self.scanning {
+                crate::alcove::empty(ui, area, Icon::Wifi, "Looking for networks…");
+            } else {
+                crate::alcove::empty(ui, area, Icon::Wifi, "No networks found");
+            }
+        } else {
+            let gap = 10.0;
+            let pitch = 62.0;
+            let cw = (area.w - gap) * 0.5;
+            let rows = self.nets.len().div_ceil(2);
+            let shown =
+                crate::alcove::scroll_rows(ui, area, &mut self.scroll, rows as f32 * pitch - 8.0, pitch, "wifi-list");
+            ui.p.push_clip(area);
+            let mut action: Option<Cmd> = None;
+            for (i, n) in self.nets.iter().enumerate() {
+                let (c, rw) = (i % 2, i / 2);
+                let card =
+                    Rect::new(area.x + c as f32 * (cw + gap), area.y + rw as f32 * pitch - shown, cw, pitch - 8.0);
+                if card.bottom() < area.y || card.y > area.bottom() {
+                    continue;
+                }
+                let is_conn = self.connected.as_deref() == Some(n.ssid.as_str());
+                let hover = ui.hovered(card) && ui.hovered(area);
+                if hover {
+                    ui.hot = true;
+                }
+                let bg = if is_conn {
+                    Color::white(if hover { 0.26 } else { 0.2 })
+                } else {
+                    Color::white(if hover { 0.12 } else { 0.07 })
+                };
+                ui.p.fill_rounded(card, 26.0, bg);
+                let ic = Rect::centered(card.x + 31.0, card.cy(), 38.0, 38.0);
+                crate::alcove::signal_bars(
+                    ui,
+                    Rect::centered(ic.cx(), ic.cy(), 18.0, 15.0),
+                    n.bars,
+                    if is_conn { Color::white(1.0) } else { Color::white(0.7) },
+                );
+                let tx = card.x + 60.0;
+                let tw = (card.right() - tx - 40.0).max(0.0);
+                ui.p.text(
+                    &n.ssid,
+                    Rect::new(tx, card.y + 8.0, tw, 20.0),
+                    &TextStyle::new(14.0, palette::TEXT).semibold(),
+                );
+                let (sub, subc) = if is_conn {
+                    ("Connected", Color::white(0.9))
+                } else if n.secured {
+                    ("Secured", palette::TEXT_FAINT)
+                } else {
+                    ("Open", palette::TEXT_FAINT)
+                };
+                ui.p.text(sub, Rect::new(tx, card.y + 28.0, tw, 18.0), &TextStyle::new(12.0, subc));
+                let busy_here = self.busy.as_deref() == Some(n.ssid.as_str());
+                if busy_here {
+                    ui.ring_spin(card.right() - 24.0, card.cy(), 20.0, 3.0, accent);
+                    ui.animate();
+                } else {
+                    if n.secured && !is_conn {
+                        ui.p.icon(
+                            Icon::Lock,
+                            Rect::centered(card.right() - 24.0, card.cy(), 13.0, 13.0),
+                            palette::TEXT_FAINT,
+                        );
+                    }
+                    if ui.clicked(card) && ui.hovered(area) {
+                        action = Some(if is_conn {
+                            Cmd::Disconnect
+                        } else {
+                            Cmd::Connect { ssid: n.ssid.clone(), password: None }
+                        });
+                    }
+                }
+            }
+            ui.p.pop_clip();
+            match action {
+                Some(Cmd::Connect { ssid, password }) => {
+                    self.busy = Some(ssid.clone());
+                    self.prompt = None;
+                    self.send(Cmd::Connect { ssid, password });
+                }
+                Some(c) => self.send(c),
+                None => {}
+            }
+        }
+        area
+    }
+
+    /// The password line under the cards.
+    fn draw_prompt(&mut self, ui: &mut Ui, r: Rect, area: Rect) {
+        let accent = palette::BLUE;
+        let Some(ssid) = self.prompt.clone() else { return };
+        let bar = Rect::new(r.x, area.bottom() + 12.0, r.w, 36.0);
+        let cancel = Rect::new(bar.right() - 34.0, bar.y + 2.0, 32.0, 32.0);
+        let join = Rect::new(cancel.x - 76.0, bar.y + 4.0, 70.0, 28.0);
+        let field = Rect::new(bar.x, bar.y + 2.0, join.x - bar.x - 8.0, 32.0);
+        let hint = format!("Password for {ssid}");
+        self.pw.draw(ui, field, &hint, accent, true);
+        let can = !self.pw.is_empty();
+        if crate::alcove::chip(ui, join, "Join", None, can) && can {
+            let pw = self.pw.text();
+            self.busy = Some(ssid.clone());
+            self.send(Cmd::Connect { ssid, password: Some(pw) });
+            self.prompt = None;
+            self.pw.clear();
+            ui.fx.keyboard_focus = Some(false);
+        }
+        if crate::alcove::round_button(ui, Rect::new(cancel.x, cancel.y, 30.0, 30.0), Icon::Close, false) {
+            self.prompt = None;
+            self.pw.clear();
+            ui.fx.keyboard_focus = Some(false);
         }
     }
 }

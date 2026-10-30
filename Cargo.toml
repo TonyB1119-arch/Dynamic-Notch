@@ -1,6 +1,6 @@
 [package]
 name = "dynamic-notch"
-version = "0.1.0"
+version = "3.0.1"
 edition = "2021"
 description = "A MacBook-style dynamic notch / desktop island for Windows"
 license = "MIT"
@@ -73,6 +73,7 @@ features = [
     "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
@@ -108,6 +109,23 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The generated Windows bindings are huge but need no heavy optimising (the code that uses
+# them is optimised when it is linked in). Building them in small pieces keeps the memory
+# use low enough that small build machines do not kill the compiler.
+[profile.release.package.windows]
+opt-level = 1
+codegen-units = 16
+
+# Quick test builds: `cargo build --profile fast` compiles in a fraction of the time and
+# memory of a release build; the app runs a little slower. Use `--release` for the real one.
+[profile.fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+strip = false
 
 [profile.dev]
 opt-level = 1

@@ -6,6 +6,7 @@
 
 pub mod icons;
 pub mod image;
+mod pack;
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -162,6 +163,7 @@ fn pick_fonts(dwrite: &IDWriteFactory) -> FontNames {
 pub enum Font {
     Text,
     Display,
+    #[allow(dead_code)]
     Icons,
     Mono,
     Script,
@@ -562,6 +564,53 @@ impl<'a> Painter<'a> {
         unsafe { self.dc.FillRectangle(&rf(r), self.brush(c)) }
     }
 
+    /// Rounded rect drawn straight on the context, with no cached geometry. For shapes whose size
+    /// changes every frame (a growing bar, a shimmer), where caching one entry per size would only
+    /// churn memory.
+    pub fn fill_rounded_live(&self, r: Rect, radius: f32, c: Color) {
+        if c.a * self.alpha <= 0.001 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rad = radius.min(r.w * 0.5).min(r.h * 0.5);
+        let rr = D2D1_ROUNDED_RECT { rect: rf(r), radiusX: rad, radiusY: rad };
+        unsafe { self.dc.FillRoundedRectangle(&rr, self.brush(c)) }
+    }
+
+    /// A polygon filled with a horizontal gradient running from `x0` to `x1`. `stops` are
+    /// (position 0..1, color). For soft, gradient-shaded glows whose outline changes every frame.
+    pub fn fill_gradient_poly(&self, pts: &[(f32, f32)], stops: &[(f32, Color)], x0: f32, x1: f32) {
+        if pts.len() < 3 || stops.len() < 2 || x1 - x0 < 0.5 {
+            return;
+        }
+        let Some(g) = self.path(|b| {
+            b.move_to(pts[0].0, pts[0].1);
+            for p in &pts[1..] {
+                b.line_to(p.0, p.1);
+            }
+        }) else {
+            return;
+        };
+        let mut buf = [D2D1_GRADIENT_STOP::default(); 8];
+        let n = stops.len().min(buf.len());
+        for (slot, (pos, c)) in buf.iter_mut().zip(stops) {
+            *slot = D2D1_GRADIENT_STOP { position: *pos, color: d2c(c.alpha(self.alpha)) };
+        }
+        let stops = &buf[..n];
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: v2(x0, 0.0), endPoint: v2(x1, 0.0) };
+        unsafe {
+            let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+                &self.dc,
+                stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            ) else {
+                return;
+            };
+            let Ok(brush) = self.dc.CreateLinearGradientBrush(&props, None, &coll) else { return };
+            self.dc.FillGeometry(&g, &brush, None);
+        }
+    }
+
     pub fn fill_rounded(&self, r: Rect, radius: f32, c: Color) {
         if c.a * self.alpha <= 0.001 || r.w <= 0.0 || r.h <= 0.0 {
             return;
@@ -879,6 +928,7 @@ impl<'a> Painter<'a> {
     }
 
     /// Draw a glyph from the system icon font, centered in `r`.
+    #[allow(dead_code)]
     pub fn glyph(&mut self, ch: char, r: Rect, size: f32, c: Color) {
         let st = TextStyle {
             size,
@@ -1067,6 +1117,8 @@ impl<'a> Painter<'a> {
 /// faded (one rectangle fill per frame) instead of being laid out and drawn again every frame.
 pub struct Snapshot {
     brush: ID2D1BitmapBrush1,
+    /// The same picture at a quarter of the size; drawn stretched back up it is a soft blur.
+    soft: Option<ID2D1BitmapBrush1>,
     /// Where the picture sits, in logical units (snapped to whole device pixels).
     pub rect: Rect,
     pub key: u64,
@@ -1124,8 +1176,36 @@ impl Res {
                 interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
             };
             let brush = dc.CreateBitmapBrush(&bmp, Some(&bprops), None).ok()?;
+            // Halve the picture twice (each step averages 2x2 pixels); stretched back up with
+            // linear filtering this reads as a gentle blur, for a fraction of a real blur's cost.
+            let soft = (|| -> Option<ID2D1BitmapBrush1> {
+                let mut src: ID2D1Bitmap1 = bmp.clone();
+                let (mut sw, mut sh) = (w, h);
+                let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+                for _ in 0..2 {
+                    let (nw, nh) = (sw.div_ceil(2).max(1), sh.div_ceil(2).max(1));
+                    let small = dc.CreateBitmap(D2D_SIZE_U { width: nw, height: nh }, None, 0, &props).ok()?;
+                    dc.SetTarget(&small);
+                    dc.SetTransform(&ident);
+                    dc.BeginDraw();
+                    dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                    let d = D2D_RECT_F { left: 0.0, top: 0.0, right: nw as f32, bottom: nh as f32 };
+                    let from: ID2D1Bitmap = src.cast().ok()?;
+                    dc.DrawBitmap(&from, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                    let ok = dc.EndDraw(None, None).is_ok();
+                    dc.SetTarget(None);
+                    if !ok {
+                        return None;
+                    }
+                    src = small;
+                    sw = nw;
+                    sh = nh;
+                }
+                dc.CreateBitmapBrush(&src, Some(&bprops), None).ok()
+            })();
             Some(Snapshot {
                 brush,
+                soft,
                 rect: Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale),
                 key,
                 born: std::time::Instant::now(),
@@ -1148,6 +1228,60 @@ impl<'a> Painter<'a> {
             s.brush.SetTransform(&m);
             s.brush.SetOpacity(a);
             self.dc.FillRectangle(&rf(Rect::new(x, y, s.rect.w, s.rect.h)), &s.brush);
+        }
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Draw a snapshot scaled about its own centre by `sc`, shifted by (`dx`, `dy`); `soft` picks
+    /// the blurred copy (falls back to the sharp one when there is none).
+    pub fn snapshot_scaled(&self, s: &Snapshot, sc: f32, dx: f32, dy: f32, opacity: f32, soft: bool) {
+        let a = opacity * self.alpha;
+        if a <= 0.002 || sc <= 0.01 {
+            return;
+        }
+        let (w, h) = (s.rect.w * sc, s.rect.h * sc);
+        let x = s.rect.x + (s.rect.w - w) * 0.5 + dx;
+        let y = s.rect.y + (s.rect.h - h) * 0.5 + dy;
+        let soft_brush = if soft { s.soft.as_ref() } else { None };
+        let k = if soft_brush.is_some() { 4.0 } else { 1.0 } * sc / self.scale;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x, M32: y };
+        unsafe {
+            match soft_brush {
+                Some(b) => {
+                    b.SetTransform(&m);
+                    b.SetOpacity(a);
+                    self.dc.FillRectangle(&rf(Rect::new(x, y, w, h)), b);
+                }
+                None => {
+                    s.brush.SetTransform(&m);
+                    s.brush.SetOpacity(a);
+                    self.dc.FillRectangle(&rf(Rect::new(x, y, w, h)), &s.brush);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Like `snapshot`, but the soft (blurred) copy of the picture. Falls back to the sharp
+    /// picture if there is no soft copy.
+    pub fn snapshot_soft(&self, s: &Snapshot, dx: f32, dy: f32, opacity: f32) {
+        let Some(soft) = &s.soft else {
+            self.snapshot(s, dx, dy, opacity);
+            return;
+        };
+        let a = opacity * self.alpha;
+        if a <= 0.002 {
+            return;
+        }
+        let (x, y) = (s.rect.x + dx, s.rect.y + dy);
+        let k = 4.0 / self.scale;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x, M32: y };
+        unsafe {
+            soft.SetTransform(&m);
+            soft.SetOpacity(a);
+            self.dc.FillRectangle(&rf(Rect::new(x, y, s.rect.w, s.rect.h)), soft);
         }
     }
 }
@@ -1304,6 +1438,11 @@ impl PathBuilder {
         self.close();
     }
 
+    pub fn cubic_to(&self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        unsafe {
+            self.sink.AddBezier(&D2D1_BEZIER_SEGMENT { point1: v2(x1, y1), point2: v2(x2, y2), point3: v2(x, y) })
+        }
+    }
     pub fn quad_to(&self, cx: f32, cy: f32, x: f32, y: f32) {
         unsafe { self.sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: v2(cx, cy), point2: v2(x, y) }) }
     }

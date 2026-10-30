@@ -181,7 +181,11 @@ impl Module for Mirror {
     }
 
     fn page_height(&self, _width: f32) -> f32 {
-        230.0
+        if crate::ui::look_alcove() {
+            210.0
+        } else {
+            230.0
+        }
     }
 
     /// The Mirror tab: a round camera button with a ring of beams. Pressing it grows the button
@@ -193,7 +197,12 @@ impl Module for Mirror {
             self.page_seen = Instant::now();
         }
         let state = self.state.clone();
-        let btn = Rect::centered(r.cx(), r.cy() - 6.0, 52.0, 52.0);
+        let al = crate::ui::look_alcove();
+        let btn = if al {
+            Rect::centered(r.cx(), r.cy() - 14.0, 64.0, 64.0)
+        } else {
+            Rect::centered(r.cx(), r.cy() - 6.0, 52.0, 52.0)
+        };
         let p = ui.glide(gkey("mirror-open", 0), if open { 1.0 } else { 0.0 });
 
         // the button and the ring of beams around it
@@ -205,10 +214,23 @@ impl Module for Mirror {
             let alpha = 1.0 - smoothstep(0.45, 0.9, p);
             let outer = ui.p.alpha;
             ui.p.alpha = outer * alpha;
-            ui.ring(btn.cx(), btn.cy(), btn.w + 26.0, 2.8, if open || hover { 1.0 } else { 0.0 }, Color::white(0.9));
+            if !al {
+                ui.ring(
+                    btn.cx(),
+                    btn.cy(),
+                    btn.w + 26.0,
+                    2.8,
+                    if open || hover { 1.0 } else { 0.0 },
+                    Color::white(0.9),
+                );
+            }
             ui.p.alpha = outer;
             if p < 0.02 {
-                let style = ButtonStyle::filled(Color::white(0.09)).scale(0.52);
+                let style = if al {
+                    ButtonStyle::filled(Color::white(0.94)).fg(Color::hex(0x0E0E10)).scale(0.5)
+                } else {
+                    ButtonStyle::filled(Color::white(0.09)).scale(0.52)
+                };
                 if ui.icon_button(btn, Icon::Camera, style) && !open {
                     let bus = ui.bus.clone();
                     self.begin(&bus);
@@ -226,7 +248,7 @@ impl Module for Mirror {
 
         // the view grows out of the button and fills the tab
         let view = Rect::new(lerp(btn.x, r.x, p), lerp(btn.y, r.y, p), lerp(btn.w, r.w, p), lerp(btn.h, r.h, p));
-        let radius = lerp(btn.h * 0.5, 22.0, p);
+        let radius = lerp(btn.h * 0.5, if al { 30.0 } else { 22.0 }, p);
         let outer = ui.p.alpha;
         ui.p.alpha = outer * smoothstep(0.0, 0.25, p);
         ui.p.fill_rounded(view, radius, Color::hex(0x0B0B0D));
@@ -245,7 +267,14 @@ impl Module for Mirror {
                     }
                     ui.p.image_zoom(img, view, radius, 1.0, ZOOM);
                     // a quiet sweep along the bottom edge shows the camera is live
-                    ui.ticks_sweep(Rect::new(view.cx() - 40.0, view.bottom() - 22.0, 80.0, 8.0), Color::white(0.55));
+                    if al {
+                        ui.p.fill_circle(view.x + 24.0, view.y + 24.0, 5.0, palette::RED);
+                    } else {
+                        ui.ticks_sweep(
+                            Rect::new(view.cx() - 40.0, view.bottom() - 22.0, 80.0, 8.0),
+                            Color::white(0.55),
+                        );
+                    }
                 }
                 None => {
                     ui.p.text(

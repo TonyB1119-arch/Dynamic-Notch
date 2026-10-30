@@ -299,11 +299,25 @@ impl Module for Timer {
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
+        let al = crate::ui::look_alcove();
+        if al {
+            // Alcove: two capsules, the chosen one white
+            for (i, (label, m)) in [("Timer", Mode::Timer), ("Stopwatch", Mode::Stopwatch)].iter().enumerate() {
+                let b = Rect::new(r.x + i as f32 * 98.0, r.y, 90.0, 28.0);
+                if crate::alcove::chip(ui, b, label, None, self.mode == *m) {
+                    self.mode = *m;
+                }
+            }
+        }
         // segmented mode switch
         let seg = Rect::new(r.x, r.y, 190.0, 28.0);
-        ui.p.fill_rounded(seg, 14.0, Color::white(0.05));
+        if !al {
+            ui.p.fill_rounded(seg, 14.0, Color::white(0.05));
+        }
         let half = Rect::new(seg.x, seg.y, seg.w * 0.5, seg.h);
-        for (i, (label, m)) in [("Timer", Mode::Timer), ("Stopwatch", Mode::Stopwatch)].iter().enumerate() {
+        for (i, (label, m)) in
+            [("Timer", Mode::Timer), ("Stopwatch", Mode::Stopwatch)].iter().enumerate().filter(|_| !al)
+        {
             let b = half.translate(i as f32 * half.w, 0.0).inset(2.0);
             let sel = self.mode == *m;
             if sel {
@@ -327,17 +341,25 @@ impl Module for Timer {
                 let rem = self.remaining();
                 let running = self.end.is_some();
                 let shown = rem.unwrap_or(self.total);
-                let color = if rem.is_some() { TIMER_COLOR } else { palette::TEXT };
+                let color = if al {
+                    Color::white(0.96)
+                } else if rem.is_some() {
+                    TIMER_COLOR
+                } else {
+                    palette::TEXT
+                };
                 ui.p.text(
                     &fmt_countdown(shown),
                     Rect::new(left.x, left.y - 2.0, left.w, 56.0),
                     &TextStyle::new(48.0, color).semibold().display(),
                 );
-                ui.progress(
-                    Rect::new(left.x, left.y + 58.0, 240.0, 4.0),
-                    if rem.is_some() { self.progress() } else { 1.0 },
-                    color.with_a(0.9),
-                );
+                let bar = Rect::new(left.x, left.y + 58.0, 240.0, 4.0);
+                let frac = if rem.is_some() { self.progress() } else { 1.0 };
+                if al {
+                    crate::alcove::meter(ui, bar, frac, color);
+                } else {
+                    ui.progress(bar, frac, color.with_a(0.9));
+                }
                 let by = left.bottom() - bh;
                 let main = Rect::new(left.x, by, 104.0, bh);
                 let (label, icon) = if running {
@@ -347,21 +369,26 @@ impl Module for Timer {
                 } else {
                     ("Start", Icon::Play)
                 };
-                if ui.pill_button(
-                    main,
-                    label,
-                    Some(icon),
-                    ButtonStyle::filled(TIMER_COLOR.with_a(0.24)).fg(TIMER_COLOR),
-                ) {
+                let go = if al {
+                    crate::alcove::chip(ui, main, label, Some(icon), true)
+                } else {
+                    ui.pill_button(
+                        main,
+                        label,
+                        Some(icon),
+                        ButtonStyle::filled(TIMER_COLOR.with_a(0.24)).fg(TIMER_COLOR),
+                    )
+                };
+                if go {
                     self.pause_resume();
                 }
                 let reset = Rect::new(main.right() + 8.0, by, bh, bh);
-                if ui.icon_button(reset, Icon::Refresh, ButtonStyle::filled(Color::white(0.1)).scale(0.44)) {
+                if round(ui, reset, Icon::Refresh, 0.44) {
                     self.reset();
                 }
                 // +1 / -1 minute adjust
                 let plus = Rect::new(reset.right() + 8.0, by, bh, bh);
-                if ui.icon_button(plus, Icon::Plus, ButtonStyle::filled(Color::white(0.1)).scale(0.6)) {
+                if round(ui, plus, Icon::Plus, 0.6) {
                     let add = Duration::from_secs(60);
                     match (self.end, self.paused_left) {
                         (Some(e), _) => {
@@ -376,9 +403,7 @@ impl Module for Timer {
                     }
                 }
                 let minus = Rect::new(plus.right() + 8.0, by, bh, bh);
-                if ui.icon_button(minus, Icon::Minus, ButtonStyle::filled(Color::white(0.1)).scale(0.6))
-                    && !self.timer_active()
-                {
+                if round(ui, minus, Icon::Minus, 0.6) && !self.timer_active() {
                     self.total = self.total.saturating_sub(Duration::from_secs(60)).max(Duration::from_secs(60));
                 }
 
@@ -392,14 +417,24 @@ impl Module for Timer {
                     let (cxi, cyi) = ((i % cols) as f32, (i / cols) as f32);
                     let b = Rect::new(right.x + cxi * (cw + gap), right.y + 16.0 + cyi * (ch + gap), cw, ch);
                     let label = if *m >= 60 { format!("{}h", m / 60) } else { format!("{m} min") };
-                    if ui.pill_button(b, &label, None, ButtonStyle::filled(Color::white(0.09))) {
+                    if (if al {
+                        crate::alcove::chip(ui, b, &label, None, false)
+                    } else {
+                        ui.pill_button(b, &label, None, ButtonStyle::filled(Color::white(0.09)))
+                    }) {
                         self.start(Duration::from_secs(*m as u64 * 60));
                     }
                 }
             }
             Mode::Stopwatch => {
                 let running = self.sw_start.is_some();
-                let color = if self.sw_active() { SW_COLOR } else { palette::TEXT };
+                let color = if al {
+                    Color::white(0.96)
+                } else if self.sw_active() {
+                    SW_COLOR
+                } else {
+                    palette::TEXT
+                };
                 ui.p.text(
                     &fmt_stopwatch(self.sw_elapsed(), true),
                     Rect::new(left.x, left.y - 2.0, left.w + 100.0, 56.0),
@@ -408,15 +443,29 @@ impl Module for Timer {
                 let by = left.bottom() - bh;
                 let main = Rect::new(left.x, by, 104.0, bh);
                 let (label, icon) = if running { ("Stop", Icon::Pause) } else { ("Start", Icon::Play) };
-                if ui.pill_button(main, label, Some(icon), ButtonStyle::filled(SW_COLOR.with_a(0.22)).fg(SW_COLOR)) {
+                let go = if al {
+                    crate::alcove::chip(ui, main, label, Some(icon), true)
+                } else {
+                    ui.pill_button(main, label, Some(icon), ButtonStyle::filled(SW_COLOR.with_a(0.22)).fg(SW_COLOR))
+                };
+                if go {
                     self.sw_toggle();
                 }
                 let reset = Rect::new(main.right() + 8.0, by, bh, bh);
-                if ui.icon_button(reset, Icon::Refresh, ButtonStyle::filled(Color::white(0.1)).scale(0.44)) {
+                if round(ui, reset, Icon::Refresh, 0.44) {
                     self.sw_reset();
                 }
             }
         }
+    }
+}
+
+/// A small round button: the soft Alcove circle there, the usual filled one elsewhere.
+fn round(ui: &mut Ui, r: Rect, icon: Icon, scale: f32) -> bool {
+    if crate::ui::look_alcove() {
+        crate::alcove::round_button(ui, r, icon, false)
+    } else {
+        ui.icon_button(r, icon, ButtonStyle::filled(Color::white(0.1)).scale(scale))
     }
 }
 
