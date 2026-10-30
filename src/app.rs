@@ -2408,6 +2408,9 @@ impl App {
     /// the live drawing in `bottom_fade`. It is there as soon as the notch is open, also while pages
     /// switch.
     fn prepare_band(&mut self, now: Instant) {
+        if self.page_from.is_some() && self.snap_band.is_some() && self.mode == Mode::Expanded {
+            return;
+        }
         let t = self.targets();
         let tw = self.page_width();
         let body = self.body_rect();
@@ -2896,7 +2899,11 @@ impl App {
                             let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
                             // the strip along the bottom is drawn from its own picture (sharp, then
                             // softer toward the rim), so the live page stops just above it
-                            let band = if band_k > 0.01 && self.mode == Mode::Expanded { self.snap_band.as_ref() } else { None };
+                            let band = if band_k > 0.01 && self.mode == Mode::Expanded && self.page_from.is_none() {
+                                self.snap_band.as_ref()
+                            } else {
+                                None
+                            };
                             if let Some(b) = band {
                                 ui.p.push_clip(Rect::new(0.0, -200.0, self.win_w, b.rect.y + 200.0));
                             }
