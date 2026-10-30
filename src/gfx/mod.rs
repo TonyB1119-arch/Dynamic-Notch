@@ -1226,7 +1226,13 @@ impl Res {
                     sw = nw;
                     sh = nh;
                 }
-                dc.CreateBitmapBrush(&src, Some(&bprops), None).ok()
+                // stretched back up with a smooth (cubic) filter, so the blur has no blocky edges
+                let smooth = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                };
+                dc.CreateBitmapBrush(&src, Some(&smooth), None).ok()
             })();
             Some(Snapshot {
                 brush,
