@@ -2694,7 +2694,7 @@ impl App {
         // while the size is still changing a coarse rim is enough (a quarter of the work); the
         // frame after it has stopped makes the fine one
         // (live glass keeps making half-detail rims, so that is what "fine" means while it is on)
-        let fine = if self.live_armed() { 2 } else { 1 };
+        let fine = 1;
         let still = self.rim_geo == Some(geo);
         // how far the notch still has to go, and how far it had to go when this move began: in the
         // last part of a real move (the last ~12 %, where it is slow) the rim is already made at full
@@ -2702,7 +2702,9 @@ impl App {
         let left = (self.anim.w.target - self.anim.w.value).abs() + (self.anim.h.target - self.anim.h.value).abs();
         self.rim_far = if still { 0.0 } else { self.rim_far.max(left) };
         let late = self.rim_far >= 24.0 && left <= self.rim_far * self.cfg.glass.sharpen_at.clamp(0.02, 0.5);
-        let step = if still || late { fine } else { 2 };
+        // (the picture is sharp along the edge and half detail elsewhere, cheap enough to use always)
+        let step = fine;
+        let _ = late;
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
         // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
