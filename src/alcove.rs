@@ -564,11 +564,11 @@ pub fn empty(ui: &mut Ui, r: Rect, icon: Icon, msg: &str) {
     let (cx, cy) = (r.cx(), r.cy() - 18.0);
     ui.p.fill_circle(cx, cy + bob * 0.4, 25.0 + 2.5 * breath, Color::white(0.035 + 0.02 * breath));
     ui.p.fill_circle(cx, cy + bob * 0.4, 19.0, Color::white(0.07));
-    ui.p.icon(icon, Rect::centered(cx, cy + bob, 22.0, 22.0), Color::white(0.62));
+    ui.p.icon(icon, Rect::centered(cx, cy + bob, 22.0, 22.0), Color::white(0.8));
     ui.p.text(
         msg,
         Rect::new(r.x + 12.0, r.cy() + 12.0, r.w - 24.0, 22.0),
-        &TextStyle::new(13.0, palette::TEXT_FAINT).center(),
+        &TextStyle::new(13.0, Color::white(0.86)).center(),
     );
     // only keeps frames coming while the pointer is on the page, so an open notch left alone
     // settles and costs nothing

@@ -1421,8 +1421,8 @@ impl<'p, 'a> Ui<'p, 'a> {
         let is = 26.0;
         let total = is + 8.0 + 18.0;
         let top = r.cy() - total * 0.5;
-        self.p.icon(icon, Rect::new(r.cx() - is * 0.5, top, is, is), palette::TEXT_FAINT);
-        self.p.text(msg, Rect::new(r.x, top + is + 8.0, r.w, 18.0), &TextStyle::new(12.5, palette::TEXT_DIM).center());
+        self.p.icon(icon, Rect::new(r.cx() - is * 0.5, top, is, is), Color::white(0.7));
+        self.p.text(msg, Rect::new(r.x, top + is + 8.0, r.w, 18.0), &TextStyle::new(12.5, Color::white(0.86)).center());
     }
 }
 
