@@ -46,6 +46,8 @@ use crate::sys::{radio, shell_open};
 use crate::ui::{ButtonStyle, Ui};
 use crate::util::{palette, Color, Rect};
 
+/// Height of the list of devices: two rows of cards, the rest scrolls.
+const ALC_LIST: f32 = 116.0;
 const ID: ModuleId = "control";
 const IS_CONNECTED: &str = "System.Devices.Aep.IsConnected";
 const CONTAINER: &str = "System.Devices.Aep.ContainerId";
@@ -300,7 +302,7 @@ impl Module for Bluetooth {
 
     fn page_height(&self, _w: f32) -> f32 {
         if crate::ui::look_alcove() {
-            return 48.0 + 12.0 + 186.0;
+            return 48.0 + 12.0 + ALC_LIST;
         }
         HEADER_H + 12.0 + LIST_H
     }
@@ -1206,7 +1208,7 @@ impl Bluetooth {
             shell_open("ms-settings:bluetooth");
         }
 
-        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, 186.0);
+        let area = Rect::new(r.x, head.bottom() + 12.0, r.w, ALC_LIST);
         if let Some(p) = self.problem.clone() {
             crate::alcove::empty(ui, area, Icon::Bluetooth, &p);
             return;

@@ -121,7 +121,7 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
     let sc = sh.scale.max(0.5);
     // The rim fades out over a long, soft stretch so it melts into the black of the notch.
     let width = 64.0 * sc; // how far in from the edge the rim reaches
-    let pull = 28.0 * sc; // how far out the strongest pixels look
+    let pull = 20.0 * sc; // how far out the strongest pixels look
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + 90.0 * sc; // how far up the sides it is drawn, fading out toward the top
     let x0 = ((sh.left - 2.0).floor() as i32).max(0);
@@ -181,7 +181,7 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             // u: 1 at the edge, 0 at the inner end of the rim. The strength follows a smooth S, so
             // it starts and ends gently, with no visible line where the rim stops.
             let u = 1.0 - d / width;
-            let alpha = 0.96 * u * u * (3.0 - 2.0 * u) * (d + 1.0).clamp(0.0, 1.0) * up;
+            let alpha = 0.6 * u * u * (3.0 - 2.0 * u) * (d + 1.0).clamp(0.0, 1.0) * up;
             if alpha < 0.004 {
                 continue;
             }
@@ -189,8 +189,8 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             let (ox, oy) = (nx * pull * k, ny * pull * k);
             // red, green and blue look a slightly different distance out, like light through glass
             let cr = sample(shot, x + ox, y + oy, 16);
-            let cg = sample(shot, x + ox * 0.93, y + oy * 0.93, 8);
-            let cb2 = sample(shot, x + ox * 0.86, y + oy * 0.86, 0);
+            let cg = sample(shot, x + ox * 0.95, y + oy * 0.95, 8);
+            let cb2 = sample(shot, x + ox * 0.9, y + oy * 0.9, 0);
             let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
             px[j * w + i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }

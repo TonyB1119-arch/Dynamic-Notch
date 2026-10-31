@@ -33,7 +33,7 @@ const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 34.0;
 const LIST_H: f32 = 5.0 * ROW_H;
 /// Alcove: three rows of network cards.
-const ALC_LIST: f32 = 186.0;
+const ALC_LIST: f32 = 116.0; // two rows of cards, the rest scrolls
 const RESCAN_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
