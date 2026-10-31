@@ -2438,7 +2438,7 @@ impl App {
             && self.mode == Mode::Expanded
             && self.page != "settings"
             && self.anim.exp.value >= 0.88
-            && (body.h - t.h).abs() < 40.0;
+            && body.h >= 56.0;
         let peek_band = on
             && self.mode == Mode::Peek
             && self.anim.peek.value >= 0.95
@@ -2461,8 +2461,11 @@ impl App {
             let full = Rect::new(body.cx() - tw * 0.5, body.y, tw, t.h);
             let content =
                 page_content(body.cx(), full.y, page_size(&self.cfg, &self.modules, &self.started, self.page));
-            let h = BAND_H.min(full.h * 0.4);
-            let region = Rect::new(full.x, full.bottom() - h, full.w, h);
+            // the strip sits on the notch's real bottom edge, also while it is still growing or
+            // shrinking to the next page's size, and is as wide as the wider of the two
+            let h = BAND_H.min(body.h * 0.4);
+            let (rx, rr) = (full.x.min(body.x), full.right().max(body.right()));
+            let region = Rect::new(rx, body.bottom() - h, rr - rx, h);
             let trans = self.page_from.map(|(from, dir)| (from, dir, self.anim.page.value.clamp(0.0, 1.0)));
             let tabs = if trans.is_some() { self.tab_list() } else { Vec::new() };
             let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
