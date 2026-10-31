@@ -120,13 +120,13 @@ const TRIM_DELAY: Duration = Duration::from_secs(10);
 const AMBIENT_GAP: Duration = Duration::from_millis(12);
 /// Live glass: how often the screen behind the notch is looked at again, and how often once
 /// it has not changed for a while.
-const LIVE_FAST: Duration = Duration::from_millis(350);
-const LIVE_SLOW: Duration = Duration::from_millis(800);
+const LIVE_FAST: Duration = Duration::from_millis(150);
+const LIVE_SLOW: Duration = Duration::from_millis(600);
 /// Live glass carries on this long after the media stops (pausing a video for a moment must not
 /// switch it off and on again).
 const LIVE_LINGER: Duration = Duration::from_secs(6);
 /// Seconds for the glass edge to melt from the old picture into a new one.
-const LIVE_FADE: f32 = 0.4;
+const LIVE_FADE: f32 = 0.12;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// A peek would be visible right now (not hidden, not expanded).
@@ -2648,9 +2648,8 @@ impl App {
         {
             let (x, y, w, h) = self.win_px;
             self.refr_shot = crate::refract::grab(x, y, w, h);
-            if let Some(shot) = &self.refr_shot {
-                self.live_sum = crate::refract::checksum(shot);
-            }
+            // (no fingerprint yet: the first refresh always counts as new)
+            self.live_sum = 0;
             self.refr_retry = Some(now);
             self.refr_fg = fg.0 as isize;
             if self.refr_shot.is_none() {
@@ -2683,7 +2682,9 @@ impl App {
         let geo = (q4(body.x), q4(body.w), q4(body.bottom()), q4(r), (sc * 100.0).round() as i32);
         // while the size is still changing a coarse rim is enough (a quarter of the work); the
         // frame after it has stopped makes the fine one
-        let step = if self.rim_geo == Some(geo) { 1 } else { 2 };
+        // (live glass keeps making half-detail rims, so that is what "fine" means while it is on)
+        let fine = if self.live_armed() { 2 } else { 1 };
+        let step = if self.rim_geo == Some(geo) { fine } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
         let shape = crate::refract::Shape {
@@ -2705,7 +2706,7 @@ impl App {
             }
         }
         self.rim_ok = self.refr_rim.is_some();
-        if step > 1 && self.rim_ok {
+        if step > fine && self.rim_ok {
             // one more frame so the fine picture follows as soon as the notch has stopped
             self.request_frame();
         }
@@ -2803,6 +2804,11 @@ impl App {
         let hwnd = SendHwnd::new(self.hwnd);
         let (tx, rx) = std::sync::mpsc::channel();
         let job = std::thread::Builder::new().name("glass".into()).spawn(move || {
+            // behind everything else: the notch's own drawing always comes first
+            unsafe {
+                use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
             let out = crate::refract::refresh(x, y, w, h, prev, shape);
             let _ = tx.send(out);
             unsafe {
@@ -2844,7 +2850,7 @@ impl App {
                 if let (Some(rim), Some((geo, shape))) = (f.rim, self.rim_last) {
                     if shape == f.shape && self.page_from.is_none() {
                         if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
-                            let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, 1);
+                            let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, rim.step);
                             self.rim_old = self.refr_rim.take();
                             self.rim_x = if self.rim_old.is_some() { 0.0 } else { 1.0 };
                             self.refr_rim = Some((key, pic));
