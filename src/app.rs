@@ -3240,8 +3240,8 @@ impl App {
                         // Alcove: the glass turns see-through toward the bottom edge
                         // it starts higher up and follows a gentle S, so there is no point where the
                         // black visibly begins to thin out
-                        let from = 1.0 - bh * 1.5 / body.h;
-                        let drop = 0.66 * band_k * bd_k;
+                        let from = 1.0 - bh * 1.7 / body.h;
+                        let drop = 0.8 * band_k * bd_k;
                         let at = |t: f32| {
                             let e = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
                             Color::black(bg_alpha * (1.0 - drop * e))
