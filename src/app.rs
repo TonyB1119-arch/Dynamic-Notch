@@ -2824,10 +2824,10 @@ impl App {
                             body.y,
                             body.bottom(),
                             &[
-                                (0.0, Color::white(0.10 * k)),
+                                (0.0, Color::white(0.17 * k)),
                                 (0.3, Color::white(0.0)),
                                 (0.72, Color::white(0.0)),
-                                (1.0, Color::white(0.09 * k)),
+                                (1.0, Color::white(0.16 * k)),
                             ],
                         );
                     }
@@ -2981,28 +2981,28 @@ impl App {
                         })
                     };
                     p.push_clip(Rect::new(body.x - 1.0, body.y + a_ear * 0.8, body.w + 2.0, body.h));
-                    if let Some(g) = ring(outer, a_r, 7.0) {
+                    if let Some(g) = ring(outer, a_r, 12.0) {
                         p.fill_geometry_vgrad(
                             &g,
                             body.y,
                             body.bottom(),
                             &[
                                 (0.0, Color::white(0.0)),
-                                (0.55, Color::white(0.0)),
-                                (0.85, Color::white(0.07 * k)),
-                                (1.0, Color::white(0.20 * k)),
+                                (0.45, Color::white(0.0)),
+                                (0.80, Color::white(0.14 * k)),
+                                (1.0, Color::white(0.40 * k)),
                             ],
                         );
                     }
-                    if let Some(g) = ring(outer, a_r, 1.5) {
+                    if let Some(g) = ring(outer, a_r, 2.0) {
                         p.fill_geometry_vgrad(
                             &g,
                             body.y,
                             body.bottom(),
                             &[
-                                (0.0, Color::white(0.10 * k)),
-                                (0.5, Color::white(0.16 * k)),
-                                (1.0, Color::white(0.50 * k)),
+                                (0.0, Color::white(0.22 * k)),
+                                (0.5, Color::white(0.34 * k)),
+                                (1.0, Color::white(0.90 * k)),
                             ],
                         );
                     }
