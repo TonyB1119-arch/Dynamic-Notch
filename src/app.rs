@@ -2429,9 +2429,6 @@ impl App {
     /// the live drawing in `bottom_fade`. It is there as soon as the notch is open, also while pages
     /// switch.
     fn prepare_band(&mut self, now: Instant) {
-        if self.page_from.is_some() && self.snap_band.is_some() && self.mode == Mode::Expanded {
-            return;
-        }
         let t = self.targets();
         let tw = self.page_width();
         let body = self.body_rect();
@@ -2466,6 +2463,9 @@ impl App {
                 page_content(body.cx(), full.y, page_size(&self.cfg, &self.modules, &self.started, self.page));
             let h = BAND_H.min(full.h * 0.4);
             let region = Rect::new(full.x, full.bottom() - h, full.w, h);
+            let trans = self.page_from.map(|(from, dir)| (from, dir, self.anim.page.value.clamp(0.0, 1.0)));
+            let tabs = if trans.is_some() { self.tab_list() } else { Vec::new() };
+            let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
             self.snap_band = self.res.render_snapshot(&self.gfx, scale, region, 0xB4D, self.snap_band.take(), true, |p| {
                 let mut ui = Ui {
                     p,
@@ -2478,7 +2478,20 @@ impl App {
                     hot: false,
                     interactive: false,
                 };
-                draw_body(&mut ui, content, &mut self.modules, &self.started, page);
+                match trans {
+                    Some(_) => draw_expanded_core(
+                        &mut ui,
+                        full,
+                        &mut self.modules,
+                        &self.started,
+                        &tabs,
+                        page,
+                        trans,
+                        &self.indicators,
+                        pages,
+                    ),
+                    None => draw_body(&mut ui, content, &mut self.modules, &self.started, page),
+                }
             });
         } else if let Some(act) = &self.peek {
             let h = BAND_H.min(body.h * 0.4);
@@ -2591,8 +2604,12 @@ impl App {
     /// animation just place that picture (one rectangle fill instead of laying out and drawing
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
+        self.prepare_pictures(now);
         self.prepare_band(now);
         self.prepare_rim(now);
+    }
+
+    fn prepare_pictures(&mut self, now: Instant) {
         let a_exp = self.anim.exp.value;
         let paging = self.page_from.is_some();
         let on = self.cfg.appearance.motion_cache;
@@ -2980,7 +2997,7 @@ impl App {
                             let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
                             // the strip along the bottom is drawn from its own picture (sharp, then
                             // softer toward the rim), so the live page stops just above it
-                            let band = if band_k > 0.01 && self.mode == Mode::Expanded && self.page_from.is_none() {
+                            let band = if band_k > 0.01 && self.mode == Mode::Expanded {
                                 self.snap_band.as_ref()
                             } else {
                                 None
