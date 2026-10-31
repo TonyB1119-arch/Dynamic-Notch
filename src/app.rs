@@ -410,6 +410,8 @@ pub struct App {
     rim_last: Option<((i32, i32, i32, i32, i32), crate::refract::Shape)>,
     /// The glass settings the current rim was made with (a change makes it again).
     rim_tune: Option<crate::refract::Tune>,
+    /// The strip / see-through settings the current rim was made with (quantised).
+    rim_extra: Option<(i32, i32, i32)>,
     /// Live glass: a refresh running on a background thread.
     live_rx: Option<Receiver<Option<crate::refract::Fetched>>>,
     /// When the next refresh is due.
@@ -554,6 +556,7 @@ impl App {
             rim_far: 0.0,
             rim_last: None,
             rim_tune: None,
+            rim_extra: None,
             live_rx: None,
             live_next: None,
             live_same: 0,
@@ -2702,7 +2705,27 @@ impl App {
         let step = if still || late { fine } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
+        // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
+        // all of it (the middle glass follows that)
+        let ap = &self.cfg.appearance;
+        let bhh = BAND_H.min(body.h * 0.4);
+        let band_on = ap.bottom_fade && ap.blur && self.page != "settings" && body.h > bhh * 2.0;
+        let opaque = if ap.blur { ap.expanded_opacity } else { ap.expanded_opacity.max(0.95) };
+        let band_px = if band_on { bhh * self.cfg.glass.fade_start.clamp(0.5, 3.0) * sc } else { 0.0 };
+        let fade_to = if band_on { self.cfg.glass.fade_amount.clamp(0.0, 1.0) } else { 0.0 };
+        let clear = (1.0 - opaque).clamp(0.0, 1.0);
+        let extra = ((band_px * 4.0) as i32, (fade_to * 1000.0) as i32, (clear * 1000.0) as i32);
+        if self.rim_extra != Some(extra) {
+            self.rim_extra = Some(extra);
+            self.refr_rim = None;
+            self.rim_old = None;
+            self.live_sum = 0;
+        }
         let shape = crate::refract::Shape {
+            top: body.y * sc,
+            band: band_px,
+            fade: fade_to,
+            clear,
             left: body.x * sc,
             right: body.right() * sc,
             bottom: body.bottom() * sc,
@@ -3277,6 +3300,26 @@ impl App {
                     }
                 }
 
+                // the glass lies under the content, so buttons and text stay sharp over it
+                p.push_clip(body);
+                if glass && self.rim_k > 0.003 && body.h >= 56.0 && a_glass > 0.01 {
+                    // the glass edge: the screen behind, bent along the rim (see `prepare_rim`)
+                    if let Some((key, pic)) = &self.refr_rim {
+                        let a = a_glass * self.rim_k;
+                        match &self.rim_old {
+                            // (only while the old picture still fits the notch's size)
+                            Some((old_key, old)) if old_key.0 == key.0 && old_key.1 == key.1 && old_key.2 == key.2 && old_key.3 == key.3 && old_key.4 == key.4 => {
+                                let t = self.rim_x.clamp(0.0, 1.0);
+                                let t = t * t * (3.0 - 2.0 * t);
+                                p.draw_rim(old, a * (1.0 - t));
+                                p.draw_rim(pic, a * t);
+                            }
+                            _ => p.draw_rim(pic, a),
+                        }
+                    }
+                }
+                p.pop_clip();
+
                 p.push_clip(body);
                 let input = self.input.clone();
                 let accent = self.accent;
@@ -3407,22 +3450,6 @@ impl App {
                             ];
                             ui.p.fill_gradient_poly(&pts, &band, cx - 90.0, cx + 90.0);
                             ui.fx.animate = true;
-                        }
-                    }
-                }
-                if glass && self.rim_k > 0.003 && body.h >= 56.0 && a_glass > 0.01 {
-                    // the glass edge: the screen behind, bent along the rim (see `prepare_rim`)
-                    if let Some((key, pic)) = &self.refr_rim {
-                        let a = a_glass * self.rim_k;
-                        match &self.rim_old {
-                            // (only while the old picture still fits the notch's size)
-                            Some((old_key, old)) if old_key.0 == key.0 && old_key.1 == key.1 && old_key.2 == key.2 && old_key.3 == key.3 && old_key.4 == key.4 => {
-                                let t = self.rim_x.clamp(0.0, 1.0);
-                                let t = t * t * (3.0 - 2.0 * t);
-                                p.draw_rim(old, a * (1.0 - t));
-                                p.draw_rim(pic, a * t);
-                            }
-                            _ => p.draw_rim(pic, a),
                         }
                     }
                 }

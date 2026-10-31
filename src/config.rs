@@ -641,6 +641,10 @@ pub struct GlassCfg {
     pub reach: f32,
     /// How softly the glass starts at the outer edge.
     pub softness: f32,
+    /// Glass across the middle of the notch, wherever it is even a little see-through (0 = off).
+    pub middle: f32,
+    /// How much the middle glass bends what is behind it (0 = clear, 1 = like the edge).
+    pub middle_warp: f32,
     /// How see-through the bottom edge of the notch gets (0 = not at all).
     pub fade_amount: f32,
     /// How high up the bottom fade begins (1 = the usual height).
@@ -666,6 +670,8 @@ impl Default for GlassCfg {
             fringe: 0.05,
             reach: 90.0,
             softness: 4.0,
+            middle: 0.85,
+            middle_warp: 0.5,
             fade_amount: 0.8,
             fade_start: 1.7,
             glow_in: 9.0,
@@ -686,6 +692,8 @@ impl GlassCfg {
         self.fringe = self.fringe.clamp(0.0, 0.2);
         self.reach = self.reach.clamp(30.0, 200.0);
         self.softness = self.softness.clamp(0.5, 12.0);
+        self.middle = self.middle.clamp(0.0, 1.0);
+        self.middle_warp = self.middle_warp.clamp(0.0, 1.0);
         self.fade_amount = self.fade_amount.clamp(0.0, 1.0);
         self.fade_start = self.fade_start.clamp(0.5, 3.0);
         self.glow_in = self.glow_in.clamp(2.0, 30.0);
@@ -1027,6 +1035,8 @@ corner = 0.3
 fringe = 0.05
 reach = 90.0
 softness = 4.0
+middle = 0.85
+middle_warp = 0.5
 fade_amount = 0.8
 fade_start = 1.7
 glow_in = 9.0
