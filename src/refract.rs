@@ -1,9 +1,14 @@
 //! The glass edge: a snapshot of the desktop behind the notch, bent along the rim like thick glass.
 //!
-//! A snapshot of the screen is taken once when the notch opens (while the window is still small, so
-//! it does not photograph itself). The rim is worked out from it on the CPU for the notch's current
+//! A snapshot of the screen is taken when the notch opens (while the window is still small, so it
+//! does not photograph itself). The rim is worked out from it on the CPU for the notch's current
 //! size and uploaded as one small picture, drawn with a single call; it is only made again when the
 //! size changes (while a page change resizes the notch, and never while nothing moves).
+//!
+//! Live glass: while the notch is open the screen is looked at again every so often, on a
+//! background thread (`refresh`). The notch is hidden from screen copies for that (the window
+//! is excluded from capture), so the copy shows only what is really behind it. A copy that turns
+//! out identical to the last one is thrown away at once and costs nothing more.
 
 use std::ffi::c_void;
 
@@ -51,11 +56,8 @@ pub fn grab(x: i32, y: i32, w: i32, h: i32) -> Option<Shot> {
                     let ok = BitBlt(hdc, 0, 0, w, h, Some(screen), x, y, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0)).is_ok();
                     if ok {
                         let len = w as usize * h as usize;
-                        let mut px = std::slice::from_raw_parts(bits as *const u32, len).to_vec();
-                        // a screen copy has no alpha: make every pixel opaque
-                        for p in px.iter_mut() {
-                            *p |= 0xFF00_0000;
-                        }
+                        // (a screen copy has no alpha; only the colours are ever read)
+                        let px = std::slice::from_raw_parts(bits as *const u32, len).to_vec();
                         shot = Some(Shot { w: w as usize, h: h as usize, px });
                     }
                     SelectObject(hdc, old);
@@ -84,13 +86,50 @@ pub struct Rim {
 
 /// Where the notch is, in window pixels: left and right edges, the bottom edge and the radius of
 /// its bottom corners; `scale` is device pixels per logical unit.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Shape {
     pub left: f32,
     pub right: f32,
     pub bottom: f32,
     pub radius: f32,
     pub scale: f32,
+}
+
+/// A quick fingerprint of a screen copy (about one pixel in thirteen): equal fingerprints mean
+/// "nothing worth redrawing changed".
+pub fn checksum(s: &Shot) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &p in s.px.iter().step_by(13) {
+        h = (h ^ (p & 0x00FF_FFFF) as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// What a refresh brings back.
+pub struct Fresh {
+    pub shot: Shot,
+    pub sum: u64,
+    /// The notch shape the rim was made for.
+    pub shape: Shape,
+    pub rim: Option<Rim>,
+}
+
+pub enum Fetched {
+    /// Looks exactly like the previous copy: nothing to do.
+    Same,
+    Fresh(Fresh),
+}
+
+/// Copy the screen again and, when it differs from the copy with fingerprint `prev`, work out the
+/// rim for `shape` as well. Meant for a background thread; None when the screen could not be copied.
+pub fn refresh(x: i32, y: i32, w: i32, h: i32, prev: u64, shape: Shape) -> Option<Fetched> {
+    let shot = grab(x, y, w, h)?;
+    let sum = checksum(&shot);
+    if sum == prev {
+        return Some(Fetched::Same);
+    }
+    let made = rim(&shot, shape, 1);
+    Some(Fetched::Fresh(Fresh { shot, sum, shape, rim: made }))
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {

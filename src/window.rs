@@ -20,6 +20,7 @@ pub const WM_APP_BUS: u32 = WM_APP + 2;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 4;
 pub const WM_APP_DRAG: u32 = WM_APP + 5;
+pub const WM_APP_GLASS: u32 = WM_APP + 6;
 
 pub const CLASS_NAME: PCWSTR = w!("DynamicNotch.Window");
 

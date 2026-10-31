@@ -251,7 +251,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 14.0,
+        1 => 15.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -756,6 +756,14 @@ impl Settings {
             a.glass_look,
             "appearance",
             "glass_look",
+        );
+        toggle_row(
+            ui,
+            row_rect(body, 14),
+            "Live glass (follows what is behind)",
+            a.glass_live,
+            "appearance",
+            "glass_live",
         );
     }
 

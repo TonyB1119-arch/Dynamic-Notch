@@ -46,7 +46,7 @@ use crate::sys::dragdrop::{self, DropEvent};
 use crate::tray::{self, MenuState, Tray};
 use crate::ui::{gkey, ButtonStyle, Input, Ui};
 use crate::util::{palette, Color, Rect, SendHwnd};
-use crate::window::{WM_APP_BUS, WM_APP_DRAG, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_TRAY};
+use crate::window::{WM_APP_BUS, WM_APP_DRAG, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_GLASS, WM_APP_TRAY};
 use crate::{ipc, log, sys};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK,
@@ -118,6 +118,12 @@ const CLOCK_STRIP_H: f32 = 52.0;
 const TRIM_DELAY: Duration = Duration::from_secs(10);
 /// Minimum time between purely ambient frames (see `frame`).
 const AMBIENT_GAP: Duration = Duration::from_millis(12);
+/// Live glass: how often the screen behind the notch is looked at again, and how often once
+/// it has not changed for a while.
+const LIVE_FAST: Duration = Duration::from_millis(350);
+const LIVE_SLOW: Duration = Duration::from_millis(800);
+/// Seconds for the glass edge to melt from the old picture into a new one.
+const LIVE_FADE: f32 = 0.4;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// A peek would be visible right now (not hidden, not expanded).
@@ -401,6 +407,23 @@ pub struct App {
     refr_rim: Option<(RimKey, gfx::RimPic)>,
     /// The notch's shape at the previous frame (to tell whether it is still changing size).
     rim_geo: Option<(i32, i32, i32, i32, i32)>,
+    /// The shape (and its quantised key) the current rim was made for.
+    rim_last: Option<((i32, i32, i32, i32, i32), crate::refract::Shape)>,
+    /// Live glass: a refresh running on a background thread.
+    live_rx: Option<Receiver<Option<crate::refract::Fetched>>>,
+    /// When the next refresh is due.
+    live_next: Option<Instant>,
+    /// How many refreshes in a row found nothing new.
+    live_same: u8,
+    /// Fingerprint of the current screen copy.
+    live_sum: u64,
+    /// This Windows cannot hide the notch from screen copies: no live glass.
+    live_dead: bool,
+    /// The notch is hidden from screen copies right now.
+    excl: bool,
+    /// The previous rim picture, while the new one melts in over it.
+    rim_old: Option<(RimKey, gfx::RimPic)>,
+    rim_x: f32,
     refr_retry: Option<Instant>,
     /// The window in front when the copy was taken; if another comes forward the copy is out of date.
     refr_fg: isize,
@@ -525,6 +548,15 @@ impl App {
             refr_shot: None,
             refr_rim: None,
             rim_geo: None,
+            rim_last: None,
+            live_rx: None,
+            live_next: None,
+            live_same: 0,
+            live_sum: 0,
+            live_dead: false,
+            excl: false,
+            rim_old: None,
+            rim_x: 1.0,
             refr_retry: None,
             refr_fg: 0,
             refr_dead: false,
@@ -721,6 +753,10 @@ impl App {
             }
             WM_APP_BUS => {
                 self.drain_bus();
+                Some(LRESULT(0))
+            }
+            WM_APP_GLASS => {
+                self.live_done();
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == TIMER_WAKE => {
@@ -1248,6 +1284,7 @@ impl App {
                 self.request_frame();
             }
         }
+        self.live_tick(now);
         self.schedule_wake();
     }
 
@@ -1283,6 +1320,15 @@ impl App {
         }
         if let Some(t) = self.trim_at {
             consider(t);
+        }
+        if self.live_armed() {
+            if let Some(t) = self.live_next {
+                consider(t);
+            }
+            if self.live_rx.is_some() {
+                // the answer normally arrives as a message; this is only a safety net
+                consider(now + Duration::from_millis(60));
+            }
         }
         if self.mode == Mode::Expanded && self.page == HOME {
             // the flip clock shows seconds: wake at the next full second
@@ -2578,10 +2624,12 @@ impl App {
             self.refr_dead = false;
             self.rim_ok = false;
             self.rim_k = 0.0;
+            self.live_off();
             return;
         }
         let fg = unsafe { GetForegroundWindow() };
-        if self.refr_shot.is_some() && fg != self.hwnd && fg.0 as isize != self.refr_fg {
+        // (with live glass the copy is renewed anyway, so a new window in front is no reason to stop)
+        if self.refr_shot.is_some() && !self.excl && fg != self.hwnd && fg.0 as isize != self.refr_fg {
             // another window came to the front: the copy no longer matches what is behind the
             // notch, so the rim goes rather than show an old picture (until the next opening)
             self.refr_shot = None;
@@ -2594,6 +2642,9 @@ impl App {
         {
             let (x, y, w, h) = self.win_px;
             self.refr_shot = crate::refract::grab(x, y, w, h);
+            if let Some(shot) = &self.refr_shot {
+                self.live_sum = crate::refract::checksum(shot);
+            }
             self.refr_retry = Some(now);
             self.refr_fg = fg.0 as isize;
             if self.refr_shot.is_none() {
@@ -2607,8 +2658,10 @@ impl App {
         let open = self.anim.exp.value > 0.98 || self.anim.peek.value > 0.95;
         if !open {
             self.rim_ok = false;
+            self.live_off();
             return;
         }
+        self.live_sync(now);
         let Some(shot) = self.refr_shot.as_ref() else {
             self.rim_ok = false;
             return;
@@ -2627,11 +2680,6 @@ impl App {
         let step = if self.rim_geo == Some(geo) { 1 } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
-        if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
-            self.rim_ok = true;
-            return;
-        }
-        self.refr_rim = None;
         let shape = crate::refract::Shape {
             left: body.x * sc,
             right: body.right() * sc,
@@ -2639,6 +2687,12 @@ impl App {
             radius: r * sc,
             scale: sc,
         };
+        self.rim_last = Some((geo, shape));
+        if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
+            self.rim_ok = true;
+            return;
+        }
+        self.refr_rim = None;
         if let Some(rim) = crate::refract::rim(shot, shape, step) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
@@ -2649,6 +2703,137 @@ impl App {
             // one more frame so the fine picture follows as soon as the notch has stopped
             self.request_frame();
         }
+    }
+
+    // ----- live glass -----------------------------------------------------------------------
+
+    /// Live glass is switched on, the notch is hidden from screen copies and there is a copy.
+    fn live_armed(&self) -> bool {
+        self.excl && self.refr_shot.is_some() && self.cfg.appearance.glass_live
+    }
+
+    /// ... and the rim is showing, so a refresh would be seen.
+    fn live_wanted(&self) -> bool {
+        self.live_armed() && self.rim_ok
+    }
+
+    /// Hide the notch from screen copies (or show it again). Needs Windows 10 version 2004 or newer;
+    /// when that fails live glass is simply off.
+    fn set_excl(&mut self, on: bool) {
+        if self.excl == on {
+            return;
+        }
+        let how = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+        match unsafe { SetWindowDisplayAffinity(self.hwnd, how) } {
+            Ok(()) => self.excl = on,
+            Err(e) => {
+                if on {
+                    log!("live glass: the notch cannot be hidden from screen copies here ({e}); not used");
+                    self.live_dead = true;
+                }
+            }
+        }
+    }
+
+    /// The notch is open: switch live glass on or off to match the setting and arm the first refresh.
+    fn live_sync(&mut self, now: Instant) {
+        let want = self.cfg.appearance.glass_live && !self.live_dead;
+        self.set_excl(want);
+        if !(want && self.excl) {
+            self.live_next = None;
+            self.live_rx = None;
+            return;
+        }
+        if self.live_next.is_none() && self.live_rx.is_none() && self.refr_shot.is_some() {
+            self.live_same = 0;
+            self.live_next = Some(now + LIVE_FAST);
+        }
+    }
+
+    /// The notch is closed (or the look is off): everything live stops and the notch shows in
+    /// screen copies again.
+    fn live_off(&mut self) {
+        self.set_excl(false);
+        self.live_next = None;
+        self.live_rx = None;
+        self.live_same = 0;
+        self.rim_old = None;
+        self.rim_x = 1.0;
+    }
+
+    /// Timer: pick up a finished refresh, and start the next one when it is due and the notch holds
+    /// still (a refresh is made for one size; a moving notch would leave it out of date).
+    fn live_tick(&mut self, now: Instant) {
+        self.live_done();
+        if !self.live_armed() || self.live_rx.is_some() {
+            return;
+        }
+        if self.live_next.is_none_or(|t| t > now + Duration::from_millis(2)) {
+            return;
+        }
+        let steady = self.rim_last.is_some_and(|(geo, _)| self.rim_geo == Some(geo));
+        let (Some((_, shape)), true) = (self.rim_last, steady && self.rim_ok && self.page_from.is_none() && self.settled)
+        else {
+            self.live_next = Some(now + Duration::from_millis(120));
+            return;
+        };
+        let (x, y, w, h) = self.win_px;
+        let prev = self.live_sum;
+        let hwnd = SendHwnd::new(self.hwnd);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = std::thread::Builder::new().name("glass".into()).spawn(move || {
+            let out = crate::refract::refresh(x, y, w, h, prev, shape);
+            let _ = tx.send(out);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd.hwnd()), WM_APP_GLASS, WPARAM(0), LPARAM(0));
+            }
+        });
+        if job.is_ok() {
+            self.live_rx = Some(rx);
+            self.live_next = None;
+        } else {
+            self.live_next = Some(now + LIVE_SLOW);
+        }
+    }
+
+    /// A refresh has finished: use the new copy, and melt the new rim in over the old one.
+    fn live_done(&mut self) {
+        let Some(rx) = self.live_rx.as_ref() else { return };
+        let out = match rx.try_recv() {
+            Ok(out) => out,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.live_rx = None;
+        let fresh = match out {
+            Some(crate::refract::Fetched::Fresh(f)) => Some(f),
+            _ => None,
+        };
+        // a failed copy counts like "nothing new": it is simply tried again later
+        self.live_same = if fresh.is_some() { 0 } else { (self.live_same + 1).min(8) };
+        let gap = if self.live_same >= 3 { LIVE_SLOW } else { LIVE_FAST };
+        self.live_next = Some(Instant::now() + gap);
+        if let Some(f) = fresh {
+            if self.live_wanted() {
+                self.live_sum = f.sum;
+                self.refr_shot = Some(f.shot);
+                let sc = self.scale;
+                // the rim made on the thread is only good if the notch kept its size meanwhile;
+                // otherwise the next frame makes it again from the new copy
+                if let (Some(rim), Some((geo, shape))) = (f.rim, self.rim_last) {
+                    if shape == f.shape && self.page_from.is_none() {
+                        if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
+                            let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, 1);
+                            self.rim_old = self.refr_rim.take();
+                            self.rim_x = if self.rim_old.is_some() { 0.0 } else { 1.0 };
+                            self.refr_rim = Some((key, pic));
+                            self.request_frame();
+                        }
+                    }
+                }
+            }
+        }
+        self.schedule_wake();
     }
 
     /// 1 while the soft bottom edge is showing, else 0.
@@ -2864,6 +3049,16 @@ impl App {
         }
         if self.bd_k != bd_to || !still {
             fx.animate = true;
+        }
+        if self.rim_old.is_some() {
+            // a new rim is melting in over the old one (see `live_done`); 30 frames a second is plenty
+            self.rim_x += rim_dt / LIVE_FADE;
+            if self.rim_x >= 1.0 {
+                self.rim_x = 1.0;
+                self.rim_old = None;
+            } else {
+                fx.animate_slow = true;
+            }
         }
         let bd_k = self.bd_k;
         let a_r = self.anim.r.value;
@@ -3160,8 +3355,18 @@ impl App {
                 }
                 if glass && self.rim_k > 0.003 && body.h >= 56.0 && a_glass > 0.01 {
                     // the glass edge: the screen behind, bent along the rim (see `prepare_rim`)
-                    if let Some((_, pic)) = &self.refr_rim {
-                        p.draw_rim(pic, a_glass * self.rim_k);
+                    if let Some((key, pic)) = &self.refr_rim {
+                        let a = a_glass * self.rim_k;
+                        match &self.rim_old {
+                            // (only while the old picture still fits the notch's size)
+                            Some((old_key, old)) if old_key.0 == key.0 && old_key.1 == key.1 && old_key.2 == key.2 && old_key.3 == key.3 && old_key.4 == key.4 => {
+                                let t = self.rim_x.clamp(0.0, 1.0);
+                                let t = t * t * (3.0 - 2.0 * t);
+                                p.draw_rim(old, a * (1.0 - t));
+                                p.draw_rim(pic, a * t);
+                            }
+                            _ => p.draw_rim(pic, a),
+                        }
                     }
                 }
                 p.pop_clip();
