@@ -37,6 +37,7 @@ pub struct Config {
     pub dock: DockCfg,
     pub notch: NotchCfg,
     pub tabs: TabsCfg,
+    pub glass: GlassCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -620,6 +621,80 @@ pub struct TabsCfg {
     pub order: Vec<String>,
 }
 
+/// The look of the Alcove glass edge (Settings → Glass). Sizes are in logical pixels.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlassCfg {
+    /// How far in from the edge the glass reaches.
+    pub edge_width: f32,
+    /// How far out the glass looks at its strongest (the warp).
+    pub pull: f32,
+    /// How sharply the bend is concentrated at the very edge (1 = even, 3 = only right at the edge).
+    pub bend: f32,
+    /// How solid the glass is at the edge (0.3 - 1).
+    pub strength: f32,
+    /// Extra warp in the rounded corners (0 - 1).
+    pub corner: f32,
+    /// Colour fringing: red, green and blue look slightly different distances out.
+    pub fringe: f32,
+    /// How far up the sides the glass is drawn before it fades out.
+    pub reach: f32,
+    /// How softly the glass starts at the outer edge.
+    pub softness: f32,
+    /// How see-through the bottom edge of the notch gets (0 = not at all).
+    pub fade_amount: f32,
+    /// How high up the bottom fade begins (1 = the usual height).
+    pub fade_start: f32,
+    /// How quickly the glass fades in (higher = quicker).
+    pub glow_in: f32,
+    /// Live glass: milliseconds between looks at the screen while media plays.
+    pub live_ms: f32,
+    /// Live glass: seconds for the edge to melt from one picture into the next.
+    pub melt: f32,
+    /// While the notch moves, the glass gets its finest detail once this fraction of the move is left.
+    pub sharpen_at: f32,
+}
+
+impl Default for GlassCfg {
+    fn default() -> Self {
+        Self {
+            edge_width: 76.0,
+            pull: 22.0,
+            bend: 1.5,
+            strength: 0.88,
+            corner: 0.3,
+            fringe: 0.05,
+            reach: 90.0,
+            softness: 4.0,
+            fade_amount: 0.8,
+            fade_start: 1.7,
+            glow_in: 9.0,
+            live_ms: 150.0,
+            melt: 0.12,
+            sharpen_at: 0.12,
+        }
+    }
+}
+
+impl GlassCfg {
+    fn clamped(&mut self) {
+        self.edge_width = self.edge_width.clamp(20.0, 160.0);
+        self.pull = self.pull.clamp(0.0, 60.0);
+        self.bend = self.bend.clamp(0.8, 3.0);
+        self.strength = self.strength.clamp(0.3, 1.0);
+        self.corner = self.corner.clamp(0.0, 1.0);
+        self.fringe = self.fringe.clamp(0.0, 0.2);
+        self.reach = self.reach.clamp(30.0, 200.0);
+        self.softness = self.softness.clamp(0.5, 12.0);
+        self.fade_amount = self.fade_amount.clamp(0.0, 1.0);
+        self.fade_start = self.fade_start.clamp(0.5, 3.0);
+        self.glow_in = self.glow_in.clamp(2.0, 30.0);
+        self.live_ms = self.live_ms.clamp(80.0, 500.0);
+        self.melt = self.melt.clamp(0.03, 0.5);
+        self.sharpen_at = self.sharpen_at.clamp(0.02, 0.5);
+    }
+}
+
 pub fn config_path() -> PathBuf {
     app_dir().join("config.toml")
 }
@@ -702,6 +777,7 @@ impl Config {
         self.osd.volume_step = self.osd.volume_step.clamp(1, 25);
         self.bluetooth.low_battery = self.bluetooth.low_battery.min(100);
         self.weather.refresh_minutes = self.weather.refresh_minutes.clamp(5, 360);
+        self.glass.clamped();
         self.home.widgets.truncate(4);
         self.notch.widgets.truncate(3);
         self
@@ -940,6 +1016,23 @@ name = ""
 # Optional: the name of an installed handwriting font to write the hello with (e.g. "Sacramento", "Yellowtail").
 # Empty = Yellowtail if it is installed, otherwise the built-in pen drawing. Also in Settings → General ("Script Regular" needs that font installed).
 font = ""
+
+[glass]
+# The Alcove glass edge (Settings → Glass). Sizes are in logical pixels; delete a line to get its default.
+edge_width = 76.0
+pull = 22.0
+bend = 1.5
+strength = 0.88
+corner = 0.3
+fringe = 0.05
+reach = 90.0
+softness = 4.0
+fade_amount = 0.8
+fade_start = 1.7
+glow_in = 9.0
+live_ms = 150.0
+melt = 0.12
+sharpen_at = 0.12
 
 [tabs]
 # Order of the header tabs (Settings → Tabs). Empty = default order.

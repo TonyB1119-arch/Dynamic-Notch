@@ -84,6 +84,35 @@ pub struct Rim {
     pub px: Vec<u32>,
 }
 
+/// The look of the glass (sizes in logical pixels, scaled by `Shape::scale`). The defaults are the
+/// look the glass has always had.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Tune {
+    pub width: f32,
+    pub pull: f32,
+    pub bend: f32,
+    pub strength: f32,
+    pub corner: f32,
+    pub fringe: f32,
+    pub reach: f32,
+    pub soft: f32,
+}
+
+impl From<&crate::config::GlassCfg> for Tune {
+    fn from(g: &crate::config::GlassCfg) -> Self {
+        Self {
+            width: g.edge_width.clamp(20.0, 160.0),
+            pull: g.pull.clamp(0.0, 60.0),
+            bend: g.bend.clamp(0.8, 3.0),
+            strength: g.strength.clamp(0.3, 1.0),
+            corner: g.corner.clamp(0.0, 1.0),
+            fringe: g.fringe.clamp(0.0, 0.2),
+            reach: g.reach.clamp(30.0, 200.0),
+            soft: g.softness.clamp(0.5, 12.0),
+        }
+    }
+}
+
 /// Where the notch is, in window pixels: left and right edges, the bottom edge and the radius of
 /// its bottom corners; `scale` is device pixels per logical unit.
 #[derive(Clone, Copy, PartialEq)]
@@ -93,6 +122,7 @@ pub struct Shape {
     pub bottom: f32,
     pub radius: f32,
     pub scale: f32,
+    pub tune: Tune,
 }
 
 /// A quick fingerprint of the part of the screen copy the rim actually reads: a thin ring around
@@ -102,11 +132,12 @@ pub struct Shape {
 pub fn ring_sum(s: &Shot, sh: Shape) -> u64 {
     let sc = sh.scale.max(0.5);
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
-    let pad = 32.0 * sc; // the glass pulls from up to this far outside the edge
-    let band = (76.0 * sc + pad).ceil() as i32; // how far in from the edge the rim reaches
+    let t = sh.tune;
+    let pad = (t.pull * (1.0 + t.corner) + 4.0) * sc; // the glass pulls from up to this far outside the edge
+    let band = (t.width * sc + pad).ceil() as i32; // how far in from the edge the rim reaches
     let x0 = ((sh.left - pad).floor() as i32).clamp(0, s.w as i32);
     let x1 = ((sh.right + pad).ceil() as i32).clamp(0, s.w as i32);
-    let y0 = ((sh.bottom - r - 90.0 * sc - pad).floor() as i32).clamp(0, s.h as i32);
+    let y0 = ((sh.bottom - r - t.reach * sc - pad).floor() as i32).clamp(0, s.h as i32);
     let y1 = ((sh.bottom + pad).ceil() as i32).clamp(0, s.h as i32);
     let full_from = (sh.bottom - band as f32).floor() as i32;
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
@@ -193,10 +224,13 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let st = step.max(1);
     let sc = sh.scale.max(0.5);
     // The rim fades out over a long, soft stretch so it melts into the black of the notch.
-    let width = 76.0 * sc; // how far in from the edge the rim reaches
-    let pull = 22.0 * sc; // how far out the strongest pixels look
+    let t = sh.tune;
+    let width = t.width * sc; // how far in from the edge the rim reaches
+    let pull = t.pull * sc; // how far out the strongest pixels look
+    let soft = t.soft * sc;
+    let even_bend = (t.bend - 1.5).abs() < 0.001;
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
-    let reach = r + 90.0 * sc; // how far up the sides it is drawn, fading out toward the top
+    let reach = r + t.reach * sc; // how far up the sides it is drawn, fading out toward the top
     let x0 = ((sh.left - 2.0).floor() as i32).max(0);
     let x1 = ((sh.right + 2.0).ceil() as i32).min(shot.w as i32);
     let y0 = ((sh.bottom - reach).floor() as i32).max(0);
@@ -261,18 +295,18 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             // notch takes over; the tail is smooth, with no visible line where the rim stops.
             let u = 1.0 - d / width;
             let fade = u * u * (1.5 - 0.5 * u);
-            let base = 0.88 + 0.1 * corner;
-            let alpha = (base + (1.0 - base) * smooth(4.0 * sc, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
+            let base = (t.strength + 0.1 * corner).min(1.0);
+            let alpha = (base + (1.0 - base) * smooth(soft, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
             if alpha < 0.004 {
                 continue;
             }
-            let k = u * u.sqrt();
-            let pull = pull * (1.0 + 0.3 * corner);
+            let k = if even_bend { u * u.sqrt() } else { u.powf(t.bend) };
+            let pull = pull * (1.0 + t.corner * corner);
             let (ox, oy) = (nx * pull * k, ny * pull * k);
             // red, green and blue look a slightly different distance out, like light through glass
             let cr = sample(shot, x + ox, y + oy, 16);
-            let cg = sample(shot, x + ox * 0.95, y + oy * 0.95, 8);
-            let cb2 = sample(shot, x + ox * 0.9, y + oy * 0.9, 0);
+            let cg = sample(shot, x + ox * (1.0 - t.fringe), y + oy * (1.0 - t.fringe), 8);
+            let cb2 = sample(shot, x + ox * (1.0 - 2.0 * t.fringe), y + oy * (1.0 - 2.0 * t.fringe), 0);
             let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
             px[j * w + i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }

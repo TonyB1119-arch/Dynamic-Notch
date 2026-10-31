@@ -118,15 +118,9 @@ const CLOCK_STRIP_H: f32 = 52.0;
 const TRIM_DELAY: Duration = Duration::from_secs(10);
 /// Minimum time between purely ambient frames (see `frame`).
 const AMBIENT_GAP: Duration = Duration::from_millis(12);
-/// Live glass: how often the screen behind the notch is looked at again, and how often once
-/// it has not changed for a while.
-const LIVE_FAST: Duration = Duration::from_millis(150);
-const LIVE_SLOW: Duration = Duration::from_millis(600);
 /// Live glass carries on this long after the media stops (pausing a video for a moment must not
 /// switch it off and on again).
 const LIVE_LINGER: Duration = Duration::from_secs(6);
-/// Seconds for the glass edge to melt from the old picture into a new one.
-const LIVE_FADE: f32 = 0.12;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// A peek would be visible right now (not hidden, not expanded).
@@ -414,6 +408,8 @@ pub struct App {
     rim_far: f32,
     /// The shape (and its quantised key) the current rim was made for.
     rim_last: Option<((i32, i32, i32, i32, i32), crate::refract::Shape)>,
+    /// The glass settings the current rim was made with (a change makes it again).
+    rim_tune: Option<crate::refract::Tune>,
     /// Live glass: a refresh running on a background thread.
     live_rx: Option<Receiver<Option<crate::refract::Fetched>>>,
     /// When the next refresh is due.
@@ -557,6 +553,7 @@ impl App {
             rim_geo: None,
             rim_far: 0.0,
             rim_last: None,
+            rim_tune: None,
             live_rx: None,
             live_next: None,
             live_same: 0,
@@ -2636,6 +2633,14 @@ impl App {
             self.live_off();
             return;
         }
+        // a change in Settings → Glass: the rim is made again with the new look
+        let tune = crate::refract::Tune::from(&self.cfg.glass);
+        if self.rim_tune != Some(tune) {
+            self.rim_tune = Some(tune);
+            self.refr_rim = None;
+            self.rim_old = None;
+            self.live_sum = 0;
+        }
         let fg = unsafe { GetForegroundWindow() };
         // (with live glass the copy is renewed anyway, so a new window in front is no reason to stop)
         if self.refr_shot.is_some() && !self.excl && fg != self.hwnd && fg.0 as isize != self.refr_fg {
@@ -2693,7 +2698,7 @@ impl App {
         // detail, so it is sharp by the time the notch arrives
         let left = (self.anim.w.target - self.anim.w.value).abs() + (self.anim.h.target - self.anim.h.value).abs();
         self.rim_far = if still { 0.0 } else { self.rim_far.max(left) };
-        let late = self.rim_far >= 24.0 && left <= self.rim_far * 0.12;
+        let late = self.rim_far >= 24.0 && left <= self.rim_far * self.cfg.glass.sharpen_at.clamp(0.02, 0.5);
         let step = if still || late { fine } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
@@ -2703,6 +2708,7 @@ impl App {
             bottom: body.bottom() * sc,
             radius: r * sc,
             scale: sc,
+            tune,
         };
         self.rim_last = Some((geo, shape));
         if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
@@ -2769,6 +2775,11 @@ impl App {
         }
     }
 
+    /// Time between looks at the screen while live glass is busy (Settings → Glass).
+    fn live_fast(&self) -> Duration {
+        Duration::from_millis(self.cfg.glass.live_ms.clamp(80.0, 500.0) as u64)
+    }
+
     /// The notch is open: switch live glass on or off to match the setting and arm the first refresh.
     fn live_sync(&mut self, now: Instant) {
         let want = self.cfg.appearance.glass_live && !self.live_dead && self.live_media(now);
@@ -2780,7 +2791,7 @@ impl App {
         }
         if self.live_next.is_none() && self.live_rx.is_none() && self.refr_shot.is_some() {
             self.live_same = 0;
-            self.live_next = Some(now + LIVE_FAST);
+            self.live_next = Some(now + self.live_fast());
         }
     }
 
@@ -2837,7 +2848,7 @@ impl App {
             self.live_rx = Some(rx);
             self.live_next = None;
         } else {
-            self.live_next = Some(now + LIVE_SLOW);
+            self.live_next = Some(now + self.live_fast() * 4);
         }
     }
 
@@ -2856,7 +2867,7 @@ impl App {
         };
         // a failed copy counts like "nothing new": it is simply tried again later
         self.live_same = if fresh.is_some() { 0 } else { (self.live_same + 1).min(8) };
-        let gap = if self.live_same >= 3 { LIVE_SLOW } else { LIVE_FAST };
+        let gap = if self.live_same >= 3 { self.live_fast() * 4 } else { self.live_fast() };
         self.live_next = Some(Instant::now() + gap);
         if let Some(f) = fresh {
             if self.live_wanted() {
@@ -3064,7 +3075,8 @@ impl App {
         let rim_to = if self.rim_ok { 1.0 } else { 0.0 };
         let rim_dt = now.saturating_duration_since(self.rim_at).as_secs_f32().min(0.1);
         self.rim_at = now;
-        let rim_rate = if rim_to > self.rim_k { 9.0 } else { 18.0 };
+        let glow = self.cfg.glass.glow_in.clamp(2.0, 30.0);
+        let rim_rate = if rim_to > self.rim_k { glow } else { glow * 2.0 };
         self.rim_k += (rim_to - self.rim_k) * (1.0 - (-rim_rate * rim_dt).exp());
         if (rim_to - self.rim_k).abs() < 0.01 {
             self.rim_k = rim_to;
@@ -3097,7 +3109,7 @@ impl App {
         }
         if self.rim_old.is_some() {
             // a new rim is melting in over the old one (see `live_done`); 30 frames a second is plenty
-            self.rim_x += rim_dt / LIVE_FADE;
+            self.rim_x += rim_dt / self.cfg.glass.melt.clamp(0.03, 0.5);
             if self.rim_x >= 1.0 {
                 self.rim_x = 1.0;
                 self.rim_old = None;
@@ -3240,8 +3252,8 @@ impl App {
                         // Alcove: the glass turns see-through toward the bottom edge
                         // it starts higher up and follows a gentle S, so there is no point where the
                         // black visibly begins to thin out
-                        let from = 1.0 - bh * 1.7 / body.h;
-                        let drop = 0.8 * band_k * bd_k;
+                        let from = 1.0 - bh * self.cfg.glass.fade_start.clamp(0.5, 3.0) / body.h;
+                        let drop = self.cfg.glass.fade_amount.clamp(0.0, 1.0) * band_k * bd_k;
                         let at = |t: f32| {
                             let e = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
                             Color::black(bg_alpha * (1.0 - drop * e))

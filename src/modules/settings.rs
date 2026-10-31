@@ -18,7 +18,7 @@ use crate::updater;
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 9] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock"];
+const TABS: [&str; 10] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass"];
 const ROW_H: f32 = 36.0;
 const ROW_GAP: f32 = 4.0;
 const TAB_H: f32 = 32.0;
@@ -258,7 +258,8 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        _ => 8.6,
+        8 => 8.6,
+        _ => 15.0,
     }
 }
 
@@ -446,7 +447,8 @@ impl Module for Settings {
             5 => self.gemini(ui, body),
             6 => self.notch(ui, body),
             7 => self.tabs(ui, body),
-            _ => self.dock(ui, body),
+            8 => self.dock(ui, body),
+            _ => self.glass(ui, body),
         }
         if long {
             ui.p.pop_clip();
@@ -914,6 +916,54 @@ impl Settings {
             Rect::new(body.x + 2.0, oy + 58.0, body.w, 18.0),
             &TextStyle::new(11.5, palette::TEXT_FAINT),
         );
+    }
+
+    /// Settings → Glass: one slider for each dial of the Alcove glass edge.
+    fn glass(&mut self, ui: &mut Ui, body: Rect) {
+        let g = self.cfg.glass.clone();
+        // (label, value, range, shown, key)
+        let rows: [(&str, f32, (f32, f32), String, &str); 14] = [
+            ("Edge width", g.edge_width, (20.0, 160.0), format!("{:.0}", g.edge_width), "edge_width"),
+            ("Warp strength", g.pull, (0.0, 60.0), format!("{:.0}", g.pull), "pull"),
+            ("Bend curve", g.bend, (0.8, 3.0), format!("{:.1}", g.bend), "bend"),
+            ("Edge opacity", g.strength, (0.3, 1.0), format!("{:.0}%", g.strength * 100.0), "strength"),
+            ("Corner warp", g.corner, (0.0, 1.0), format!("{:.0}%", g.corner * 100.0), "corner"),
+            ("Colour fringing", g.fringe, (0.0, 0.2), format!("{:.0}%", g.fringe * 500.0), "fringe"),
+            ("Reach up the sides", g.reach, (30.0, 200.0), format!("{:.0}", g.reach), "reach"),
+            ("Outer edge softness", g.softness, (0.5, 12.0), format!("{:.1}", g.softness), "softness"),
+            ("Bottom fade amount", g.fade_amount, (0.0, 1.0), format!("{:.0}%", g.fade_amount * 100.0), "fade_amount"),
+            ("Bottom fade start", g.fade_start, (0.5, 3.0), format!("{:.1}", g.fade_start), "fade_start"),
+            ("Glow fade-in speed", g.glow_in, (2.0, 30.0), format!("{:.0}", g.glow_in), "glow_in"),
+            ("Live refresh (ms)", g.live_ms, (80.0, 500.0), format!("{:.0}", g.live_ms), "live_ms"),
+            ("Live melt time (s)", g.melt, (0.03, 0.5), format!("{:.2}", g.melt), "melt"),
+            ("Sharpen when left", g.sharpen_at, (0.02, 0.5), format!("{:.0}%", g.sharpen_at * 100.0), "sharpen_at"),
+        ];
+        for (i, (text, val, range, shown, key)) in rows.into_iter().enumerate() {
+            slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
+        }
+        let d = crate::config::GlassCfg::default();
+        let b = row_rect(body, 14);
+        let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
+        if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
+            for (key, v) in [
+                ("edge_width", d.edge_width),
+                ("pull", d.pull),
+                ("bend", d.bend),
+                ("strength", d.strength),
+                ("corner", d.corner),
+                ("fringe", d.fringe),
+                ("reach", d.reach),
+                ("softness", d.softness),
+                ("fade_amount", d.fade_amount),
+                ("fade_start", d.fade_start),
+                ("glow_in", d.glow_in),
+                ("live_ms", d.live_ms),
+                ("melt", d.melt),
+                ("sharpen_at", d.sharpen_at),
+            ] {
+                put(ui, "glass", key, format!("{v:.2}"));
+            }
+        }
     }
 
     fn dock(&mut self, ui: &mut Ui, body: Rect) {
