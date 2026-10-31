@@ -378,6 +378,17 @@ impl Anim {
 /// Cache key of the glass rim: position, size, corner radius and scale, in quarter pixels.
 type RimKey = (i32, i32, i32, i32, i32, usize);
 
+/// A glass picture made while the notch moves carries 10 in its last field (reduced detail).
+const RIM_LOW: usize = 10;
+
+/// The two pictures belong to the same notch size (give or take a pixel).
+fn rim_near(a: &RimKey, b: &RimKey) -> bool {
+    // (whole pixels while moving, quarter pixels once settled)
+    let (ua, ub) = (if a.5 >= RIM_LOW { 1 } else { 4 }, if b.5 >= RIM_LOW { 1 } else { 4 });
+    let tol = if ua == ub { 0 } else { 4 };
+    a.4 == b.4 && [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)].iter().all(|&(x, y)| (x * ub - y * ua).abs() <= tol)
+}
+
 /// The few look settings the drawing code reads every frame, copied out so no text is cloned.
 #[derive(Clone, Copy)]
 struct Look {
@@ -2433,7 +2444,7 @@ impl App {
                 let tm = self.tm;
                 let ms = |us: u64| us as f64 / 1000.0;
                 log!(
-                    "  timing: draw {:.2} ms avg, {:.2} ms worst | pictures {:.1} ms, bottom blur {:.1} ms, glass check {:.1} ms (totals) | {} glass rebuilds, {:.1} ms (total) | {} frames skipped in the slow tail",
+                    "  timing: draw {:.2} ms avg, {:.2} ms worst | pictures {:.1} ms, bottom blur {:.1} ms, glass check {:.1} ms (totals) | {} glass rebuilds, {:.1} ms (total) | {} frames skipped in the slow tail | glass: middle warp {:.2}, middle blur {:.2}, full-detail zone {:.1}",
                     ms(tm[0]) / tm[2].max(1) as f64,
                     ms(tm[1]),
                     ms(tm[3]),
@@ -2441,7 +2452,10 @@ impl App {
                     ms(tm[5]),
                     tm[7],
                     ms(tm[6]),
-                    tm[8]
+                    tm[8],
+                    self.cfg.glass.middle_warp,
+                    self.cfg.glass.middle_blur,
+                    self.cfg.glass.sharp_zone
                 );
                 self.tm = [0; 9];
             }
@@ -2729,7 +2743,12 @@ impl App {
         let step = fine;
         let _ = late;
         self.rim_geo = Some(geo);
-        let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
+        // While the size is still changing the sharp zone is capped: the glass is rebuilt for nearly
+        // every frame then, and the full-detail band along the edge is what costs most. The full
+        // picture follows as soon as the notch stops and melts in over this one.
+        const MOVING_ZONE: f32 = 0.55;
+        let low = !self.settled && tune.sharp > MOVING_ZONE && !still;
+        let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step + if low { RIM_LOW } else { 0 });
         // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
         // all of it (the middle glass follows that)
         let ap = &self.cfg.appearance;
@@ -2773,13 +2792,17 @@ impl App {
         }
         let prev = self.refr_rim.take();
         let t_rim = self.debug.then(Instant::now);
-        if let Some(rim) = crate::refract::rim(shot, shape, step) {
+        let mut made = shape;
+        if low {
+            made.tune.sharp = MOVING_ZONE;
+        }
+        if let Some(rim) = crate::refract::rim(shot, made, step) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
                 // the notch has just stopped and the fine rim replaces the coarse one made while it
                 // moved: the two melt into each other instead of one jumping to the other
                 if let Some(old) = prev {
-                    if old.0 .5 > key.5 && old.0 .0 == key.0 && old.0 .1 == key.1 && old.0 .2 == key.2 && old.0 .3 == key.3 && old.0 .4 == key.4 {
+                    if old.0 .5 > key.5 && rim_near(&old.0, &key) {
                         self.rim_old = Some(old);
                         self.rim_x = 0.0;
                     }
@@ -2791,7 +2814,7 @@ impl App {
             self.tm[7] += 1;
         }
         self.rim_ok = self.refr_rim.is_some();
-        if step > fine && self.rim_ok {
+        if low && self.rim_ok {
             // one more frame so the fine picture follows as soon as the notch has stopped
             self.request_frame();
         }
@@ -3372,7 +3395,7 @@ impl App {
                         let a = a_glass * self.rim_k;
                         match &self.rim_old {
                             // (only while the old picture still fits the notch's size)
-                            Some((old_key, old)) if old_key.0 == key.0 && old_key.1 == key.1 && old_key.2 == key.2 && old_key.3 == key.3 && old_key.4 == key.4 => {
+                            Some((old_key, old)) if rim_near(old_key, key) => {
                                 let t = self.rim_x.clamp(0.0, 1.0);
                                 let t = t * t * (3.0 - 2.0 * t);
                                 p.draw_rim(old, a * (1.0 - t));
