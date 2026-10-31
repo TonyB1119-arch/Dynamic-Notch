@@ -170,7 +170,14 @@ fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
         let yi = y.clamp(0, s.h as i32 - 1) as usize;
         ((s.px[yi * s.w + xi] >> shift) & 255) as f32
     };
-    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let (a, b, c, d) = if x0 >= 0 && y0 >= 0 && (x0 as usize) + 1 < s.w && (y0 as usize) + 1 < s.h {
+        // the usual case: all four pixels are inside the copy
+        let i = y0 as usize * s.w + x0 as usize;
+        let g = |p: u32| ((p >> shift) & 255) as f32;
+        (g(s.px[i]), g(s.px[i + 1]), g(s.px[i + s.w]), g(s.px[i + s.w + 1]))
+    } else {
+        (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1))
+    };
     let top = a + (b - a) * tx;
     let bot = c + (d - c) * tx;
     top + (bot - top) * ty

@@ -410,6 +410,8 @@ pub struct App {
     refr_rim: Option<(RimKey, gfx::RimPic)>,
     /// The notch's shape at the previous frame (to tell whether it is still changing size).
     rim_geo: Option<(i32, i32, i32, i32, i32)>,
+    /// How far (in logical px of width + height) the notch had to go when the current move began.
+    rim_far: f32,
     /// The shape (and its quantised key) the current rim was made for.
     rim_last: Option<((i32, i32, i32, i32, i32), crate::refract::Shape)>,
     /// Live glass: a refresh running on a background thread.
@@ -553,6 +555,7 @@ impl App {
             refr_shot: None,
             refr_rim: None,
             rim_geo: None,
+            rim_far: 0.0,
             rim_last: None,
             live_rx: None,
             live_next: None,
@@ -2684,7 +2687,14 @@ impl App {
         // frame after it has stopped makes the fine one
         // (live glass keeps making half-detail rims, so that is what "fine" means while it is on)
         let fine = if self.live_armed() { 2 } else { 1 };
-        let step = if self.rim_geo == Some(geo) { fine } else { 2 };
+        let still = self.rim_geo == Some(geo);
+        // how far the notch still has to go, and how far it had to go when this move began: in the
+        // last third of a real move the rim is already made at full detail, so it is sharp by the
+        // time the notch arrives (the work is spread over the slow end of the move)
+        let left = (self.anim.w.target - self.anim.w.value).abs() + (self.anim.h.target - self.anim.h.value).abs();
+        self.rim_far = if still { 0.0 } else { self.rim_far.max(left) };
+        let late = self.rim_far >= 24.0 && left <= self.rim_far * 0.34;
+        let step = if still || late { fine } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
         let shape = crate::refract::Shape {
