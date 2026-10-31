@@ -120,8 +120,8 @@ fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
 pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
     let sc = sh.scale.max(0.5);
     // The rim fades out over a long, soft stretch so it melts into the black of the notch.
-    let width = 64.0 * sc; // how far in from the edge the rim reaches
-    let pull = 20.0 * sc; // how far out the strongest pixels look
+    let width = 76.0 * sc; // how far in from the edge the rim reaches
+    let pull = 22.0 * sc; // how far out the strongest pixels look
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + 90.0 * sc; // how far up the sides it is drawn, fading out toward the top
     let x0 = ((sh.left - 2.0).floor() as i32).max(0);
@@ -184,8 +184,8 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             // edge, and strongest of all in the corners, then eases away quickly so the black of the
             // notch takes over; the tail is smooth, with no visible line where the rim stops.
             let u = 1.0 - d / width;
-            let fade = u * u * (0.5 + 0.5 * u);
-            let alpha = (0.8 + 0.15 * corner) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
+            let fade = u * u * (1.5 - 0.5 * u);
+            let alpha = (0.88 + 0.1 * corner) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
             if alpha < 0.004 {
                 continue;
             }

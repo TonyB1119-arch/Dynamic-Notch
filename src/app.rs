@@ -2959,13 +2959,27 @@ impl App {
                     let bh = self.snap_band.as_ref().map_or(BAND_H, |b| b.rect.h);
                     if band_k > 0.01 && body.h > bh * 2.0 {
                         // Alcove: the glass turns see-through toward the bottom edge
-                        let from = 1.0 - bh / body.h;
-                        let low = bg_alpha * (1.0 - 0.62 * band_k * bd_k);
+                        // it starts higher up and follows a gentle S, so there is no point where the
+                        // black visibly begins to thin out
+                        let from = 1.0 - bh * 1.5 / body.h;
+                        let drop = 0.66 * band_k * bd_k;
+                        let at = |t: f32| {
+                            let e = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+                            Color::black(bg_alpha * (1.0 - drop * e))
+                        };
+                        let span = 1.0 - from;
                         p.fill_geometry_vgrad(
                             &g,
                             body.y,
                             body.bottom(),
-                            &[(0.0, Color::black(bg_alpha)), (from, Color::black(bg_alpha)), (1.0, Color::black(low))],
+                            &[
+                                (0.0, Color::black(bg_alpha)),
+                                (from, Color::black(bg_alpha)),
+                                (from + span * 0.25, at(0.25)),
+                                (from + span * 0.5, at(0.5)),
+                                (from + span * 0.75, at(0.75)),
+                                (1.0, at(1.0)),
+                            ],
                         );
                     } else {
                         p.fill_geometry(&g, Color::black(bg_alpha));
