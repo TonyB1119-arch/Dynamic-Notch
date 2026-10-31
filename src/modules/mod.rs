@@ -354,6 +354,11 @@ pub trait Module {
     }
     fn on_tick(&mut self, cx: &mut Cx) {}
 
+    /// Media is playing right now (used to decide whether the glass edge needs to stay live).
+    fn is_playing(&self) -> bool {
+        false
+    }
+
     fn activity(&self) -> Option<Activity> {
         None
     }

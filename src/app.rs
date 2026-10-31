@@ -122,6 +122,9 @@ const AMBIENT_GAP: Duration = Duration::from_millis(12);
 /// it has not changed for a while.
 const LIVE_FAST: Duration = Duration::from_millis(350);
 const LIVE_SLOW: Duration = Duration::from_millis(800);
+/// Live glass carries on this long after the media stops (pausing a video for a moment must not
+/// switch it off and on again).
+const LIVE_LINGER: Duration = Duration::from_secs(6);
 /// Seconds for the glass edge to melt from the old picture into a new one.
 const LIVE_FADE: f32 = 0.4;
 
@@ -419,6 +422,8 @@ pub struct App {
     live_sum: u64,
     /// This Windows cannot hide the notch from screen copies: no live glass.
     live_dead: bool,
+    /// When media was last seen playing.
+    play_seen: Option<Instant>,
     /// The notch is hidden from screen copies right now.
     excl: bool,
     /// The previous rim picture, while the new one melts in over it.
@@ -554,6 +559,7 @@ impl App {
             live_same: 0,
             live_sum: 0,
             live_dead: false,
+            play_seen: None,
             excl: false,
             rim_old: None,
             rim_x: 1.0,
@@ -2717,6 +2723,15 @@ impl App {
         self.live_armed() && self.rim_ok
     }
 
+    /// Media is playing, or stopped only a moment ago: the screen behind the notch may be moving.
+    fn live_media(&mut self, now: Instant) -> bool {
+        let playing = self.module_index("media").is_some_and(|i| self.started[i] && self.modules[i].is_playing());
+        if playing {
+            self.play_seen = Some(now);
+        }
+        self.play_seen.is_some_and(|t| now.saturating_duration_since(t) < LIVE_LINGER)
+    }
+
     /// Hide the notch from screen copies (or show it again). Needs Windows 10 version 2004 or newer;
     /// when that fails live glass is simply off.
     fn set_excl(&mut self, on: bool) {
@@ -2737,7 +2752,7 @@ impl App {
 
     /// The notch is open: switch live glass on or off to match the setting and arm the first refresh.
     fn live_sync(&mut self, now: Instant) {
-        let want = self.cfg.appearance.glass_live && !self.live_dead;
+        let want = self.cfg.appearance.glass_live && !self.live_dead && self.live_media(now);
         self.set_excl(want);
         if !(want && self.excl) {
             self.live_next = None;
@@ -2759,6 +2774,7 @@ impl App {
         self.live_same = 0;
         self.rim_old = None;
         self.rim_x = 1.0;
+        self.play_seen = None;
     }
 
     /// Timer: pick up a finished refresh, and start the next one when it is due and the notch holds
@@ -2766,6 +2782,11 @@ impl App {
     fn live_tick(&mut self, now: Instant) {
         self.live_done();
         if !self.live_armed() || self.live_rx.is_some() {
+            return;
+        }
+        if !self.live_media(now) {
+            // the media has been quiet for a while: the picture behind is as good as it will get
+            self.live_off();
             return;
         }
         if self.live_next.is_none_or(|t| t > now + Duration::from_millis(2)) {

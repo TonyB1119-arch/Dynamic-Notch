@@ -760,7 +760,7 @@ impl Settings {
         toggle_row(
             ui,
             row_rect(body, 14),
-            "Live glass (follows what is behind)",
+            "Live glass while media plays",
             a.glass_live,
             "appearance",
             "glass_live",

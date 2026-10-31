@@ -117,8 +117,8 @@ pub struct Appearance {
     pub bottom_fade: bool,
     /// Alcove: the open notch's edge bends what is behind it, like thick glass.
     pub glass_look: bool,
-    /// Alcove: the glass edge keeps up with what is behind the notch (the screen is looked at again
-    /// a few times a second while the notch is open). Turn off to save a little CPU.
+    /// Alcove: while media is playing and the notch is open, the glass edge keeps up with what is
+    /// behind the notch (the screen is looked at again a few times a second). Turn off to save CPU.
     pub glass_live: bool,
     /// Extra UI scale on top of the monitor DPI.
     pub scale: f32,
@@ -758,8 +758,8 @@ motion_cache = true
 bottom_fade = true
 # Alcove: the notch's edge bends what is behind it (false = plain glass)
 glass_look = true
-# Alcove: the glass edge keeps up with what is behind the notch (a little extra CPU while open;
-# it also hides the open notch from screenshots and screen recordings)
+# Alcove: while media plays and the notch is open, the glass edge keeps up with what is behind it
+# (a little extra CPU; during that time the notch is hidden from screenshots and screen recordings)
 glass_live = true
 # "auto" picks the accent from album art, or use "#RRGGBB"
 accent = "auto"

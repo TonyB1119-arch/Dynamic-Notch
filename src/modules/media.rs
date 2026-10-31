@@ -399,6 +399,10 @@ impl Module for Media {
         cx.fx.redraw = true;
     }
 
+    fn is_playing(&self) -> bool {
+        self.playing()
+    }
+
     fn activity(&self) -> Option<Activity> {
         if !self.visible() {
             return None;
