@@ -408,6 +408,11 @@ pub struct App {
     rim_ok: bool,
     rim_k: f32,
     rim_at: Instant,
+    /// How much of the frosted layer behind the notch is let through (0 while the notch changes
+    /// size, because that layer is moved by Windows a moment later and would trail the edge) and
+    /// the body size at the last frame.
+    bd_k: f32,
+    bd_prev: (f32, f32),
     /// When the blur strip first appeared (it fades in from here).
     band_since: Option<Instant>,
     pacer: Pacer,
@@ -519,6 +524,8 @@ impl App {
             rim_ok: false,
             rim_k: 0.0,
             rim_at: Instant::now(),
+            bd_k: 1.0,
+            bd_prev: (0.0, 0.0),
             band_since: None,
             pacer,
             bus,
@@ -2805,6 +2812,21 @@ impl App {
         if self.rim_k != rim_to {
             fx.animate = true;
         }
+        // while the notch changes size the frosted layer behind it would trail the edge as a second,
+        // fainter outline: it is let go quickly, the bottom edge turns solid with it, and both come
+        // back smoothly once the size holds still
+        let moved = (body.w - self.bd_prev.0).abs() + (body.h - self.bd_prev.1).abs();
+        self.bd_prev = (body.w, body.h);
+        let bd_to = if moved > 1.0 { 0.0 } else { 1.0 };
+        let bd_rate = if bd_to < self.bd_k { 30.0 } else { 9.0 };
+        self.bd_k += (bd_to - self.bd_k) * (1.0 - (-bd_rate * rim_dt).exp());
+        if (bd_to - self.bd_k).abs() < 0.01 {
+            self.bd_k = bd_to;
+        }
+        if self.bd_k != bd_to {
+            fx.animate = true;
+        }
+        let bd_k = self.bd_k;
         let a_r = self.anim.r.value;
         let a_ear = self.anim.ear.value;
         let a_compact = self.anim.compact.value;
@@ -2938,7 +2960,7 @@ impl App {
                     if band_k > 0.01 && body.h > bh * 2.0 {
                         // Alcove: the glass turns see-through toward the bottom edge
                         let from = 1.0 - bh / body.h;
-                        let low = bg_alpha * (1.0 - 0.74 * band_k);
+                        let low = bg_alpha * (1.0 - 0.62 * band_k * bd_k);
                         p.fill_geometry_vgrad(
                             &g,
                             body.y,
@@ -3118,7 +3140,7 @@ impl App {
         // The frosted layer is dark and strong; under the see-through bottom edge it is only
         // blended in lightly, so the page behind still shows through softly.
         let blur = if band_k > 0.01 && !see_through { blur * 0.4 } else { blur };
-        self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value);
+        self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value * bd_k);
 
         if let Some(page) = fx.open_page.take() {
             if self.mode == Mode::Expanded && self.page_available(page) {

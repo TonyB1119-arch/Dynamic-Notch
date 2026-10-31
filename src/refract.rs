@@ -152,6 +152,7 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             let d;
             let nx;
             let ny;
+            let mut corner = 0.0;
             if y > cb && (x < cl || x > cr) {
                 let cx = if x < cl { cl } else { cr };
                 let (dx, dy) = (x - cx, y - cb);
@@ -159,6 +160,7 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
                 d = r - dist;
                 nx = dx / dist;
                 ny = dy / dist;
+                corner = 1.0;
             } else {
                 let (dl, dr, db) = (x - sh.left, sh.right - x, sh.bottom - y);
                 if db <= dl && db <= dr {
@@ -178,14 +180,17 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             if d <= -1.0 || d >= width {
                 continue;
             }
-            // u: 1 at the edge, 0 at the inner end of the rim. The strength follows a smooth S, so
-            // it starts and ends gently, with no visible line where the rim stops.
+            // u: 1 at the edge, 0 at the inner end of the rim. The glass is strongest right at the
+            // edge, and strongest of all in the corners, then eases away quickly so the black of the
+            // notch takes over; the tail is smooth, with no visible line where the rim stops.
             let u = 1.0 - d / width;
-            let alpha = 0.6 * u * u * (3.0 - 2.0 * u) * (d + 1.0).clamp(0.0, 1.0) * up;
+            let fade = u * u * (0.5 + 0.5 * u);
+            let alpha = (0.8 + 0.15 * corner) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
             if alpha < 0.004 {
                 continue;
             }
             let k = u * u.sqrt();
+            let pull = pull * (1.0 + 0.3 * corner);
             let (ox, oy) = (nx * pull * k, ny * pull * k);
             // red, green and blue look a slightly different distance out, like light through glass
             let cr = sample(shot, x + ox, y + oy, 16);
