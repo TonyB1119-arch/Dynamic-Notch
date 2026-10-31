@@ -2689,11 +2689,11 @@ impl App {
         let fine = if self.live_armed() { 2 } else { 1 };
         let still = self.rim_geo == Some(geo);
         // how far the notch still has to go, and how far it had to go when this move began: in the
-        // last third of a real move the rim is already made at full detail, so it is sharp by the
-        // time the notch arrives (the work is spread over the slow end of the move)
+        // last part of a real move (the last ~12 %, where it is slow) the rim is already made at full
+        // detail, so it is sharp by the time the notch arrives
         let left = (self.anim.w.target - self.anim.w.value).abs() + (self.anim.h.target - self.anim.h.value).abs();
         self.rim_far = if still { 0.0 } else { self.rim_far.max(left) };
-        let late = self.rim_far >= 24.0 && left <= self.rim_far * 0.34;
+        let late = self.rim_far >= 24.0 && left <= self.rim_far * 0.12;
         let step = if still || late { fine } else { 2 };
         self.rim_geo = Some(geo);
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);

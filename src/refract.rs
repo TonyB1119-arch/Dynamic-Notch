@@ -235,7 +235,8 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 d = r - dist;
                 nx = dx / dist;
                 ny = dy / dist;
-                corner = 1.0;
+                // 0 where the curve meets the straight edges, 1 in the middle of the curve (no seam)
+                corner = (2.0 * dx.abs() * dy / (dist * dist)).clamp(0.0, 1.0);
             } else {
                 let (dl, dr, db) = (x - sh.left, sh.right - x, sh.bottom - y);
                 if db <= dl && db <= dr {
@@ -260,7 +261,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             // notch takes over; the tail is smooth, with no visible line where the rim stops.
             let u = 1.0 - d / width;
             let fade = u * u * (1.5 - 0.5 * u);
-            let alpha = (0.88 + 0.1 * corner) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
+            let alpha = (0.88 + 0.1 * corner) * fade * smooth(-1.0, 2.5 * sc, d) * up;
             if alpha < 0.004 {
                 continue;
             }
