@@ -413,6 +413,8 @@ pub struct App {
     /// the body size at the last frame.
     bd_k: f32,
     bd_prev: (f32, f32),
+    /// When the notch last changed size.
+    bd_move: Instant,
     /// When the blur strip first appeared (it fades in from here).
     band_since: Option<Instant>,
     pacer: Pacer,
@@ -526,6 +528,7 @@ impl App {
             rim_at: Instant::now(),
             bd_k: 1.0,
             bd_prev: (0.0, 0.0),
+            bd_move: Instant::now(),
             band_since: None,
             pacer,
             bus,
@@ -2817,13 +2820,22 @@ impl App {
         // back smoothly once the size holds still
         let moved = (body.w - self.bd_prev.0).abs() + (body.h - self.bd_prev.1).abs();
         self.bd_prev = (body.w, body.h);
-        let bd_to = if moved > 1.0 { 0.0 } else { 1.0 };
-        let bd_rate = if bd_to < self.bd_k { 30.0 } else { 9.0 };
-        self.bd_k += (bd_to - self.bd_k) * (1.0 - (-bd_rate * rim_dt).exp());
+        // gone the very frame the size starts to change (a fade would still show the trailing
+        // outline), and only back a moment after it holds still, as the layer needs a few frames
+        // to catch up with the new size
+        if moved > 0.25 {
+            self.bd_move = now;
+            self.bd_k = 0.0;
+        }
+        let still = now.saturating_duration_since(self.bd_move) > Duration::from_millis(140);
+        let bd_to = if still { 1.0 } else { 0.0 };
+        if bd_to > self.bd_k {
+            self.bd_k += (bd_to - self.bd_k) * (1.0 - (-10.0 * rim_dt).exp());
+        }
         if (bd_to - self.bd_k).abs() < 0.01 {
             self.bd_k = bd_to;
         }
-        if self.bd_k != bd_to {
+        if self.bd_k != bd_to || !still {
             fx.animate = true;
         }
         let bd_k = self.bd_k;
