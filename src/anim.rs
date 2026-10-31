@@ -22,7 +22,7 @@ pub struct Spring {
 impl Spring {
     pub fn new(value: f32, response: f32, damping_ratio: f32) -> Self {
         let mut s =
-            Self { value, velocity: 0.0, target: value, stiffness: 0.0, damping: 0.0, eps: 0.01, pending: None };
+            Self { value, velocity: 0.0, target: value, stiffness: 0.0, damping: 0.0, eps: 0.02, pending: None };
         s.set_params(response, damping_ratio);
         s
     }
@@ -30,7 +30,7 @@ impl Spring {
     /// Spring for 0..1 values (opacity, progress) — tighter settle threshold.
     pub fn unit(value: f32, response: f32, damping_ratio: f32) -> Self {
         let mut s = Self::new(value, response, damping_ratio);
-        s.eps = 0.0015;
+        s.eps = 0.003;
         s
     }
 
@@ -86,7 +86,7 @@ impl Spring {
             self.value += self.velocity * h;
             dt -= h;
         }
-        if (self.value - self.target).abs() < self.eps && self.velocity.abs() < self.eps * 10.0 {
+        if (self.value - self.target).abs() < self.eps && self.velocity.abs() < self.eps * 25.0 {
             self.value = self.target;
             self.velocity = 0.0;
         }

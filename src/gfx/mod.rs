@@ -295,7 +295,13 @@ pub struct Res {
     /// The fade masks and the full-strip rectangle used by `bake_band`, made once per strip height.
     band_mask: Option<(u32, Vec<ID2D1LinearGradientBrush>)>,
     band_geo: Option<((u32, u32), ID2D1Geometry)>,
+    /// Glass pictures that are no longer shown, kept to be filled again instead of allocating a new
+    /// one for every rebuild (see `rim_pic`).
+    rim_pool: RimPool,
 }
+
+/// Spare glass pictures: (width, height of the picture, the picture).
+type RimPool = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32, ID2D1Bitmap1)>>>;
 
 /// Cache key for a realized shape: kind + quantized dimensions.
 pub type RKey = (u8, i32, i32, i32, i32);
@@ -333,6 +339,7 @@ impl Res {
                 frame: 0,
                 band_mask: None,
                 band_geo: None,
+                rim_pool: RimPool::default(),
             })
         }
     }
@@ -342,6 +349,9 @@ impl Res {
         // after a while with nothing on screen, give back everything that can be rebuilt on demand
         self.layouts.clear();
         self.realizations.borrow_mut().clear();
+        if let Ok(mut pool) = self.rim_pool.lock() {
+            pool.clear();
+        }
         let f = self.frame;
         self.bitmaps.retain(|_, b| f.saturating_sub(b.last_used) < 2);
     }
@@ -1169,10 +1179,29 @@ pub struct RimPic {
     bmp: ID2D1Bitmap1,
     pub rect: Rect,
     step: usize,
+    /// The part of the picture that holds the rim (the picture itself is rounded up to a multiple
+    /// of 64, so one picture fits many slightly different sizes), and the picture's own size.
+    used: (u32, u32),
+    cap: (u32, u32),
+    pool: RimPool,
+}
+
+impl Drop for RimPic {
+    /// A picture that is no longer shown goes back to the pool to be filled again.
+    fn drop(&mut self) {
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.retain(|e| (e.0, e.1) == self.cap);
+            if pool.len() < 2 {
+                pool.push((self.cap.0, self.cap.1, self.bmp.clone()));
+            }
+        }
+    }
 }
 
 impl Res {
     /// Upload premultiplied BGRA pixels (`w` x `h`, at (`x0`, `y0`) in window pixels) as a picture.
+    /// The picture is taken from the pool when one of the right size is spare, and only the rim's
+    /// pixels are copied into it.
     pub fn rim_pic(&self, x0: i32, y0: i32, w: usize, h: usize, step: usize, px: &[u32], scale: f32) -> Option<RimPic> {
         if w == 0 || h == 0 || px.len() < w * h || w > 4096 || h > 4096 {
             return None;
@@ -1187,15 +1216,34 @@ impl Res {
             bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
             colorContext: ManuallyDrop::new(None),
         };
+        let up = |v: usize| (v.div_ceil(64) * 64) as u32;
+        let cap = (up(w), up(h));
+        let used = (w as u32, h as u32);
         unsafe {
-            let size = D2D_SIZE_U { width: w as u32, height: h as u32 };
             let data = px.as_ptr() as *const std::ffi::c_void;
-            let bmp = self.dc.CreateBitmap(size, Some(data), (w * 4) as u32, &props).ok()?;
+            let pitch = (w * 4) as u32;
+            let region = D2D_RECT_U { left: 0, top: 0, right: used.0, bottom: used.1 };
+            let spare = self
+                .rim_pool
+                .lock()
+                .ok()
+                .and_then(|mut p| p.iter().position(|e| (e.0, e.1) == cap).map(|i| p.swap_remove(i).2));
+            let bmp = match spare {
+                Some(b) if b.CopyFromMemory(Some(&region), data, pitch).is_ok() => b,
+                _ => {
+                    let b = self.dc.CreateBitmap(D2D_SIZE_U { width: cap.0, height: cap.1 }, None, 0, &props).ok()?;
+                    b.CopyFromMemory(Some(&region), data, pitch).ok()?;
+                    b
+                }
+            };
             let k = step.max(1) as f32;
             Some(RimPic {
                 bmp,
                 rect: Rect::new(x0 as f32 / scale, y0 as f32 / scale, w as f32 * k / scale, h as f32 * k / scale),
                 step,
+                used,
+                cap,
+                pool: self.rim_pool.clone(),
             })
         }
     }
@@ -1211,7 +1259,9 @@ impl<'a> Painter<'a> {
         let Ok(b) = r.bmp.cast::<ID2D1Bitmap>() else { return };
         unsafe {
             let mode = if r.step > 1 { D2D1_INTERPOLATION_MODE_LINEAR } else { D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
-            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, mode, None, None);
+            // only the part that holds the rim (the picture may be a little bigger)
+            let src = D2D_RECT_F { left: 0.0, top: 0.0, right: r.used.0 as f32, bottom: r.used.1 as f32 };
+            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, mode, Some(&src), None);
         }
     }
 }
@@ -1472,6 +1522,9 @@ impl Res {
                     bufs.push(bmp.clone());
                 }
                 for (i, slot) in brushes.iter_mut().enumerate() {
+                    if !deep && i >= 2 {
+                        break; // the eighth-size step is only used by the bottom strip
+                    }
                     let (nw, nh) = (sw.div_ceil(2).max(1), sh.div_ceil(2).max(1));
                     let small = dc.CreateBitmap(D2D_SIZE_U { width: nw, height: nh }, None, 0, &props).ok()?;
                     if !down(&src, &small, nw, nh) {
