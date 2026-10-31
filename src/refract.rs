@@ -459,7 +459,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     // a big picture is split into bands of rows worked out side by side; small ones are not worth
     // the hand-over
     let bands = h.div_ceil(cell);
-    let threads = if w * h >= 60_000 { workers() } else { 1 };
+    let threads = if w * h >= PAR_MIN { workers() } else { 1 };
     if threads > 1 {
         let per = bands.div_ceil(threads);
         let f = &band_fn;
@@ -479,6 +479,10 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     }
     Some(Rim { x0, y0, w, h, step: st, px })
 }
+
+/// Pictures smaller than this are worked out on the one thread (starting threads costs more CPU
+/// than it saves); only a very big one is split up.
+const PAR_MIN: usize = 400_000;
 
 /// How many threads a big rim may use (looked up once).
 fn workers() -> usize {

@@ -18,7 +18,7 @@ use crate::updater;
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 10] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass"];
+const TABS: [&str; 9] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Glass"];
 const ROW_H: f32 = 36.0;
 const ROW_GAP: f32 = 4.0;
 const TAB_H: f32 = 32.0;
@@ -251,14 +251,13 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 15.0,
+        1 => 16.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 8.6,
         _ => 18.0,
     }
 }
@@ -447,7 +446,6 @@ impl Module for Settings {
             5 => self.gemini(ui, body),
             6 => self.notch(ui, body),
             7 => self.tabs(ui, body),
-            8 => self.dock(ui, body),
             _ => self.glass(ui, body),
         }
         if long {
@@ -767,6 +765,16 @@ impl Settings {
             "appearance",
             "glass_live",
         );
+        slider_row(
+            ui,
+            row_rect(body, 15),
+            "Max frame rate",
+            a.max_fps,
+            (30.0, 240.0),
+            format!("{:.0}", a.max_fps),
+            "appearance",
+            "max_fps",
+        );
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {
@@ -970,31 +978,6 @@ impl Settings {
                 put(ui, "glass", key, format!("{v:.2}"));
             }
         }
-    }
-
-    fn dock(&mut self, ui: &mut Ui, body: Rect) {
-        let d = self.cfg.dock.clone();
-        toggle_row(ui, row_rect(body, 0), "Show the dock", d.enabled, "dock", "enabled");
-        toggle_row(ui, row_rect(body, 1), "Hide the Windows taskbar", d.hide_taskbar, "dock", "hide_taskbar");
-        toggle_row(ui, row_rect(body, 2), "Auto-hide (show on hover)", d.auto_hide, "dock", "auto_hide");
-        toggle_row(ui, row_rect(body, 3), "Icons grow near the pointer", d.magnify, "dock", "magnify");
-        slider_row(
-            ui,
-            row_rect(body, 4),
-            "Growth",
-            d.magnify_amount,
-            (0.1, 1.0),
-            format!("{:.0}%", d.magnify_amount * 100.0),
-            "dock",
-            "magnify_amount",
-        );
-        toggle_row(ui, row_rect(body, 5), "Window previews on hover", d.previews, "dock", "previews");
-        slider_row(ui, row_rect(body, 6), "Icon size", d.size, (32.0, 80.0), format!("{:.0}", d.size), "dock", "size");
-        ui.p.text(
-            "Right-click an icon to pin, unpin or close. Drag icons to reorder. Scroll over an app to step through its windows.",
-            Rect::new(body.x + 2.0, row_rect(body, 7).y + 4.0, body.w - 4.0, 34.0),
-            &TextStyle::new(11.5, palette::TEXT_FAINT).wrap(),
-        );
     }
 
     fn tabs(&mut self, ui: &mut Ui, body: Rect) {

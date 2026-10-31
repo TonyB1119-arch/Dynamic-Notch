@@ -9,7 +9,6 @@ mod bloom;
 mod bus;
 mod claude;
 mod config;
-mod dock;
 mod gfx;
 mod host;
 mod hotkeys;
@@ -18,6 +17,7 @@ mod modules;
 mod pacer;
 mod refract;
 mod sys;
+mod taskbar;
 mod tray;
 mod ui;
 mod updater;
@@ -88,7 +88,7 @@ fn main() {
 }
 
 fn run(cfg: config::Config, args: Vec<String>) -> windows::core::Result<()> {
-    dock::recover_taskbar();
+    taskbar::recover_taskbar();
     let hwnd = window::create()?;
     let app = app::App::new(hwnd, cfg)?;
     window::APP.with(|a| *a.borrow_mut() = Some(app));

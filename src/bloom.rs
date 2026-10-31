@@ -266,24 +266,10 @@ pub fn control_center(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], sta
         ui.fx.open_page = Some("control");
     }
 
-    // Dock Mode: off, on, or peek (auto-hide)
-    let d = ui.cfg.dock.clone();
-    let dock_state = if !d.enabled {
-        0
-    } else if d.auto_hide {
-        2
-    } else {
-        1
-    };
-    let dock_text = ["Off", "On", "Peek"][dock_state];
-    if pill(ui, cell(1, 0), Icon::Control, "Dock Mode", dock_text, false, false) {
-        let (enabled, auto) = match (dock_state + 1) % 3 {
-            0 => (false, false),
-            1 => (true, false),
-            _ => (true, true),
-        };
-        ui.fx.save_config.push(("dock".into(), "enabled".into(), enabled.to_string()));
-        ui.fx.save_config.push(("dock".into(), "auto_hide".into(), auto.to_string()));
+    // Glass edge: on or off
+    let glass_on = ui.cfg.appearance.glass_look;
+    if pill(ui, cell(1, 0), Icon::Control, "Glass Edge", if glass_on { "On" } else { "Off" }, false, false) {
+        ui.fx.save_config.push(("appearance".into(), "glass_look".into(), (!glass_on).to_string()));
     }
 
     // Notch Mode: always shown, a thin pill when idle, or hidden until something happens

@@ -34,7 +34,6 @@ pub struct Config {
     pub gemini: GeminiCfg,
     pub greeting: GreetingCfg,
     pub update: UpdateCfg,
-    pub dock: DockCfg,
     pub notch: NotchCfg,
     pub tabs: TabsCfg,
     pub glass: GlassCfg,
@@ -121,6 +120,9 @@ pub struct Appearance {
     /// Alcove: while media is playing and the notch is open, the glass edge keeps up with what is
     /// behind the notch (the screen is looked at again a few times a second). Turn off to save CPU.
     pub glass_live: bool,
+    /// Most frames a second the notch draws while it moves (30 - 240). 60 is smooth and light; raise it on a fast display for
+    /// even smoother motion at a higher CPU cost.
+    pub max_fps: f32,
     /// Extra UI scale on top of the monitor DPI.
     pub scale: f32,
 }
@@ -145,6 +147,7 @@ impl Default for Appearance {
             bottom_fade: true,
             glass_look: true,
             glass_live: true,
+            max_fps: 60.0,
             scale: 1.0,
         }
     }
@@ -548,42 +551,6 @@ impl Default for UpdateCfg {
     }
 }
 
-/// The dock: pinned and running apps along the bottom edge, in place of the taskbar if you like.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DockCfg {
-    pub enabled: bool,
-    /// Icon size in pixels (32 – 80).
-    pub size: f32,
-    /// Icons near the pointer grow.
-    pub magnify: bool,
-    /// How much icons grow near the pointer (0.1 – 1.0; 0.5 = one and a half times).
-    pub magnify_amount: f32,
-    /// Slide the dock away and bring it back when the pointer touches the bottom edge.
-    pub auto_hide: bool,
-    /// Window previews when you rest the pointer on an app.
-    pub previews: bool,
-    /// Hide the Windows taskbar while the dock is on (it comes back when the dock is switched off or the app quits).
-    pub hide_taskbar: bool,
-    /// Pinned programs: full paths, or bare names such as "notepad.exe".
-    pub pinned: Vec<String>,
-}
-
-impl Default for DockCfg {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            size: 48.0,
-            magnify: true,
-            magnify_amount: 0.5,
-            auto_hide: false,
-            previews: true,
-            hide_taskbar: false,
-            pinned: vec!["explorer.exe".into(), "notepad.exe".into(), "calc.exe".into(), "mspaint.exe".into()],
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GreetingCfg {
@@ -773,8 +740,6 @@ pub fn set_value(section: &str, key: &str, value: &str) {
 
 impl Config {
     fn sanitized(mut self) -> Self {
-        self.dock.size = self.dock.size.clamp(32.0, 80.0);
-        self.dock.magnify_amount = self.dock.magnify_amount.clamp(0.1, 1.0);
         let a = &mut self.appearance;
         a.notch_width = a.notch_width.clamp(80.0, 600.0);
         a.notch_height = a.notch_height.clamp(18.0, 64.0);
@@ -784,6 +749,7 @@ impl Config {
         a.bounce = a.bounce.clamp(0.0, 1.0);
         a.animation_speed = a.animation_speed.clamp(0.25, 4.0);
         a.scale = a.scale.clamp(0.5, 2.5);
+        a.max_fps = a.max_fps.clamp(30.0, 240.0);
         self.clipboard.history = self.clipboard.history.clamp(1, 30);
         self.voice.max_seconds = self.voice.max_seconds.clamp(5, 780);
         self.osd.volume_step = self.osd.volume_step.clamp(1, 25);
@@ -849,6 +815,9 @@ glass_look = true
 # Alcove: while media plays and the notch is open, the glass edge keeps up with what is behind it
 # (a little extra CPU; during that time the notch is hidden from screenshots and screen recordings)
 glass_live = true
+# Most frames a second while the notch moves (30 - 240). 60 is smooth and light; raise it on a fast display
+# for smoother motion at a higher CPU cost.
+max_fps = 60
 # "auto" picks the accent from album art, or use "#RRGGBB"
 accent = "auto"
 scale = 1.0
@@ -1002,24 +971,6 @@ system_prompt = "You are a helpful assistant living in a small desktop notch. Ke
 # "Check for updates" in Settings → General looks at the newest release of this GitHub repo (owner/name).
 # Nothing is checked unless you press that button.
 repo = "TonyB1119-arch/Notch"
-
-[dock]
-# A dock along the bottom of the screen with your pinned and running apps. Also in Settings → Dock.
-enabled = false
-# Icon size in pixels (32 - 80).
-size = 48
-# Icons near the pointer grow.
-magnify = true
-# How much icons grow near the pointer (0.1 - 1.0; 0.5 = one and a half times).
-magnify_amount = 0.5
-# Slide the dock away and bring it back when the pointer touches the bottom edge.
-auto_hide = false
-# Window previews when you rest the pointer on an app.
-previews = true
-# Hide the Windows taskbar while the dock is on (it comes back when you switch the dock off or quit).
-hide_taskbar = false
-# Pinned programs (full paths or bare names). Drag icons in the dock to reorder; right-click to pin or unpin.
-pinned = ["explorer.exe", "notepad.exe", "calc.exe", "mspaint.exe"]
 
 [greeting]
 # On unlock the notch scans, then writes "Hello" in handwriting (switch it off with greeting = false under [modules]).

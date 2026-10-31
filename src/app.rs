@@ -34,7 +34,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::{lerp, smoothstep, Spring};
 use crate::bus::{Bus, Msg};
 use crate::config::{self, Config, LoadResult};
-use crate::dock::{self, Dock};
 use crate::gfx::{self, icons, Gfx, Icon, Painter, Res, Snapshot, TextStyle};
 use crate::host::Host;
 use crate::hotkeys::{self, Action};
@@ -497,7 +496,6 @@ pub struct App {
     region: Option<(i32, i32, i32, i32)>,
     region_anim: Option<Rect>,
     fs_hidden: bool,
-    dock: Option<Dock>,
     user_hidden: bool,
     shown_once: bool,
 
@@ -612,7 +610,6 @@ impl App {
             region: None,
             region_anim: None,
             fs_hidden: false,
-            dock: None,
             user_hidden: false,
             shown_once: false,
             tray: None,
@@ -639,7 +636,6 @@ impl App {
     /// Second-stage init once the app is reachable from the window proc.
     pub fn start(&mut self) {
         self.place();
-        self.sync_dock();
         self.tray = Some(Tray::new(self.hwnd));
         self.register_hotkeys();
         unsafe {
@@ -684,44 +680,6 @@ impl App {
         log!("started: scale={} monitor={:?}", self.scale, self.win_px);
     }
 
-    /// Create, update or remove the dock to match the settings.
-    fn sync_dock(&mut self) {
-        let cfg = self.cfg.dock.clone();
-        let scale = self.cfg.appearance.scale;
-        if !cfg.enabled {
-            self.dock = None;
-            return;
-        }
-        match self.dock.as_mut() {
-            Some(d) => d.set_config(&cfg, scale),
-            None => {
-                let created = crate::window::create_dock()
-                    .ok()
-                    .and_then(|h| Dock::new(h, &self.gfx, &self.host.compositor, &cfg, scale));
-                if created.is_none() {
-                    log!("could not start the dock");
-                }
-                self.dock = created;
-            }
-        }
-    }
-
-    /// Messages for the dock's window (see `window::wndproc_inner`).
-    pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        let d = self.dock.as_mut()?;
-        if msg == WM_TIMER && wp.0 == dock::TIMER_FRAME {
-            if !d.frame(&self.gfx, Instant::now()) {
-                d.stop_timer();
-            }
-            return Some(LRESULT(0));
-        }
-        let (r, frame) = d.handle(msg, wp, lp);
-        if frame {
-            d.start_timer();
-        }
-        r
-    }
-
     pub fn shutdown(&mut self) {
         for (i, m) in self.modules.iter_mut().enumerate() {
             if self.started[i] {
@@ -744,7 +702,6 @@ impl App {
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
         }
         dragdrop::revoke_target(self.hwnd);
-        self.dock = None;
         self.tray = None;
         self.pacer.stop();
     }
@@ -929,9 +886,6 @@ impl App {
             _ if msg == self.msg_taskbar_created && msg != 0 => {
                 if let Some(t) = self.tray.as_mut() {
                     t.readd();
-                }
-                if let Some(d) = self.dock.as_mut() {
-                    d.explorer_restarted();
                 }
                 Some(LRESULT(0))
             }
@@ -1970,7 +1924,6 @@ impl App {
                 self.register_hotkeys();
                 self.sync_modules();
                 self.place();
-                self.sync_dock();
                 self.broadcast(SystemEvent::ConfigReloaded);
                 log!("config reloaded");
             }
@@ -2114,9 +2067,6 @@ impl App {
             if hide {
                 self.collapse();
             }
-            if let Some(d) = self.dock.as_mut() {
-                d.set_hidden(hide);
-            }
             log!("fullscreen hidden = {hide}");
             self.request_frame();
         }
@@ -2129,7 +2079,15 @@ impl App {
     fn request_frame(&mut self) {
         self.dirty = true;
         self.slow_only = false;
+        self.pacer.set_gap_us(self.frame_gap_us());
         self.pacer.start();
+    }
+
+    /// Shortest time between two frames, microseconds: the frame-rate cap from Settings → Look,
+    /// a little under the refresh period so a 60 Hz screen is never held back.
+    fn frame_gap_us(&self) -> u32 {
+        let fps = self.cfg.appearance.max_fps.clamp(30.0, 240.0);
+        (1_000_000.0 / fps * 0.8) as u32
     }
 
     fn targets(&self) -> Targets {
@@ -2366,6 +2324,10 @@ impl App {
 
     fn frame(&mut self) {
         let now = Instant::now();
+        // (the pacer already leaves out refreshes beyond the cap; this catches the rest)
+        if now.duration_since(self.last_frame).as_micros() < self.frame_gap_us() as u128 * 3 / 4 {
+            return;
+        }
         // Ambient animation only (a sweeping shimmer, the record turning): nothing is being moved by
         // a spring and nobody touched anything. Frames closer together than AMBIENT_GAP are skipped,
         // which only trims displays faster than 60 Hz; on a 60 Hz screen every frame is drawn, since
@@ -2689,7 +2651,10 @@ impl App {
         }
         let sc = self.scale;
         let r = self.anim.r.value.min(body.w * 0.5).min(body.h - self.anim.ear.value.min(body.h * 0.5)).max(0.0);
-        let q4 = |v: f32| (v * sc * 4.0).round() as i32;
+        // while the size changes the shape is followed to a whole pixel (far fewer rebuilds in the slow
+        // tail of a move); once it has settled, to a quarter pixel
+        let qs = if self.settled { 4.0 } else { 1.0 };
+        let q4 = |v: f32| (v * sc * qs).round() as i32;
         let geo = (q4(body.x), q4(body.w), q4(body.bottom()), q4(r), (sc * 100.0).round() as i32);
         // while the size is still changing a coarse rim is enough (a quarter of the work); the
         // frame after it has stopped makes the fine one
@@ -3510,9 +3475,6 @@ impl App {
             self.snap_pages = None;
             if let Ok(r) = Res::new(&self.gfx) {
                 self.res = r;
-            }
-            if let Some(d) = self.dock.as_mut() {
-                d.recover(&self.gfx);
             }
         }
         self.request_frame();

@@ -68,11 +68,6 @@ impl Host {
         Self::build(hwnd, gfx, w, h, None)
     }
 
-    /// A host that shares an existing compositor (the dock's window).
-    pub fn new_shared(hwnd: HWND, gfx: &Gfx, w: i32, h: i32, compositor: Compositor) -> Result<Self> {
-        Self::build(hwnd, gfx, w, h, Some(compositor))
-    }
-
     fn build(hwnd: HWND, gfx: &Gfx, w: i32, h: i32, shared: Option<Compositor>) -> Result<Self> {
         unsafe {
             let (dq, compositor) = match shared {

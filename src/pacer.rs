@@ -5,7 +5,7 @@
 //! an animation is running.  When idle the thread blocks on an event, so an
 //! idle notch costs exactly zero CPU.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,8 @@ struct Shared {
     active: AtomicBool,
     pending: AtomicBool,
     quit: AtomicBool,
+    /// Shortest time between two frame messages, microseconds (the frame-rate cap; 0 = every refresh).
+    gap_us: AtomicU32,
     wake: isize, // HANDLE
 }
 
@@ -40,11 +42,17 @@ impl Pacer {
             active: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             quit: AtomicBool::new(false),
+            gap_us: AtomicU32::new(0),
             wake: ev.0 as isize,
         });
         let s2 = shared.clone();
         let thread = std::thread::Builder::new().name("vsync".into()).spawn(move || run(s2, hwnd)).ok();
         Self { shared, thread }
+    }
+
+    /// Cap the frame rate: refresh ticks closer together than this are not turned into frames.
+    pub fn set_gap_us(&self, us: u32) {
+        self.shared.gap_us.store(us, Ordering::Relaxed);
     }
 
     /// Keep frames coming until `stop` is called.
@@ -119,6 +127,11 @@ fn run(s: Arc<Shared>, hwnd: SendHwnd) {
             std::thread::sleep(Duration::from_millis(4) - el);
         }
         last = Instant::now();
+        // frame-rate cap: on a faster display some refreshes are simply skipped
+        let gap = s.gap_us.load(Ordering::Relaxed) as u128;
+        if gap > 0 && posted.elapsed().as_micros() < gap {
+            continue;
+        }
         // A frame message that was never consumed (dropped while the UI
         // thread was busy re-entrantly) must not stall frames forever.
         let stale = posted.elapsed() > Duration::from_millis(250);
