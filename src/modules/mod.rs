@@ -250,6 +250,9 @@ pub struct Effects {
     pub nudge: bool,
     /// Need another frame right away (caret blink, spinners...).
     pub animate: bool,
+    /// Need more frames, but only a slow, gentle animation is running (a floating icon, a
+    /// scanning spinner): half the frames are enough and nobody can tell the difference.
+    pub animate_slow: bool,
     pub keyboard_focus: Option<bool>,
     pub layout_changed: bool,
     pub save_config: Vec<(String, String, String)>,

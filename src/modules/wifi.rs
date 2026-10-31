@@ -301,7 +301,7 @@ impl Module for Wifi {
             &TextStyle::new(13.0, head_col).medium(),
         );
         if self.scanning {
-            ui.animate();
+            ui.animate_slow();
         }
         if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_DIM)) {
             self.scan();

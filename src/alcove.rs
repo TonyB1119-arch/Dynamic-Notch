@@ -274,7 +274,7 @@ pub fn status_tile(
         right = sw.x - 8.0;
     }
     if spinning {
-        ui.animate();
+        ui.animate_slow();
     }
     let rb = Rect::new(right - 30.0, r.cy() - 15.0, 30.0, 30.0);
     let refresh = round_button(ui, rb, Icon::Refresh, false);
@@ -573,7 +573,7 @@ pub fn empty(ui: &mut Ui, r: Rect, icon: Icon, msg: &str) {
     // only keeps frames coming while the pointer is on the page, so an open notch left alone
     // settles and costs nothing
     if ui.hovered(r) {
-        ui.animate();
+        ui.animate_slow();
     }
 }
 

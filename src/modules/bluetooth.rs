@@ -357,7 +357,7 @@ impl Module for Bluetooth {
             self.settings_hint = false;
         }
         if self.scanning {
-            ui.animate();
+            ui.animate_slow();
         }
         if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_DIM)) {
             self.scan();

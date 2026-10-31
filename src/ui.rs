@@ -297,6 +297,11 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.fx.animate = true;
     }
 
+    /// Like `animate`, for slow, gentle motion: drawn at about 30 frames a second.
+    pub fn animate_slow(&mut self) {
+        self.fx.animate_slow = true;
+    }
+
     // -- widgets --------------------------------------------------------------
 
     /// Eased hover and press amounts (0..1) for a control, so highlights fade and presses settle

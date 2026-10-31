@@ -350,7 +350,7 @@ impl Module for Weather {
         // refresh sits in the top corner
         let rb = Rect::new(now.right() - 24.0, now.y - 8.0, 24.0, 24.0);
         if self.loading {
-            ui.animate();
+            ui.animate_slow();
         }
         if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_FAINT)) && !self.loading
         {

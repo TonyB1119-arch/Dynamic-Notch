@@ -351,7 +351,7 @@ impl Downloads {
                 ui.p.text(&status, Rect::new(t.x + 4.0, t.y + 96.0, t.w - 8.0, 16.0), &sub_st);
                 ui.p.pop_clip();
                 if a.progress.is_none() {
-                    ui.animate();
+                    ui.animate_slow();
                 }
             }
         }
