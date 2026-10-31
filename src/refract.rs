@@ -120,12 +120,12 @@ fn sample(s: &Shot, fx: f32, fy: f32) -> [f32; 3] {
 }
 
 /// Work out the rim along the sides and the bottom corners of the notch. Inside the rim each
-/// pixel shows what lies a little further out (pulled in toward the edge, strongest at the very
-/// edge) with a soft highlight, fading to nothing toward the inside of the notch.
+/// pixel shows what lies further out (pulled in toward the edge, strongest at the very edge),
+/// fading to nothing toward the inside of the notch.
 pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
     let sc = sh.scale.max(0.5);
-    let width = 15.0 * sc; // how far in from the edge the rim reaches
-    let pull = 12.0 * sc; // how far out the strongest pixels look
+    let width = 26.0 * sc; // how far in from the edge the rim reaches
+    let pull = 40.0 * sc; // how far out the strongest pixels look
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + 60.0 * sc; // how far up the sides it is drawn, fading out toward the top
     let x0 = ((sh.left - 2.0).floor() as i32).max(0);
@@ -175,18 +175,16 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
                 continue;
             }
             let t = (d / width).clamp(0.0, 1.0);
-            let k = (1.0 - t) * (1.0 - t);
-            let c = sample(shot, x + nx * pull * k, y + ny * pull * k);
-            // a soft highlight hugging the edge
-            let glow = 0.30 * (1.0 - t).powi(5) + 0.07 * k;
-            let alpha = 0.88 * (1.0 - t).powf(1.4) * (d + 1.0).clamp(0.0, 1.0) * up;
-            let mut out = 0u32;
-            for (n, v) in [c[2], c[1], c[0]].into_iter().enumerate() {
-                let lit = v + (255.0 - v) * glow;
-                out |= ((lit * alpha).round().clamp(0.0, 255.0) as u32) << (8 * n);
-            }
-            out |= ((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24;
-            px[j * w + i] = out;
+            let k = (1.0 - t).powf(1.6);
+            // red, green and blue look a slightly different distance out, like light through glass
+            let (cr, cg, cb2) = (
+                sample(shot, x + nx * pull * k, y + ny * pull * k)[0],
+                sample(shot, x + nx * pull * k * 0.88, y + ny * pull * k * 0.88)[1],
+                sample(shot, x + nx * pull * k * 0.76, y + ny * pull * k * 0.76)[2],
+            );
+            let alpha = 0.96 * (1.0 - t).powf(0.9) * (d + 1.0).clamp(0.0, 1.0) * up;
+            let ch = |v: f32| ((v * alpha).round().clamp(0.0, 255.0) as u32);
+            px[j * w + i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }
     }
     Some(Rim { x0, y0, w, h, px })

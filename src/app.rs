@@ -399,8 +399,10 @@ pub struct App {
     /// out from it, when the notch last went idle, and when a copy was last tried.
     refr_shot: Option<crate::refract::Shot>,
     refr_rim: Option<(RimKey, gfx::RimPic)>,
-    refr_idle: Option<Instant>,
     refr_retry: Option<Instant>,
+    /// The window in front when the copy was taken; if another comes forward the copy is out of date.
+    refr_fg: isize,
+    refr_dead: bool,
     /// When the blur strip first appeared (it fades in from here).
     band_since: Option<Instant>,
     pacer: Pacer,
@@ -506,8 +508,9 @@ impl App {
             band_failed: false,
             refr_shot: None,
             refr_rim: None,
-            refr_idle: None,
             refr_retry: None,
+            refr_fg: 0,
+            refr_dead: false,
             band_since: None,
             pacer,
             bus,
@@ -2516,25 +2519,29 @@ impl App {
     /// let go a moment after the notch closes. Once the notch has settled, the rim is worked out
     /// from that copy and uploaded as one small picture; that is redone only if the size changes.
     fn prepare_rim(&mut self, now: Instant) {
-        if !(self.cfg.appearance.glass_look && crate::ui::look_alcove()) {
+        if !(self.cfg.appearance.glass_look && crate::ui::look_alcove()) || self.mode == Mode::Idle {
+            // nothing is kept while the notch is closed: the next opening takes a fresh copy
             self.refr_shot = None;
             self.refr_rim = None;
-            self.refr_idle = None;
+            self.refr_dead = false;
             return;
         }
-        if self.mode == Mode::Idle {
-            let since = *self.refr_idle.get_or_insert(now);
-            if now.duration_since(since) > Duration::from_millis(1500) {
-                self.refr_shot = None;
-                self.refr_rim = None;
-            }
-            return;
+        let fg = unsafe { GetForegroundWindow() };
+        if self.refr_shot.is_some() && fg != self.hwnd && fg.0 as isize != self.refr_fg {
+            // another window came to the front: the copy no longer matches what is behind the
+            // notch, so the rim goes rather than show an old picture (until the next opening)
+            self.refr_shot = None;
+            self.refr_rim = None;
+            self.refr_dead = true;
         }
-        self.refr_idle = None;
-        if self.refr_shot.is_none() && self.refr_retry.is_none_or(|t| now.duration_since(t) > Duration::from_secs(2)) {
+        if self.refr_shot.is_none()
+            && !self.refr_dead
+            && self.refr_retry.is_none_or(|t| now.duration_since(t) > Duration::from_secs(2))
+        {
             let (x, y, w, h) = self.win_px;
             self.refr_shot = crate::refract::grab(x, y, w, h);
             self.refr_retry = Some(now);
+            self.refr_fg = fg.0 as isize;
             if self.refr_shot.is_none() {
                 log!("glass edge: the screen could not be copied");
             }
