@@ -433,6 +433,8 @@ pub struct App {
     refr_rim: Option<(RimKey, gfx::RimPic)>,
     /// The notch's shape at the previous frame (to tell whether it is still changing size).
     rim_geo: Option<(i32, i32, i32, i32, i32)>,
+    /// When the glass edge was last rebuilt (lighter animations spread the rebuilds out).
+    rim_t: Option<Instant>,
     /// How far (in logical px of width + height) the notch had to go when the current move began.
     rim_far: f32,
     /// The shape (and its quantised key) the current rim was made for.
@@ -586,6 +588,7 @@ impl App {
             refr_shot: None,
             refr_rim: None,
             rim_geo: None,
+            rim_t: None,
             rim_far: 0.0,
             rim_last: None,
             rim_tune: None,
@@ -2382,7 +2385,8 @@ impl App {
         // motion is too small to show it). Input or anything else that wants a frame ends it.
         if self.tail
             && !self.dirty
-            && now.duration_since(self.last_frame) < Duration::from_micros(self.frame_gap_us() as u64 * 15 / 8)
+            && now.duration_since(self.last_frame)
+                < Duration::from_micros(self.frame_gap_us() as u64 * if self.cfg.appearance.lite_motion { 22 } else { 15 } / 8)
         {
             self.tm[8] += 1;
             return;
@@ -2742,12 +2746,24 @@ impl App {
         // (the picture is sharp along the edge and half detail elsewhere, cheap enough to use always)
         let step = fine;
         let _ = late;
+        let lite = self.cfg.appearance.lite_motion;
+        // lighter animations: while the size changes the glass edge is rebuilt at most every 45 ms and
+        // the picture already there keeps showing in between (it is a few pixels behind at worst)
+        if lite
+            && !self.settled
+            && !still
+            && self.refr_rim.is_some()
+            && self.rim_t.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(45))
+        {
+            self.rim_ok = true;
+            return;
+        }
         self.rim_geo = Some(geo);
         // While the size is still changing the sharp zone is capped: the glass is rebuilt for nearly
         // every frame then, and the full-detail band along the edge is what costs most. The full
         // picture follows as soon as the notch stops and melts in over this one.
-        const MOVING_ZONE: f32 = 0.55;
-        let low = !self.settled && tune.sharp > MOVING_ZONE && !still;
+        let moving_zone: f32 = if lite { 0.3 } else { 0.55 };
+        let low = !self.settled && tune.sharp > moving_zone && !still;
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step + if low { RIM_LOW } else { 0 });
         // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
         // all of it (the middle glass follows that)
@@ -2794,7 +2810,7 @@ impl App {
         let t_rim = self.debug.then(Instant::now);
         let mut made = shape;
         if low {
-            made.tune.sharp = MOVING_ZONE;
+            made.tune.sharp = moving_zone;
         }
         if let Some(rim) = crate::refract::rim(shot, made, step) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
@@ -2809,6 +2825,7 @@ impl App {
                 }
             }
         }
+        self.rim_t = Some(now);
         if let Some(t) = t_rim {
             self.tm[6] += t.elapsed().as_micros() as u64;
             self.tm[7] += 1;

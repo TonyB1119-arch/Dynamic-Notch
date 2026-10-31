@@ -120,6 +120,10 @@ pub struct Appearance {
     /// Alcove: while media is playing and the notch is open, the glass edge keeps up with what is
     /// behind the notch (the screen is looked at again a few times a second). Turn off to save CPU.
     pub glass_live: bool,
+    /// Lighter animations: the glass edge is rebuilt less often (and coarser) while the notch moves,
+    /// and the slow last stretch of a move uses fewer frames. Looks the same once the notch rests.
+    /// Turn off for the full-rate animation.
+    pub lite_motion: bool,
     /// Most frames a second the notch draws while it moves (30 - 240). 60 is smooth and light; raise it on a fast display for
     /// even smoother motion at a higher CPU cost.
     pub max_fps: f32,
@@ -147,6 +151,7 @@ impl Default for Appearance {
             bottom_fade: true,
             glass_look: true,
             glass_live: true,
+            lite_motion: true,
             max_fps: 60.0,
             scale: 1.0,
         }
@@ -819,6 +824,9 @@ glass_look = true
 # Alcove: while media plays and the notch is open, the glass edge keeps up with what is behind it
 # (a little extra CPU; during that time the notch is hidden from screenshots and screen recordings)
 glass_live = true
+# Lighter animations: less CPU while the notch moves (the glass edge is refreshed less often, the slow
+# end of a move uses fewer frames). false = the full-rate animation
+lite_motion = true
 # Most frames a second while the notch moves (30 - 240). 60 is smooth and light; raise it on a fast display
 # for smoother motion at a higher CPU cost.
 max_fps = 60
