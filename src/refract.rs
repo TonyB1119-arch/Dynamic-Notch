@@ -1,8 +1,9 @@
 //! The glass edge: a snapshot of the desktop behind the notch, bent along the rim like thick glass.
 //!
-//! Nothing here runs per frame. A snapshot of the screen is taken once when the notch opens (while
-//! the window is still small, so it does not photograph itself); once the notch has settled the rim
-//! is worked out on the CPU and uploaded as one small picture, drawn with a single call.
+//! A snapshot of the screen is taken once when the notch opens (while the window is still small, so
+//! it does not photograph itself). The rim is worked out from it on the CPU for the notch's current
+//! size and uploaded as one small picture, drawn with a single call; it is only made again when the
+//! size changes (while a page change resizes the notch, and never while nothing moves).
 
 use std::ffi::c_void;
 
@@ -95,28 +96,22 @@ fn smooth(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// One pixel of the picture, as red, green, blue in 0..255 (coordinates are clamped to the edge).
-fn texel(s: &Shot, x: i32, y: i32) -> [f32; 3] {
-    let xi = x.clamp(0, s.w as i32 - 1) as usize;
-    let yi = y.clamp(0, s.h as i32 - 1) as usize;
-    let p = s.px[yi * s.w + xi];
-    [((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32]
-}
-
-/// The picture at a fractional position, smoothly blended between the four nearest pixels.
-fn sample(s: &Shot, fx: f32, fy: f32) -> [f32; 3] {
+/// One colour (`shift` 16 red, 8 green, 0 blue) of the picture at a fractional position, smoothly
+/// blended between the four nearest pixels (coordinates are clamped to the edge).
+fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
     let (gx, gy) = (fx - 0.5, fy - 0.5);
     let (x0, y0) = (gx.floor(), gy.floor());
     let (tx, ty) = (gx - x0, gy - y0);
     let (x0, y0) = (x0 as i32, y0 as i32);
-    let (a, b, c, d) = (texel(s, x0, y0), texel(s, x0 + 1, y0), texel(s, x0, y0 + 1), texel(s, x0 + 1, y0 + 1));
-    let mut o = [0.0; 3];
-    for i in 0..3 {
-        let top = a[i] + (b[i] - a[i]) * tx;
-        let bot = c[i] + (d[i] - c[i]) * tx;
-        o[i] = top + (bot - top) * ty;
-    }
-    o
+    let at = |x: i32, y: i32| -> f32 {
+        let xi = x.clamp(0, s.w as i32 - 1) as usize;
+        let yi = y.clamp(0, s.h as i32 - 1) as usize;
+        ((s.px[yi * s.w + xi] >> shift) & 255) as f32
+    };
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let top = a + (b - a) * tx;
+    let bot = c + (d - c) * tx;
+    top + (bot - top) * ty
 }
 
 /// Work out the rim along the sides and the bottom corners of the notch. Inside the rim each
@@ -124,10 +119,11 @@ fn sample(s: &Shot, fx: f32, fy: f32) -> [f32; 3] {
 /// fading to nothing toward the inside of the notch.
 pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
     let sc = sh.scale.max(0.5);
-    let width = 26.0 * sc; // how far in from the edge the rim reaches
-    let pull = 40.0 * sc; // how far out the strongest pixels look
+    // The rim fades out over a long, soft stretch so it melts into the black of the notch.
+    let width = 64.0 * sc; // how far in from the edge the rim reaches
+    let pull = 28.0 * sc; // how far out the strongest pixels look
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
-    let reach = r + 60.0 * sc; // how far up the sides it is drawn, fading out toward the top
+    let reach = r + 90.0 * sc; // how far up the sides it is drawn, fading out toward the top
     let x0 = ((sh.left - 2.0).floor() as i32).max(0);
     let x1 = ((sh.right + 2.0).ceil() as i32).min(shot.w as i32);
     let y0 = ((sh.bottom - reach).floor() as i32).max(0);
@@ -139,10 +135,18 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
     let mut px = vec![0u32; w * h];
     let (cl, cr, cb) = (sh.left + r, sh.right - r, sh.bottom - r);
     let top = sh.bottom - reach;
+    // Rows higher up only carry the rim along the two sides, so the middle is skipped there;
+    // from `full_from` down the whole row is rim. The corners reach further in than the sides.
+    let full_from = sh.bottom - width - 1.0;
+    let side = (width.max(r) + 2.0).ceil() as usize;
     for j in 0..h {
         let y = (y0 + j as i32) as f32 + 0.5;
         let up = smooth(0.0, 0.5, (y - top) / reach);
-        for i in 0..w {
+        if up <= 0.0 {
+            continue;
+        }
+        let (a_end, b_start) = if y >= full_from { (w, w) } else { (side.min(w), w.saturating_sub(side).max(side.min(w))) };
+        for i in (0..a_end).chain(b_start..w) {
             let x = (x0 + i as i32) as f32 + 0.5;
             // distance inside the edge, and the direction pointing out of the notch
             let d;
@@ -174,16 +178,20 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             if d <= -1.0 || d >= width {
                 continue;
             }
-            let t = (d / width).clamp(0.0, 1.0);
-            let k = (1.0 - t).powf(1.6);
+            // u: 1 at the edge, 0 at the inner end of the rim. The strength follows a smooth S, so
+            // it starts and ends gently, with no visible line where the rim stops.
+            let u = 1.0 - d / width;
+            let alpha = 0.96 * u * u * (3.0 - 2.0 * u) * (d + 1.0).clamp(0.0, 1.0) * up;
+            if alpha < 0.004 {
+                continue;
+            }
+            let k = u * u.sqrt();
+            let (ox, oy) = (nx * pull * k, ny * pull * k);
             // red, green and blue look a slightly different distance out, like light through glass
-            let (cr, cg, cb2) = (
-                sample(shot, x + nx * pull * k, y + ny * pull * k)[0],
-                sample(shot, x + nx * pull * k * 0.88, y + ny * pull * k * 0.88)[1],
-                sample(shot, x + nx * pull * k * 0.76, y + ny * pull * k * 0.76)[2],
-            );
-            let alpha = 0.96 * (1.0 - t).powf(0.9) * (d + 1.0).clamp(0.0, 1.0) * up;
-            let ch = |v: f32| ((v * alpha).round().clamp(0.0, 255.0) as u32);
+            let cr = sample(shot, x + ox, y + oy, 16);
+            let cg = sample(shot, x + ox * 0.93, y + oy * 0.93, 8);
+            let cb2 = sample(shot, x + ox * 0.86, y + oy * 0.86, 0);
+            let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
             px[j * w + i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }
     }
