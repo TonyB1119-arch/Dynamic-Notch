@@ -354,6 +354,25 @@ impl Anim {
         }
         m
     }
+
+    /// True while every spring is creeping its last bit into place: within a hair of where it is
+    /// going and moving by a fraction of a pixel a frame.
+    fn creeping(&self) -> bool {
+        let px = |s: &Spring| (s.value - s.target).abs() < 3.0 && s.velocity.abs() < 30.0;
+        let un = |s: &Spring| (s.value - s.target).abs() < 0.03 && s.velocity.abs() < 0.3;
+        px(&self.w)
+            && px(&self.h)
+            && px(&self.r)
+            && px(&self.ear)
+            && un(&self.glass)
+            && un(&self.compact)
+            && un(&self.peek)
+            && un(&self.exp)
+            && un(&self.shown)
+            && un(&self.sec)
+            && un(&self.split)
+            && un(&self.page)
+    }
 }
 
 /// Cache key of the glass rim: position, size, corner radius and scale, in quarter pixels.
@@ -523,6 +542,11 @@ pub struct App {
     /// Frames in the current burst: (start, spring, animate, dirty).
     stats: (Option<Instant>, u32, u32, u32),
     debug: bool,
+    /// The slow last stretch of a move (see `Anim::creeping`): every other frame is left out.
+    tail: bool,
+    /// DN_DEBUG timings of the current burst, in microseconds: [draw total, draw worst, frames drawn,
+    /// pictures, bottom blur, glass check, glass rebuilds total, rebuild count, tail frames skipped].
+    tm: [u64; 9],
 }
 
 impl App {
@@ -629,6 +653,8 @@ impl App {
             pending_drag: None,
             stats: (None, 0, 0, 0),
             debug: std::env::var_os("DN_DEBUG").is_some(),
+            tail: false,
+            tm: [0; 9],
             cfg,
         }))
     }
@@ -2340,6 +2366,16 @@ impl App {
         if self.slow_only && self.settled && now.duration_since(self.last_frame) < Duration::from_millis(30) {
             return;
         }
+        // the slow last stretch of a move: every spring is creeping the final bit into place, a
+        // fraction of a pixel a frame, so every other frame is left out (about 30 a second; the
+        // motion is too small to show it). Input or anything else that wants a frame ends it.
+        if self.tail
+            && !self.dirty
+            && now.duration_since(self.last_frame) < Duration::from_micros(self.frame_gap_us() as u64 * 15 / 8)
+        {
+            self.tm[8] += 1;
+            return;
+        }
         self.slow_only = false;
         let dt = (now - self.last_frame).as_secs_f32().min(1.0 / 20.0);
         self.last_frame = now;
@@ -2353,11 +2389,19 @@ impl App {
         self.refresh_activity();
         self.retarget();
         let moving = self.anim.step(dt);
+        self.tail = moving && self.anim.creeping();
         if self.page_from.is_some() && self.anim.page.value > 0.998 && self.anim.page.target >= 1.0 {
             self.page_from = None;
         }
         self.settled = !moving;
+        let t_draw = self.debug.then(Instant::now);
         let fx = self.render(now);
+        if let Some(t) = t_draw {
+            let us = t.elapsed().as_micros() as u64;
+            self.tm[0] += us;
+            self.tm[1] = self.tm[1].max(us);
+            self.tm[2] += 1;
+        }
         let animate = fx.animate;
         self.apply_effects(fx);
         self.update_region(!moving);
@@ -2386,6 +2430,20 @@ impl App {
                     self.mode
                 );
                 self.stats = (None, 0, 0, 0);
+                let tm = self.tm;
+                let ms = |us: u64| us as f64 / 1000.0;
+                log!(
+                    "  timing: draw {:.2} ms avg, {:.2} ms worst | pictures {:.1} ms, bottom blur {:.1} ms, glass check {:.1} ms (totals) | {} glass rebuilds, {:.1} ms (total) | {} frames skipped in the slow tail",
+                    ms(tm[0]) / tm[2].max(1) as f64,
+                    ms(tm[1]),
+                    ms(tm[3]),
+                    ms(tm[4]),
+                    ms(tm[5]),
+                    tm[7],
+                    ms(tm[6]),
+                    tm[8]
+                );
+                self.tm = [0; 9];
             }
             self.pacer.stop();
             // Release GPU scratch memory once nothing has been drawn for a
@@ -2714,6 +2772,7 @@ impl App {
             return;
         }
         let prev = self.refr_rim.take();
+        let t_rim = self.debug.then(Instant::now);
         if let Some(rim) = crate::refract::rim(shot, shape, step) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
@@ -2726,6 +2785,10 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(t) = t_rim {
+            self.tm[6] += t.elapsed().as_micros() as u64;
+            self.tm[7] += 1;
         }
         self.rim_ok = self.refr_rim.is_some();
         if step > fine && self.rim_ok {
@@ -2904,11 +2967,19 @@ impl App {
     /// animation just place that picture (one rectangle fill instead of laying out and drawing
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
+        let t0 = self.debug.then(Instant::now);
         self.prepare_pictures(now);
+        let t1 = self.debug.then(Instant::now);
         // (the blurred strip is drawn without the outline: it is a soft copy of the page anyway)
         self.res.set_halo(None);
         self.prepare_band(now);
+        let t2 = self.debug.then(Instant::now);
         self.prepare_rim(now);
+        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+            self.tm[3] += (t1 - t0).as_micros() as u64;
+            self.tm[4] += (t2 - t1).as_micros() as u64;
+            self.tm[5] += t2.elapsed().as_micros() as u64;
+        }
     }
 
     /// Where the see-through glass begins at the bottom of a notch whose bottom edge is at `bottom` and
