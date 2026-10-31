@@ -259,7 +259,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 8.6,
-        _ => 17.0,
+        _ => 18.0,
     }
 }
 
@@ -922,7 +922,7 @@ impl Settings {
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
         let g = self.cfg.glass.clone();
         // (label, value, range, shown, key)
-        let rows: [(&str, f32, (f32, f32), String, &str); 16] = [
+        let rows: [(&str, f32, (f32, f32), String, &str); 17] = [
             ("Edge width", g.edge_width, (20.0, 160.0), format!("{:.0}", g.edge_width), "edge_width"),
             ("Warp strength", g.pull, (0.0, 60.0), format!("{:.0}", g.pull), "pull"),
             ("Bend curve", g.bend, (0.8, 3.0), format!("{:.1}", g.bend), "bend"),
@@ -933,6 +933,7 @@ impl Settings {
             ("Outer edge softness", g.softness, (0.5, 12.0), format!("{:.1}", g.softness), "softness"),
             ("Middle glass", g.middle, (0.0, 1.0), format!("{:.0}%", g.middle * 100.0), "middle"),
             ("Middle warp", g.middle_warp, (0.0, 1.0), format!("{:.0}%", g.middle_warp * 100.0), "middle_warp"),
+            ("Middle blur", g.middle_blur, (0.0, 6.0), format!("{:.1}", g.middle_blur), "middle_blur"),
             ("Bottom fade amount", g.fade_amount, (0.0, 1.0), format!("{:.0}%", g.fade_amount * 100.0), "fade_amount"),
             ("Bottom fade start", g.fade_start, (0.5, 3.0), format!("{:.1}", g.fade_start), "fade_start"),
             ("Glow fade-in speed", g.glow_in, (2.0, 30.0), format!("{:.0}", g.glow_in), "glow_in"),
@@ -944,7 +945,7 @@ impl Settings {
             slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
         }
         let d = crate::config::GlassCfg::default();
-        let b = row_rect(body, 16);
+        let b = row_rect(body, 17);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
             for (key, v) in [
@@ -958,6 +959,7 @@ impl Settings {
                 ("softness", d.softness),
                 ("middle", d.middle),
                 ("middle_warp", d.middle_warp),
+                ("middle_blur", d.middle_blur),
                 ("fade_amount", d.fade_amount),
                 ("fade_start", d.fade_start),
                 ("glow_in", d.glow_in),

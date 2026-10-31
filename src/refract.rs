@@ -98,6 +98,7 @@ pub struct Tune {
     pub soft: f32,
     pub mid: f32,
     pub mid_warp: f32,
+    pub mid_blur: f32,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -113,6 +114,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             soft: g.softness.clamp(0.5, 12.0),
             mid: g.middle.clamp(0.0, 1.0),
             mid_warp: g.middle_warp.clamp(0.0, 1.0),
+            mid_blur: g.middle_blur.clamp(0.0, 6.0),
         }
     }
 }
@@ -232,6 +234,29 @@ fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
     top + (bot - top) * ty
 }
 
+/// The picture at a fractional position as red, green and blue, blended between the four nearest
+/// pixels (coordinates are clamped to the edge).
+fn sample_rgb(s: &Shot, fx: f32, fy: f32) -> [f32; 3] {
+    let (gx, gy) = (fx - 0.5, fy - 0.5);
+    let (x0, y0) = (gx.floor(), gy.floor());
+    let (tx, ty) = (gx - x0, gy - y0);
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let at = |x: i32, y: i32| -> u32 {
+        let xi = x.clamp(0, s.w as i32 - 1) as usize;
+        let yi = y.clamp(0, s.h as i32 - 1) as usize;
+        s.px[yi * s.w + xi]
+    };
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let mut out = [0.0_f32; 3];
+    for (n, shift) in [16u32, 8, 0].into_iter().enumerate() {
+        let g = |p: u32| ((p >> shift) & 255) as f32;
+        let top = g(a) + (g(b) - g(a)) * tx;
+        let bot = g(c) + (g(d) - g(c)) * tx;
+        out[n] = top + (bot - top) * ty;
+    }
+    out
+}
+
 /// Work out the rim along the sides and the bottom corners of the notch. Inside the rim each
 /// pixel shows what lies further out (pulled in toward the edge, strongest at the very edge),
 /// fading to nothing toward the inside of the notch.
@@ -272,6 +297,9 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let side = ((width.max(r) + 2.0).ceil() as usize).div_ceil(st);
     let w2 = width + 70.0 * sc; // how far in the middle's gentle bend fades out
     let band = sh.band.max(1.0);
+    // deeper in, the outline the middle follows is rounder and rounder (bigger circles at the corners)
+    let rb = (r + 70.0 * sc).min((sh.right - sh.left) * 0.5);
+    let (cl2, cr2, cb2) = (sh.left + rb, sh.right - rb, sh.bottom - rb);
     let row = |j: usize, out: &mut [u32]| {
         let y = (y0 + (j * st) as i32) as f32 + half;
         let up = smooth(0.0, 0.5, (y - top) / reach);
@@ -337,31 +365,66 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 ox = nx * p * k;
                 oy = ny * p * k;
             }
+            let mut blur = 0.0_f32;
             if a_row > 0.0 {
                 // the middle lies under the rim; it bends gently toward the nearest edges
                 let ai = a_row * (d + 1.0).clamp(0.0, 1.0);
                 alpha += ai * (1.0 - alpha);
-                if d > width && t.mid_warp > 0.0 {
-                    let wi = smooth(width, width * 1.8, d);
-                    let u2 = (1.0 - d / w2).clamp(0.0, 1.0);
-                    let k2 = if even_bend { u2 * u2.sqrt() } else { u2.powf(t.bend) };
-                    // a soft blend of the nearest edges' directions: no crease where they meet
-                    let wl = 1.0 / (x - sh.left + 6.0).max(1.0).powi(3);
-                    let wr = 1.0 / (sh.right - x + 6.0).max(1.0).powi(3);
-                    let wb = 1.0 / (sh.bottom - y + 6.0).max(1.0).powi(3);
-                    let inv = 1.0 / (wl + wr + wb);
-                    let m = pull * t.mid_warp * k2 * wi;
-                    ox += (wr - wl) * inv * m;
-                    oy += wb * inv * m;
+                if d > width {
+                    let dm;
+                    let dirx;
+                    let diry;
+                    if y > cb2 && (x < cl2 || x > cr2) {
+                        // around a corner: along circles, with the outline getting rounder inward
+                        let cx = if x < cl2 { cl2 } else { cr2 };
+                        let (dx, dy) = (x - cx, y - cb2);
+                        let dist = (dx * dx + dy * dy).sqrt().max(0.001);
+                        dm = d + ((rb - dist) - d) * smooth(0.0, width, d);
+                        dirx = dx / dist;
+                        diry = dy / dist;
+                    } else {
+                        // a soft blend of the nearest edges' directions: no crease where they meet
+                        let wl = 1.0 / (x - sh.left + 6.0).max(1.0).powi(3);
+                        let wr = 1.0 / (sh.right - x + 6.0).max(1.0).powi(3);
+                        let wb = 1.0 / (sh.bottom - y + 6.0).max(1.0).powi(3);
+                        let inv = 1.0 / (wl + wr + wb);
+                        dm = d;
+                        dirx = (wr - wl) * inv;
+                        diry = wb * inv;
+                    }
+                    if t.mid_warp > 0.0 {
+                        let wi = smooth(width, width * 1.8, d);
+                        let u2 = (1.0 - dm / w2).clamp(0.0, 1.0);
+                        let k2 = if even_bend { u2 * u2.sqrt() } else { u2.powf(t.bend) };
+                        let m = pull * t.mid_warp * k2 * wi;
+                        ox += dirx * m;
+                        oy += diry * m;
+                    }
                 }
+                // the middle is a little soft; the sharp rim keeps its fine detail
+                blur = t.mid_blur * sc * smooth(width * 0.6, width * 1.6, d);
             }
             if alpha < 0.004 {
                 continue;
             }
-            // red, green and blue look a slightly different distance out, like light through glass
-            let cr = sample(shot, x + ox, y + oy, 16);
-            let cg = sample(shot, x + ox * (1.0 - t.fringe), y + oy * (1.0 - t.fringe), 8);
-            let cb2 = sample(shot, x + ox * (1.0 - 2.0 * t.fringe), y + oy * (1.0 - 2.0 * t.fringe), 0);
+            let (cr, cg, cb2) = if blur > 0.25 {
+                let (bx, by) = (x + ox, y + oy);
+                let mut acc = [0.0_f32; 3];
+                for (sx, sy) in [(-blur, -blur), (blur, -blur), (-blur, blur), (blur, blur)] {
+                    let c = sample_rgb(shot, bx + sx, by + sy);
+                    acc[0] += c[0];
+                    acc[1] += c[1];
+                    acc[2] += c[2];
+                }
+                (acc[0] * 0.25, acc[1] * 0.25, acc[2] * 0.25)
+            } else {
+                // red, green and blue look a slightly different distance out, like light through glass
+                (
+                    sample(shot, x + ox, y + oy, 16),
+                    sample(shot, x + ox * (1.0 - t.fringe), y + oy * (1.0 - t.fringe), 8),
+                    sample(shot, x + ox * (1.0 - 2.0 * t.fringe), y + oy * (1.0 - 2.0 * t.fringe), 0),
+                )
+            };
             let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
             out[i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }
