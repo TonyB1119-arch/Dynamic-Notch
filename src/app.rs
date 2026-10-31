@@ -355,7 +355,7 @@ impl Anim {
 }
 
 /// Cache key of the glass rim: position, size, corner radius and scale, in quarter pixels.
-type RimKey = (i32, i32, i32, i32, i32);
+type RimKey = (i32, i32, i32, i32, i32, usize);
 
 /// The few look settings the drawing code reads every frame, copied out so no text is cloned.
 #[derive(Clone, Copy)]
@@ -399,6 +399,8 @@ pub struct App {
     /// out from it, when the notch last went idle, and when a copy was last tried.
     refr_shot: Option<crate::refract::Shot>,
     refr_rim: Option<(RimKey, gfx::RimPic)>,
+    /// The notch's shape at the previous frame (to tell whether it is still changing size).
+    rim_geo: Option<(i32, i32, i32, i32, i32)>,
     refr_retry: Option<Instant>,
     /// The window in front when the copy was taken; if another comes forward the copy is out of date.
     refr_fg: isize,
@@ -522,6 +524,7 @@ impl App {
             band_failed: false,
             refr_shot: None,
             refr_rim: None,
+            rim_geo: None,
             refr_retry: None,
             refr_fg: 0,
             refr_dead: false,
@@ -2618,7 +2621,12 @@ impl App {
         let sc = self.scale;
         let r = self.anim.r.value.min(body.w * 0.5).min(body.h - self.anim.ear.value.min(body.h * 0.5)).max(0.0);
         let q4 = |v: f32| (v * sc * 4.0).round() as i32;
-        let key: RimKey = (q4(body.x), q4(body.w), q4(body.bottom()), q4(r), (sc * 100.0).round() as i32);
+        let geo = (q4(body.x), q4(body.w), q4(body.bottom()), q4(r), (sc * 100.0).round() as i32);
+        // while the size is still changing a coarse rim is enough (a quarter of the work); the
+        // frame after it has stopped makes the fine one
+        let step = if self.rim_geo == Some(geo) { 1 } else { 2 };
+        self.rim_geo = Some(geo);
+        let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step);
         if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
             self.rim_ok = true;
             return;
@@ -2631,12 +2639,16 @@ impl App {
             radius: r * sc,
             scale: sc,
         };
-        if let Some(rim) = crate::refract::rim(shot, shape) {
-            if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, &rim.px, sc) {
+        if let Some(rim) = crate::refract::rim(shot, shape, step) {
+            if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
             }
         }
         self.rim_ok = self.refr_rim.is_some();
+        if step > 1 && self.rim_ok {
+            // one more frame so the fine picture follows as soon as the notch has stopped
+            self.request_frame();
+        }
     }
 
     /// 1 while the soft bottom edge is showing, else 0.

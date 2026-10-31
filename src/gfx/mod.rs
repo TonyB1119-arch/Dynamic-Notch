@@ -1168,11 +1168,12 @@ pub struct Snapshot {
 pub struct RimPic {
     bmp: ID2D1Bitmap1,
     pub rect: Rect,
+    step: usize,
 }
 
 impl Res {
     /// Upload premultiplied BGRA pixels (`w` x `h`, at (`x0`, `y0`) in window pixels) as a picture.
-    pub fn rim_pic(&self, x0: i32, y0: i32, w: usize, h: usize, px: &[u32], scale: f32) -> Option<RimPic> {
+    pub fn rim_pic(&self, x0: i32, y0: i32, w: usize, h: usize, step: usize, px: &[u32], scale: f32) -> Option<RimPic> {
         if w == 0 || h == 0 || px.len() < w * h || w > 4096 || h > 4096 {
             return None;
         }
@@ -1190,7 +1191,12 @@ impl Res {
             let size = D2D_SIZE_U { width: w as u32, height: h as u32 };
             let data = px.as_ptr() as *const std::ffi::c_void;
             let bmp = self.dc.CreateBitmap(size, Some(data), (w * 4) as u32, &props).ok()?;
-            Some(RimPic { bmp, rect: Rect::new(x0 as f32 / scale, y0 as f32 / scale, w as f32 / scale, h as f32 / scale) })
+            let k = step.max(1) as f32;
+            Some(RimPic {
+                bmp,
+                rect: Rect::new(x0 as f32 / scale, y0 as f32 / scale, w as f32 * k / scale, h as f32 * k / scale),
+                step,
+            })
         }
     }
 }
@@ -1204,7 +1210,8 @@ impl<'a> Painter<'a> {
         }
         let Ok(b) = r.bmp.cast::<ID2D1Bitmap>() else { return };
         unsafe {
-            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
+            let mode = if r.step > 1 { D2D1_INTERPOLATION_MODE_LINEAR } else { D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
+            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, mode, None, None);
         }
     }
 }

@@ -77,6 +77,8 @@ pub struct Rim {
     pub y0: i32,
     pub w: usize,
     pub h: usize,
+    /// Each picture pixel stands for `step` x `step` window pixels (1 = pixel for pixel).
+    pub step: usize,
     pub px: Vec<u32>,
 }
 
@@ -117,7 +119,11 @@ fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
 /// Work out the rim along the sides and the bottom corners of the notch. Inside the rim each
 /// pixel shows what lies further out (pulled in toward the edge, strongest at the very edge),
 /// fading to nothing toward the inside of the notch.
-pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
+///
+/// `step` 1 gives the finest picture; 2 makes it on every other pixel each way (a quarter of the
+/// work, drawn enlarged): the rim is a soft gradient, so it looks the same while it is moving.
+pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
+    let st = step.max(1);
     let sc = sh.scale.max(0.5);
     // The rim fades out over a long, soft stretch so it melts into the black of the notch.
     let width = 76.0 * sc; // how far in from the edge the rim reaches
@@ -132,22 +138,24 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
         return None;
     }
     let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let (w, h) = (w.div_ceil(st), h.div_ceil(st));
+    let half = st as f32 * 0.5;
     let mut px = vec![0u32; w * h];
     let (cl, cr, cb) = (sh.left + r, sh.right - r, sh.bottom - r);
     let top = sh.bottom - reach;
     // Rows higher up only carry the rim along the two sides, so the middle is skipped there;
     // from `full_from` down the whole row is rim. The corners reach further in than the sides.
     let full_from = sh.bottom - width - 1.0;
-    let side = (width.max(r) + 2.0).ceil() as usize;
+    let side = ((width.max(r) + 2.0).ceil() as usize).div_ceil(st);
     for j in 0..h {
-        let y = (y0 + j as i32) as f32 + 0.5;
+        let y = (y0 + (j * st) as i32) as f32 + half;
         let up = smooth(0.0, 0.5, (y - top) / reach);
         if up <= 0.0 {
             continue;
         }
         let (a_end, b_start) = if y >= full_from { (w, w) } else { (side.min(w), w.saturating_sub(side).max(side.min(w))) };
         for i in (0..a_end).chain(b_start..w) {
-            let x = (x0 + i as i32) as f32 + 0.5;
+            let x = (x0 + (i * st) as i32) as f32 + half;
             // distance inside the edge, and the direction pointing out of the notch
             let d;
             let nx;
@@ -200,5 +208,5 @@ pub fn rim(shot: &Shot, sh: Shape) -> Option<Rim> {
             px[j * w + i] = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb2);
         }
     }
-    Some(Rim { x0, y0, w, h, px })
+    Some(Rim { x0, y0, w, h, step: st, px })
 }
