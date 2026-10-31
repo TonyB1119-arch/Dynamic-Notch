@@ -2700,6 +2700,14 @@ impl App {
             scale: sc,
             tune,
         };
+        // a live copy covers only the notch at the size it had; if the size has changed, the whole
+        // screen is copied again (once), so the new shape has pixels to read
+        if !shot.full && shot.made_for != Some(shape) {
+            self.refr_shot = None;
+            self.refr_retry = None;
+            self.request_frame();
+            return;
+        }
         self.rim_last = Some((geo, shape));
         if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
             self.rim_ok = true;

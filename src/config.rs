@@ -626,6 +626,8 @@ pub struct GlassCfg {
     pub melt: f32,
     /// While the notch moves, the glass gets its finest detail once this fraction of the move is left.
     pub sharpen_at: f32,
+    /// How far in from the edge the glass is worked out pixel for pixel, in edge widths (4 = everywhere).
+    pub sharp_zone: f32,
 }
 
 impl Default for GlassCfg {
@@ -648,6 +650,7 @@ impl Default for GlassCfg {
             live_ms: 150.0,
             melt: 0.12,
             sharpen_at: 0.12,
+            sharp_zone: 4.0,
         }
     }
 }
@@ -671,6 +674,7 @@ impl GlassCfg {
         self.live_ms = self.live_ms.clamp(80.0, 500.0);
         self.melt = self.melt.clamp(0.03, 0.5);
         self.sharpen_at = self.sharpen_at.clamp(0.02, 0.5);
+        self.sharp_zone = self.sharp_zone.clamp(0.3, 4.0);
     }
 }
 
@@ -999,6 +1003,7 @@ glow_in = 9.0
 live_ms = 150.0
 melt = 0.12
 sharpen_at = 0.12
+sharp_zone = 4.0
 
 [tabs]
 # Order of the header tabs (Settings → Tabs). Empty = default order.

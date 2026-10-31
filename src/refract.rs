@@ -22,10 +22,26 @@ pub struct Shot {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u32>,
+    /// Where the copy's top-left corner lies in the notch window (0, 0 for a copy of all of it).
+    pub ox: i32,
+    pub oy: i32,
+    /// A copy of the whole window (a live refresh copies only the part the glass can read).
+    pub full: bool,
+    /// For a partial copy: the notch shape it was made for.
+    pub made_for: Option<Shape>,
 }
 
-/// Copy the screen area at (`x`, `y`) of size `w` x `h` (screen pixels). None if it cannot be had.
+/// Copy the screen area at (`x`, `y`) of size `w` x `h` (screen pixels): the whole notch window.
+/// None if it cannot be had.
 pub fn grab(x: i32, y: i32, w: i32, h: i32) -> Option<Shot> {
+    grab_at(x, y, w, h, 0, 0).map(|mut s| {
+        s.full = true;
+        s
+    })
+}
+
+/// Copy a piece of the screen that sits at (`ox`, `oy`) in the notch window.
+fn grab_at(x: i32, y: i32, w: i32, h: i32, ox: i32, oy: i32) -> Option<Shot> {
     if !(8..=4096).contains(&w) || !(8..=2400).contains(&h) {
         return None;
     }
@@ -58,7 +74,7 @@ pub fn grab(x: i32, y: i32, w: i32, h: i32) -> Option<Shot> {
                         let len = w as usize * h as usize;
                         // (a screen copy has no alpha; only the colours are ever read)
                         let px = std::slice::from_raw_parts(bits as *const u32, len).to_vec();
-                        shot = Some(Shot { w: w as usize, h: h as usize, px });
+                        shot = Some(Shot { w: w as usize, h: h as usize, px, ox, oy, full: false, made_for: None });
                     }
                     SelectObject(hdc, old);
                 }
@@ -99,6 +115,7 @@ pub struct Tune {
     pub mid: f32,
     pub mid_warp: f32,
     pub mid_blur: f32,
+    pub sharp: f32,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -115,6 +132,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             mid: g.middle.clamp(0.0, 1.0),
             mid_warp: g.middle_warp.clamp(0.0, 1.0),
             mid_blur: g.middle_blur.clamp(0.0, 6.0),
+            sharp: g.sharp_zone.clamp(0.3, 4.0),
         }
     }
 }
@@ -149,28 +167,31 @@ pub fn ring_sum(s: &Shot, sh: Shape) -> u64 {
     let t = sh.tune;
     let pad = (t.pull * (1.0 + t.corner) + 4.0) * sc; // the glass pulls from up to this far outside the edge
     let band = (t.width * sc + pad).ceil() as i32; // how far in from the edge the rim reaches
-    let x0 = ((sh.left - pad).floor() as i32).clamp(0, s.w as i32);
-    let x1 = ((sh.right + pad).ceil() as i32).clamp(0, s.w as i32);
-    let y0 = ((sh.bottom - r - t.reach * sc - pad).floor() as i32).clamp(0, s.h as i32);
-    let y1 = ((sh.bottom + pad).ceil() as i32).clamp(0, s.h as i32);
+    let (sx0, sy0) = (s.ox, s.oy);
+    let (sx1, sy1) = (s.ox + s.w as i32, s.oy + s.h as i32);
+    let x0 = ((sh.left - pad).floor() as i32).clamp(sx0, sx1);
+    let x1 = ((sh.right + pad).ceil() as i32).clamp(sx0, sx1);
+    let y0 = ((sh.bottom - r - t.reach * sc - pad).floor() as i32).clamp(sy0, sy1);
+    let y1 = ((sh.bottom + pad).ceil() as i32).clamp(sy0, sy1);
     let mid = t.mid > 0.01 && ((sh.band > 0.0 && sh.fade > 0.004) || sh.clear > 0.004);
     let int_top = if sh.clear > 0.004 { sh.top } else { sh.bottom - sh.band };
     let (y0, full_from) = if mid {
-        (y0.min(((int_top - pad).floor() as i32).clamp(0, s.h as i32)), (sh.bottom - band as f32).min(int_top).floor() as i32)
+        (y0.min(((int_top - pad).floor() as i32).clamp(sy0, sy1)), (sh.bottom - band as f32).min(int_top).floor() as i32)
     } else {
         (y0, (sh.bottom - band as f32).floor() as i32)
     };
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |p: u32| h = (h ^ (p & 0x00FF_FFFF) as u64).wrapping_mul(0x0000_0100_0000_01b3);
     for y in (y0..y1).step_by(2) {
-        let row = &s.px[y as usize * s.w..(y as usize + 1) * s.w];
+        let ly = (y - sy0) as usize;
+        let row = &s.px[ly * s.w..(ly + 1) * s.w];
         if y >= full_from {
-            row[x0 as usize..x1 as usize].iter().step_by(3).for_each(|&p| mix(p));
+            row[(x0 - sx0) as usize..(x1 - sx0) as usize].iter().step_by(3).for_each(|&p| mix(p));
         } else {
             let left_end = (x0 + band).min(x1);
             let right_start = (x1 - band).max(left_end);
-            row[x0 as usize..left_end as usize].iter().step_by(3).for_each(|&p| mix(p));
-            row[right_start as usize..x1 as usize].iter().step_by(3).for_each(|&p| mix(p));
+            row[(x0 - sx0) as usize..(left_end - sx0) as usize].iter().step_by(3).for_each(|&p| mix(p));
+            row[(right_start - sx0) as usize..(x1 - sx0) as usize].iter().step_by(3).for_each(|&p| mix(p));
         }
     }
     h
@@ -195,13 +216,34 @@ pub enum Fetched {
 /// the rim for `shape` as well, at half detail (it is a soft gradient and this runs often). Meant
 /// for a background thread; None when the screen could not be copied.
 pub fn refresh(x: i32, y: i32, w: i32, h: i32, prev: u64, shape: Shape) -> Option<Fetched> {
-    let shot = grab(x, y, w, h)?;
+    // only the part of the screen the glass can read (a fraction of the window): far less to copy
+    let (cx0, cy0, cx1, cy1) = crop_for(shape, w, h);
+    let mut shot = grab_at(x + cx0, y + cy0, cx1 - cx0, cy1 - cy0, cx0, cy0)?;
+    shot.made_for = Some(shape);
     let sum = ring_sum(&shot, shape);
     if sum == prev {
         return Some(Fetched::Same);
     }
     let made = rim(&shot, shape, 1);
     Some(Fetched::Fresh(Fresh { shot, sum, shape, rim: made }))
+}
+
+/// The part of the notch window (x0, y0, x1, y1) the glass for `sh` can read: the notch itself and
+/// a margin for how far the glass looks outside it. A live refresh copies only that.
+fn crop_for(sh: Shape, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let sc = sh.scale.max(0.5);
+    let t = sh.tune;
+    let m = ((t.pull * (1.0 + t.corner) + t.mid_blur + 6.0) * sc).ceil();
+    let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
+    let mid = t.mid > 0.01 && ((sh.band > 0.0 && sh.fade > 0.004) || sh.clear > 0.004);
+    let int_top = if sh.clear > 0.004 { sh.top } else { sh.bottom - sh.band };
+    let rim_top = sh.bottom - r - t.reach * sc;
+    let top = if mid { rim_top.min(int_top) } else { rim_top };
+    let x0 = ((sh.left - m).floor() as i32).clamp(0, w);
+    let x1 = ((sh.right + m).ceil() as i32).clamp(0, w);
+    let y0 = ((top - m).floor() as i32).clamp(0, h);
+    let y1 = ((sh.bottom + m).ceil() as i32).clamp(0, h);
+    (x0, y0, x1, y1)
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {
@@ -212,7 +254,7 @@ fn smooth(a: f32, b: f32, x: f32) -> f32 {
 /// One colour (`shift` 16 red, 8 green, 0 blue) of the picture at a fractional position, smoothly
 /// blended between the four nearest pixels (coordinates are clamped to the edge).
 fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
-    let (gx, gy) = (fx - 0.5, fy - 0.5);
+    let (gx, gy) = (fx - s.ox as f32 - 0.5, fy - s.oy as f32 - 0.5);
     let (x0, y0) = (gx.floor(), gy.floor());
     let (tx, ty) = (gx - x0, gy - y0);
     let (x0, y0) = (x0 as i32, y0 as i32);
@@ -237,7 +279,7 @@ fn sample(s: &Shot, fx: f32, fy: f32, shift: u32) -> f32 {
 /// The picture at a fractional position as red, green and blue, blended between the four nearest
 /// pixels (coordinates are clamped to the edge).
 fn sample_rgb(s: &Shot, fx: f32, fy: f32) -> [f32; 3] {
-    let (gx, gy) = (fx - 0.5, fy - 0.5);
+    let (gx, gy) = (fx - s.ox as f32 - 0.5, fy - s.oy as f32 - 0.5);
     let (x0, y0) = (gx.floor(), gy.floor());
     let (tx, ty) = (gx - x0, gy - y0);
     let (x0, y0) = (x0 as i32, y0 as i32);
@@ -278,10 +320,10 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let mid = t.mid > 0.01 && ((sh.band > 0.0 && sh.fade > 0.004) || sh.clear > 0.004);
     let int_top = if sh.clear > 0.004 { sh.top } else { sh.bottom - sh.band };
     let top_y = if mid { (sh.bottom - reach).min(int_top) } else { sh.bottom - reach };
-    let x0 = ((sh.left - 2.0).floor() as i32).max(0);
-    let x1 = ((sh.right + 2.0).ceil() as i32).min(shot.w as i32);
-    let y0 = (top_y.floor() as i32).max(0);
-    let y1 = ((sh.bottom + 2.0).ceil() as i32).min(shot.h as i32);
+    let x0 = ((sh.left - 2.0).floor() as i32).max(shot.ox);
+    let x1 = ((sh.right + 2.0).ceil() as i32).min(shot.ox + shot.w as i32);
+    let y0 = (top_y.floor() as i32).max(shot.oy);
+    let y1 = ((sh.bottom + 2.0).ceil() as i32).min(shot.oy + shot.h as i32);
     if x1 - x0 < 8 || y1 - y0 < 4 {
         return None;
     }
@@ -304,8 +346,10 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     // hardest right along the edge, where fine text shows. Deeper in the rim is faint and the
     // middle is soft anyway, so each 2 x 2 block there is worked out once.
     let hybrid = st == 1;
-    let cell = if hybrid { 2_usize } else { 1 };
-    let fine_d = if hybrid { width * 0.55 } else { f32::MAX };
+    // (the top setting of the sharp zone means every pixel, so there are no blocks at all)
+    let everywhere = t.sharp >= 3.95;
+    let cell = if hybrid && !everywhere { 2_usize } else { 1 };
+    let fine_d = if hybrid && !everywhere { width * t.sharp } else { f32::MAX };
     // distance inside the edge, the direction pointing out of the notch, and the corner weight
     let geom = |x: f32, y: f32| -> (f32, f32, f32, f32) {
         if y > cb && (x < cl || x > cr) {

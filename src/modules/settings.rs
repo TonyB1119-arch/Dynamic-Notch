@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        _ => 18.0,
+        _ => 19.0,
     }
 }
 
@@ -930,7 +930,7 @@ impl Settings {
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
         let g = self.cfg.glass.clone();
         // (label, value, range, shown, key)
-        let rows: [(&str, f32, (f32, f32), String, &str); 17] = [
+        let rows: [(&str, f32, (f32, f32), String, &str); 18] = [
             ("Edge width", g.edge_width, (20.0, 160.0), format!("{:.0}", g.edge_width), "edge_width"),
             ("Warp strength", g.pull, (0.0, 60.0), format!("{:.0}", g.pull), "pull"),
             ("Bend curve", g.bend, (0.8, 3.0), format!("{:.1}", g.bend), "bend"),
@@ -948,12 +948,19 @@ impl Settings {
             ("Live refresh (ms)", g.live_ms, (80.0, 500.0), format!("{:.0}", g.live_ms), "live_ms"),
             ("Live melt time (s)", g.melt, (0.03, 0.5), format!("{:.2}", g.melt), "melt"),
             ("Sharpen when left", g.sharpen_at, (0.02, 0.5), format!("{:.0}%", g.sharpen_at * 100.0), "sharpen_at"),
+            (
+                "Full-detail zone",
+                g.sharp_zone,
+                (0.3, 4.0),
+                if g.sharp_zone >= 3.95 { "Everywhere".to_string() } else { format!("{:.1}x", g.sharp_zone) },
+                "sharp_zone",
+            ),
         ];
         for (i, (text, val, range, shown, key)) in rows.into_iter().enumerate() {
             slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
         }
         let d = crate::config::GlassCfg::default();
-        let b = row_rect(body, 17);
+        let b = row_rect(body, 18);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
             for (key, v) in [
@@ -974,6 +981,7 @@ impl Settings {
                 ("live_ms", d.live_ms),
                 ("melt", d.melt),
                 ("sharpen_at", d.sharpen_at),
+                ("sharp_zone", d.sharp_zone),
             ] {
                 put(ui, "glass", key, format!("{v:.2}"));
             }
