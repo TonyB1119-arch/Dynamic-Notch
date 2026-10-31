@@ -2763,8 +2763,11 @@ impl App {
         // every frame then, and the full-detail band along the edge is what costs most. The full
         // picture follows as soon as the notch stops and melts in over this one.
         let moving_zone: f32 = if lite { 0.3 } else { 0.55 };
-        let low = !self.settled && tune.sharp > moving_zone && !still;
-        let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, step + if low { RIM_LOW } else { 0 });
+        let low = !self.settled && !still && (lite || tune.sharp > moving_zone);
+        // lighter animations also work the moving glass out on every third pixel (about 4 times less
+        // work, and it is drawn smoothed); the full picture follows once the notch rests
+        let mstep = if low && lite { 3 } else { step };
+        let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, mstep + if low { RIM_LOW } else { 0 });
         // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
         // all of it (the middle glass follows that)
         let ap = &self.cfg.appearance;
@@ -2812,7 +2815,7 @@ impl App {
         if low {
             made.tune.sharp = moving_zone;
         }
-        if let Some(rim) = crate::refract::rim(shot, made, step) {
+        if let Some(rim) = crate::refract::rim(shot, made, mstep) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
                 // the notch has just stopped and the fine rim replaces the coarse one made while it
