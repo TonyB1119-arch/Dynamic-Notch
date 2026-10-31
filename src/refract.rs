@@ -407,7 +407,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             // the middle lies under the rim; it bends gently toward the nearest edges
             let ai = a_row * (d + 1.0).clamp(0.0, 1.0);
             alpha += ai * (1.0 - alpha);
-            if d > width {
+            if d > width && t.mid_warp > 0.0 {
                 let dm;
                 let dirx;
                 let diry;
@@ -454,6 +454,13 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 acc[2] += c[2];
             }
             (acc[0] * 0.25, acc[1] * 0.25, acc[2] * 0.25)
+        } else if st == 1 && ox == 0.0 && oy == 0.0 {
+            // nothing bends it here, so the pixel behind is copied as it is (the same result as the
+            // three blended reads below, without the blending)
+            let xi = (x - shot.ox as f32).floor().clamp(0.0, shot.w as f32 - 1.0) as usize;
+            let yi = (y - shot.oy as f32).floor().clamp(0.0, shot.h as f32 - 1.0) as usize;
+            let p = shot.px[yi * shot.w + xi];
+            (((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32)
         } else {
             // red, green and blue look a slightly different distance out, like light through glass
             (

@@ -642,8 +642,8 @@ impl Default for GlassCfg {
             reach: 90.0,
             softness: 4.0,
             middle: 0.85,
-            middle_warp: 0.5,
-            middle_blur: 1.5,
+            middle_warp: 0.0,
+            middle_blur: 0.0,
             fade_amount: 0.8,
             fade_start: 1.7,
             glow_in: 9.0,
@@ -995,8 +995,8 @@ fringe = 0.05
 reach = 90.0
 softness = 4.0
 middle = 0.85
-middle_warp = 0.5
-middle_blur = 1.5
+middle_warp = 0.0
+middle_blur = 0.0
 fade_amount = 0.8
 fade_start = 1.7
 glow_in = 9.0
