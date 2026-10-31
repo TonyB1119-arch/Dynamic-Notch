@@ -115,7 +115,7 @@ pub struct Appearance {
     pub motion_cache: bool,
     /// Alcove: the bottom edge of the open notch softens into a light blur.
     pub bottom_fade: bool,
-    /// Alcove: a soft sheen, a lit edge and a little inner glow on the open notch (liquid-glass look).
+    /// Alcove: the open notch's edge bends what is behind it, like thick glass.
     pub glass_look: bool,
     /// Extra UI scale on top of the monitor DPI.
     pub scale: f32,
@@ -752,7 +752,7 @@ clock_style = "roll"
 motion_cache = true
 # Alcove: the bottom edge of the open notch softens into a light blur
 bottom_fade = true
-# Alcove: a soft sheen, a lit edge and a little inner glow (false = plain glass)
+# Alcove: the notch's edge bends what is behind it (false = plain glass)
 glass_look = true
 # "auto" picks the accent from album art, or use "#RRGGBB"
 accent = "auto"

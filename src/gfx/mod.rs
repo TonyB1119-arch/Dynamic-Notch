@@ -1164,6 +1164,51 @@ pub struct Snapshot {
     baked: Option<(ID2D1Bitmap1, ID2D1BitmapBrush1)>,
 }
 
+/// The glass rim as one small picture (see `refract`), and where it sits in logical units.
+pub struct RimPic {
+    bmp: ID2D1Bitmap1,
+    pub rect: Rect,
+}
+
+impl Res {
+    /// Upload premultiplied BGRA pixels (`w` x `h`, at (`x0`, `y0`) in window pixels) as a picture.
+    pub fn rim_pic(&self, x0: i32, y0: i32, w: usize, h: usize, px: &[u32], scale: f32) -> Option<RimPic> {
+        if w == 0 || h == 0 || px.len() < w * h || w > 4096 || h > 4096 {
+            return None;
+        }
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: ManuallyDrop::new(None),
+        };
+        unsafe {
+            let size = D2D_SIZE_U { width: w as u32, height: h as u32 };
+            let data = px.as_ptr() as *const std::ffi::c_void;
+            let bmp = self.dc.CreateBitmap(size, Some(data), (w * 4) as u32, &props).ok()?;
+            Some(RimPic { bmp, rect: Rect::new(x0 as f32 / scale, y0 as f32 / scale, w as f32 / scale, h as f32 / scale) })
+        }
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Draw the glass rim: one picture, one call, pixel for pixel.
+    pub fn draw_rim(&self, r: &RimPic, opacity: f32) {
+        let a = opacity * self.alpha;
+        if a <= 0.002 {
+            return;
+        }
+        let Ok(b) = r.bmp.cast::<ID2D1Bitmap>() else { return };
+        unsafe {
+            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
+        }
+    }
+}
+
 impl Res {
     /// Blend the strip's pictures (sharp, then lighter to heavier blur) into ONE picture. Each
     /// layer is laid down through a smooth vertical fade, so the blur grows steadily toward the

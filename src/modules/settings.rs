@@ -752,7 +752,7 @@ impl Settings {
         toggle_row(
             ui,
             row_rect(body, 13),
-            "Glass shine and lit edge",
+            "Glass edge (bends what is behind)",
             a.glass_look,
             "appearance",
             "glass_look",

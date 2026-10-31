@@ -354,6 +354,9 @@ impl Anim {
     }
 }
 
+/// Cache key of the glass rim: position, size, corner radius and scale, in quarter pixels.
+type RimKey = (i32, i32, i32, i32, i32);
+
 /// The few look settings the drawing code reads every frame, copied out so no text is cloned.
 #[derive(Clone, Copy)]
 struct Look {
@@ -392,6 +395,12 @@ pub struct App {
     snap_band: Option<Snapshot>,
     /// Set if the blended bottom strip could not be made: the notch then stays solid, no see-through edge.
     band_failed: bool,
+    /// Alcove glass edge: a copy of the screen behind the notch, taken as it opens, the rim worked
+    /// out from it, when the notch last went idle, and when a copy was last tried.
+    refr_shot: Option<crate::refract::Shot>,
+    refr_rim: Option<(RimKey, gfx::RimPic)>,
+    refr_idle: Option<Instant>,
+    refr_retry: Option<Instant>,
     /// When the blur strip first appeared (it fades in from here).
     band_since: Option<Instant>,
     pacer: Pacer,
@@ -495,6 +504,10 @@ impl App {
             snap_pages: None,
             snap_band: None,
             band_failed: false,
+            refr_shot: None,
+            refr_rim: None,
+            refr_idle: None,
+            refr_retry: None,
             band_since: None,
             pacer,
             bus,
@@ -1928,6 +1941,8 @@ impl App {
                 self.win_w = win_w;
                 self.win_h = win_h;
                 self.win_px = geom;
+                self.refr_shot = None;
+                self.refr_rim = None;
                 let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, top, wpx, hpx, SWP_NOACTIVATE);
                 if let Err(e) = self.host.resize(wpx, hpx) {
                     log!("surface resize failed: {e}");
@@ -2496,6 +2511,65 @@ impl App {
         }
     }
 
+    /// Alcove glass edge. The screen behind the notch is copied once, on the first frame after the
+    /// notch leaves its resting size (the window is still small then, so the copy is clean), and
+    /// let go a moment after the notch closes. Once the notch has settled, the rim is worked out
+    /// from that copy and uploaded as one small picture; that is redone only if the size changes.
+    fn prepare_rim(&mut self, now: Instant) {
+        if !(self.cfg.appearance.glass_look && crate::ui::look_alcove()) {
+            self.refr_shot = None;
+            self.refr_rim = None;
+            self.refr_idle = None;
+            return;
+        }
+        if self.mode == Mode::Idle {
+            let since = *self.refr_idle.get_or_insert(now);
+            if now.duration_since(since) > Duration::from_millis(1500) {
+                self.refr_shot = None;
+                self.refr_rim = None;
+            }
+            return;
+        }
+        self.refr_idle = None;
+        if self.refr_shot.is_none() && self.refr_retry.is_none_or(|t| now.duration_since(t) > Duration::from_secs(2)) {
+            let (x, y, w, h) = self.win_px;
+            self.refr_shot = crate::refract::grab(x, y, w, h);
+            self.refr_retry = Some(now);
+            if self.refr_shot.is_none() {
+                log!("glass edge: the screen could not be copied");
+            }
+        }
+        if !self.settled {
+            return;
+        }
+        let Some(shot) = self.refr_shot.as_ref() else { return };
+        let body = self.body_rect();
+        if body.h < 56.0 {
+            self.refr_rim = None;
+            return;
+        }
+        let sc = self.scale;
+        let r = self.anim.r.value.min(body.w * 0.5).min(body.h - self.anim.ear.value.min(body.h * 0.5)).max(0.0);
+        let q4 = |v: f32| (v * sc * 4.0).round() as i32;
+        let key: RimKey = (q4(body.x), q4(body.w), q4(body.bottom()), q4(r), (sc * 100.0).round() as i32);
+        if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        self.refr_rim = None;
+        let shape = crate::refract::Shape {
+            left: body.x * sc,
+            right: body.right() * sc,
+            bottom: body.bottom() * sc,
+            radius: r * sc,
+            scale: sc,
+        };
+        if let Some(rim) = crate::refract::rim(shot, shape) {
+            if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, &rim.px, sc) {
+                self.refr_rim = Some((key, pic));
+            }
+        }
+    }
+
     /// 1 while the soft bottom edge is showing, else 0.
     fn band_k(&self) -> f32 {
         if self.snap_band.is_some() {
@@ -2511,6 +2585,7 @@ impl App {
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
         self.prepare_band(now);
+        self.prepare_rim(now);
         let a_exp = self.anim.exp.value;
         let paging = self.page_from.is_some();
         let on = self.cfg.appearance.motion_cache;
@@ -2816,21 +2891,6 @@ impl App {
                     } else {
                         p.fill_geometry(&g, Color::black(bg_alpha));
                     }
-                    if glass && glass_k > 0.0 && body.h >= 56.0 {
-                        // a soft sheen at the top and a little glow from below, like light in thick glass
-                        let k = a_glass * glass_k;
-                        p.fill_geometry_vgrad(
-                            &g,
-                            body.y,
-                            body.bottom(),
-                            &[
-                                (0.0, Color::white(0.10 * k)),
-                                (0.3, Color::white(0.0)),
-                                (0.72, Color::white(0.0)),
-                                (1.0, Color::white(0.10 * k)),
-                            ],
-                        );
-                    }
                 }
 
                 p.push_clip(body);
@@ -2967,47 +3027,10 @@ impl App {
                     }
                 }
                 if glass && glass_k > 0.0 && settled && body.h >= 56.0 && a_glass > 0.01 {
-                    // thick glass edge: a soft glow along the inside of the rim and a lit rim on top of
-                    // it, both growing toward the bottom corners (drawn once the notch has settled)
-                    let k = a_glass * glass_k;
-                    let outer = Rect::new(body.x, body.y - a_r - 2.0, body.w, body.h + a_r + 2.0);
-                    let ring = |r: Rect, radius: f32, width: f32| {
-                        p.path(|b| {
-                            b.rounded_rect(r, radius, true);
-                            let inner = r.inset(width);
-                            if inner.w > 0.0 && inner.h > 0.0 {
-                                b.rounded_rect(inner, (radius - width).max(0.0), false);
-                            }
-                        })
-                    };
-                    p.push_clip(Rect::new(body.x - 1.0, body.y + a_ear * 0.8, body.w + 2.0, body.h));
-                    if let Some(g) = ring(outer, a_r, 16.0) {
-                        p.fill_geometry_vgrad(
-                            &g,
-                            body.y,
-                            body.bottom(),
-                            &[
-                                (0.0, Color::white(0.0)),
-                                (0.50, Color::white(0.0)),
-                                (0.80, Color::white(0.05 * k)),
-                                (1.0, Color::white(0.17 * k)),
-                            ],
-                        );
+                    // the glass edge: the screen behind, bent along the rim (see `prepare_rim`)
+                    if let Some((_, pic)) = &self.refr_rim {
+                        p.draw_rim(pic, a_glass * glass_k);
                     }
-                    if let Some(g) = ring(outer, a_r, 1.2) {
-                        p.fill_geometry_vgrad(
-                            &g,
-                            body.y,
-                            body.bottom(),
-                            &[
-                                (0.0, Color::white(0.0)),
-                                (0.55, Color::white(0.03 * k)),
-                                (0.85, Color::white(0.12 * k)),
-                                (1.0, Color::white(0.30 * k)),
-                            ],
-                        );
-                    }
-                    p.pop_clip();
                 }
                 p.pop_clip();
             }

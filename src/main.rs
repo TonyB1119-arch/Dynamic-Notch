@@ -16,6 +16,7 @@ mod hotkeys;
 mod ipc;
 mod modules;
 mod pacer;
+mod refract;
 mod sys;
 mod tray;
 mod ui;
