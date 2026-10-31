@@ -298,6 +298,9 @@ pub struct Res {
     /// Glass pictures that are no longer shown, kept to be filled again instead of allocating a new
     /// one for every rebuild (see `rim_pic`).
     rim_pool: RimPool,
+    /// Text whose middle lies below this height (logical units) is over the see-through glass at the
+    /// bottom of the notch, and gets a thin dark outline so it stays readable (None = no outline).
+    halo_y: Option<f32>,
 }
 
 /// Spare glass pictures: (width, height of the picture, the picture).
@@ -340,8 +343,14 @@ impl Res {
                 band_mask: None,
                 band_geo: None,
                 rim_pool: RimPool::default(),
+                halo_y: None,
             })
         }
+    }
+
+    /// Set where the see-through glass begins for the text that is drawn next (see `halo_y`).
+    pub fn set_halo(&mut self, y: Option<f32>) {
+        self.halo_y = y;
     }
 
     /// Drop cached bitmaps that are not used right now (they are re-uploaded on demand).
@@ -919,6 +928,15 @@ impl<'a> Painter<'a> {
             return;
         }
         if let Some(l) = self.layout(s, style, r.w, r.h) {
+            // over the glass the screen behind can be any colour: a thin dark outline keeps the text
+            // readable on light and busy backgrounds alike
+            if self.res.halo_y.is_some_and(|y| r.y + r.h * 0.5 > y) {
+                let halo = Color::black(0.6 * style.color.a);
+                let d = 0.9;
+                for (dx, dy) in [(-d, 0.0), (d, 0.0), (0.0, -d), (0.0, d)] {
+                    self.draw_layout(&l, r.x + dx, r.y + dy, halo);
+                }
+            }
             self.draw_layout(&l, r.x, r.y, style.color);
         }
     }

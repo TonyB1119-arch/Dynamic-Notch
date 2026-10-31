@@ -2905,8 +2905,24 @@ impl App {
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
         self.prepare_pictures(now);
+        // (the blurred strip is drawn without the outline: it is a soft copy of the page anyway)
+        self.res.set_halo(None);
         self.prepare_band(now);
         self.prepare_rim(now);
+    }
+
+    /// Where the see-through glass begins at the bottom of a notch whose bottom edge is at `bottom` and
+    /// that is `h` tall: text below that line gets a thin dark outline (see `Res::set_halo`). With
+    /// the whole panel see-through (opacity below 100 %) all of it does.
+    fn halo_y(&self, bottom: f32, h: f32) -> Option<f32> {
+        let ap = &self.cfg.appearance;
+        let opaque = if ap.blur { ap.expanded_opacity } else { ap.expanded_opacity.max(0.95) };
+        if 1.0 - opaque > 0.05 {
+            return Some(f32::MIN);
+        }
+        let bhh = BAND_H.min(h * 0.4);
+        let band_on = ap.bottom_fade && ap.blur && crate::ui::look_alcove() && self.page != "settings" && h > bhh * 2.0;
+        band_on.then(|| bottom - bhh * self.cfg.glass.fade_start.clamp(0.5, 3.0) * 0.6)
     }
 
     fn prepare_pictures(&mut self, now: Instant) {
@@ -2955,6 +2971,7 @@ impl App {
         let page_id = |id: ModuleId| id.bytes().fold(0i32, |a, b| a.wrapping_mul(31).wrapping_add(b as i32));
         let sc = (scale * 100.0) as i32;
 
+        self.res.set_halo(self.halo_y(full.bottom(), full.h));
         if want_all {
             // the height is left out of the key: it changes every frame while closing
             let key = hash(&[page_id(page), full.x.round() as i32, full.y.round() as i32, full.w.round() as i32, sc]);
@@ -3053,6 +3070,7 @@ impl App {
             }
         };
         let body = self.body_rect();
+        self.res.set_halo(self.halo_y(body.bottom(), body.h));
         let scale = self.scale;
         let ap = {
             let a = &self.cfg.appearance;
