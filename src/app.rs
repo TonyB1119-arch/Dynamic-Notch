@@ -2572,15 +2572,12 @@ impl App {
                 log!("glass edge: the screen could not be copied");
             }
         }
-        // the rim is made as soon as the notch has reached its size, not only once every last
-        // spring has come to rest (that tail made it appear a second late)
+        // the rim is there as soon as the notch is open and follows it: while a page change
+        // resizes the notch it is made again for every size on the way (a small picture), so it
+        // moves with the page instead of waiting for it. Not while the notch itself opens or closes.
         let body = self.body_rect();
-        let t = self.targets();
-        let calm = self.page_from.is_none()
-            && (self.anim.exp.value > 0.98 || self.anim.peek.value > 0.95)
-            && (body.h - t.h).abs() < 1.0
-            && (body.w - t.w).abs() < 1.0;
-        if !calm {
+        let open = self.anim.exp.value > 0.98 || self.anim.peek.value > 0.95;
+        if !open {
             self.rim_ok = false;
             return;
         }
@@ -2795,12 +2792,9 @@ impl App {
         let settled = self.settled;
         let see_through = ap.expanded_opacity < 0.97 || ap.collapsed_opacity < 0.97;
         let glass = ap.glass_look && crate::ui::look_alcove();
-        // the sheen and the lit edge are not drawn at all while a page is changing, so a page
-        // switch runs exactly the same with the glass look on or off
-        let glass_k = if self.page_from.is_some() { 0.0 } else { 1.0 };
         let a_glass = self.anim.glass.value;
         // the rim fades in over about a quarter of a second and out twice as fast
-        let rim_to = if self.rim_ok && glass_k > 0.0 { 1.0 } else { 0.0 };
+        let rim_to = if self.rim_ok { 1.0 } else { 0.0 };
         let rim_dt = now.saturating_duration_since(self.rim_at).as_secs_f32().min(0.1);
         self.rim_at = now;
         let rim_rate = if rim_to > self.rim_k { 9.0 } else { 18.0 };
