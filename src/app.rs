@@ -2764,9 +2764,8 @@ impl App {
         // picture follows as soon as the notch stops and melts in over this one.
         let moving_zone: f32 = if lite { 0.3 } else { 0.55 };
         let low = !self.settled && !still && (lite || tune.sharp > moving_zone);
-        // lighter animations also work the moving glass out on every third pixel (about 4 times less
-        // work, and it is drawn smoothed); the full picture follows once the notch rests
-        let mstep = if low && lite { 3 } else { step };
+        // (the moving glass keeps full pixel detail along the edge: coarser pictures looked pixelated)
+        let mstep = step;
         let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, mstep + if low { RIM_LOW } else { 0 });
         // where the notch is see-through: the strip along the bottom and, below 100 % panel opacity,
         // all of it (the middle glass follows that)
@@ -2814,6 +2813,12 @@ impl App {
         let mut made = shape;
         if low {
             made.tune.sharp = moving_zone;
+            if lite {
+                // lighter animations: while the notch moves the middle is left clear (no bend, no blur,
+                // about half the work); the full look melts in as soon as it rests
+                made.tune.mid_warp = 0.0;
+                made.tune.mid_blur = 0.0;
+            }
         }
         if let Some(rim) = crate::refract::rim(shot, made, mstep) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
