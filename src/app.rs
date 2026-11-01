@@ -435,6 +435,8 @@ pub struct App {
     rim_geo: Option<(i32, i32, i32, i32, i32)>,
     /// When the glass edge was last rebuilt (lighter animations spread the rebuilds out).
     rim_t: Option<Instant>,
+    /// How long a glass rebuild takes lately (smoothed); sets how often the moving glass is redone.
+    rim_cost: Duration,
     /// How far (in logical px of width + height) the notch had to go when the current move began.
     rim_far: f32,
     /// The shape (and its quantised key) the current rim was made for.
@@ -593,6 +595,7 @@ impl App {
             refr_rim: None,
             rim_geo: None,
             rim_t: None,
+            rim_cost: Duration::from_millis(12),
             rim_far: 0.0,
             rim_last: None,
             rim_tune: None,
@@ -2393,7 +2396,7 @@ impl App {
         if self.tail
             && !self.dirty
             && now.duration_since(self.last_frame)
-                < Duration::from_micros(self.frame_gap_us() as u64 * if self.cfg.appearance.lite_motion { 22 } else { 15 } / 8)
+                < Duration::from_micros(self.frame_gap_us() as u64 * 15 / 8)
         {
             self.tm[8] += 1;
             return;
@@ -2760,7 +2763,7 @@ impl App {
             && !self.settled
             && !still
             && self.refr_rim.is_some()
-            && self.rim_t.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(45))
+            && self.rim_t.is_some_and(|t| now.saturating_duration_since(t) < (self.rim_cost * 3).clamp(Duration::from_millis(16), Duration::from_millis(45)))
         {
             self.rim_ok = true;
             return;
@@ -2769,7 +2772,7 @@ impl App {
         // While the size is still changing the sharp zone is capped: the glass is rebuilt for nearly
         // every frame then, and the full-detail band along the edge is what costs most. The full
         // picture follows as soon as the notch stops and melts in over this one.
-        let moving_zone: f32 = if lite { 0.3 } else { 0.55 };
+        let moving_zone: f32 = if lite { 0.4 } else { 0.55 };
         let low = !self.settled && !still && (lite || tune.sharp > moving_zone);
         // (the moving glass keeps full pixel detail along the edge: coarser pictures looked pixelated)
         let mstep = step;
@@ -2829,7 +2832,10 @@ impl App {
                 made.tune.mid_blur = 0.0;
             }
         }
-        if let Some(rim) = crate::refract::rim(shot, made, mstep) {
+        let t_made = Instant::now();
+        let built = crate::refract::rim(shot, made, mstep);
+        self.rim_cost = (self.rim_cost * 3 + t_made.elapsed()) / 4;
+        if let Some(rim) = built {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
                 self.rim_rect = Some(body);
@@ -4787,7 +4793,6 @@ fn draw_expanded_core(
     // One page is drawn at a time: the old one slides a little and fades out, then the new one
     // slides in and fades up. (Drawing both at once doubled the work for no visible gain.)
     const SLIDE: f32 = 16.0;
-    const SPLIT: f32 = 0.45;
     let base = ui.p.alpha;
     let was_interactive = ui.interactive;
     let wide = full.w.max(from_size.0);
@@ -4800,7 +4805,7 @@ fn draw_expanded_core(
     // Alcove, with the pictures ready: the new page starts rising while the old one is still
     // fading, so there is never an empty moment between the two
     let overlap = al && snaps.is_some();
-    let (old_end, new_start) = if overlap { (0.46, 0.38) } else { (SPLIT, SPLIT) };
+    let (old_end, new_start) = if overlap { (0.46, 0.38) } else { (0.5, 0.22) };
     if t < old_end {
         let u = t / old_end;
         let e = smoothstep(0.0, 1.0, u);
@@ -4817,7 +4822,7 @@ fn draw_expanded_core(
     if t >= new_start {
         let u = (t - new_start) / (1.0 - new_start);
         // Alcove: the new page is already clearly there while it is still being stretched
-        ui.p.alpha = base * if al { smoothstep(0.0, 0.4, u) } else { smoothstep(0.0, 0.8, u) };
+        ui.p.alpha = base * if al { smoothstep(0.0, 0.4, u) } else { smoothstep(0.0, 0.45, u) };
         ui.interactive = was_interactive && u > 0.6;
         let e = 1.0 - smoothstep(0.0, 1.0, u);
         let (dx, dy) = if al { (0.0, (dir * slide * e).round()) } else { ((dir * slide * e).round(), 0.0) };

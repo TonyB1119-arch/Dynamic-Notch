@@ -133,7 +133,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             soft: g.softness.clamp(0.5, 12.0),
             mid: g.middle.clamp(0.0, 1.0),
             mid_warp: if g.stretch { 0.0 } else { g.middle_warp.clamp(0.0, 1.0) },
-            mid_blur: g.middle_blur.clamp(0.0, 6.0),
+            mid_blur: g.middle_blur.clamp(0.0, 6.0) * 0.7,
             sharp: g.sharp_zone.clamp(0.3, 4.0),
             dir: if g.stretch { -1.0 } else { 1.0 },
         }
