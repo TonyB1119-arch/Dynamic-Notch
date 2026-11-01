@@ -633,6 +633,9 @@ pub struct GlassCfg {
     pub sharpen_at: f32,
     /// How far in from the edge the glass is worked out pixel for pixel, in edge widths (4 = everywhere).
     pub sharp_zone: f32,
+    /// Stretch the glass edge like iOS Liquid Glass: the picture under the glass is pulled out toward
+    /// the edge (it can fold over right at the rim) instead of the picture outside being pulled in.
+    pub stretch: bool,
 }
 
 impl Default for GlassCfg {
@@ -656,6 +659,7 @@ impl Default for GlassCfg {
             melt: 0.12,
             sharpen_at: 0.12,
             sharp_zone: 4.0,
+            stretch: false,
         }
     }
 }
@@ -1012,6 +1016,9 @@ live_ms = 150.0
 melt = 0.12
 sharpen_at = 0.12
 sharp_zone = 4.0
+# true = the glass edge stretches the picture under it toward the edge (iOS Liquid Glass look);
+# false = it pulls in the picture from outside the notch (the original look)
+stretch = false
 
 [tabs]
 # Order of the header tabs (Settings → Tabs). Empty = default order.

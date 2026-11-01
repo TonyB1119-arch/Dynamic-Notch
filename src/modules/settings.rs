@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        _ => 19.0,
+        _ => 20.0,
     }
 }
 
@@ -968,7 +968,8 @@ impl Settings {
             slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
         }
         let d = crate::config::GlassCfg::default();
-        let b = row_rect(body, 18);
+        toggle_row(ui, row_rect(body, 18), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
+        let b = row_rect(body, 19);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
             for (key, v) in [

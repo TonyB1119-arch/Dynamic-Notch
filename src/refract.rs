@@ -116,6 +116,8 @@ pub struct Tune {
     pub mid_warp: f32,
     pub mid_blur: f32,
     pub sharp: f32,
+    /// 1 pulls the picture from outside the notch in; -1 stretches the picture under it outward.
+    pub dir: f32,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -133,6 +135,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             mid_warp: g.middle_warp.clamp(0.0, 1.0),
             mid_blur: g.middle_blur.clamp(0.0, 6.0),
             sharp: g.sharp_zone.clamp(0.3, 4.0),
+            dir: if g.stretch { -1.0 } else { 1.0 },
         }
     }
 }
@@ -398,7 +401,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             let base = (t.strength + 0.1 * corner).min(1.0);
             alpha = (base + (1.0 - base) * smooth(soft, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
             let k = if even_bend { u * u.sqrt() } else { u.powf(t.bend) };
-            let p = pull * (1.0 + t.corner * corner);
+            let p = pull * t.dir * (1.0 + t.corner * corner);
             ox = nx * p * k;
             oy = ny * p * k;
         }
