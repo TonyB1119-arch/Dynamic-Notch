@@ -401,7 +401,13 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             let base = (t.strength + 0.1 * corner).min(1.0);
             alpha = (base + (1.0 - base) * smooth(soft, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
             let k = if even_bend { u * u.sqrt() } else { u.powf(t.bend) };
-            let p = pull * t.dir * (1.0 + t.corner * corner);
+            let mut p = pull * t.dir * (1.0 + t.corner * corner);
+            if t.dir < 0.0 {
+                // stretching only works while the picture keeps its order across the rim; past this
+                // limit it folds over and the text reads backwards, so the stretch never folds
+                let steepest = if even_bend { 1.5 } else { t.bend.max(1.0) };
+                p = p.max(-0.92 * width / steepest);
+            }
             ox = nx * p * k;
             oy = ny * p * k;
         }
