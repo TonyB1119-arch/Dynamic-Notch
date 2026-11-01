@@ -1270,6 +1270,12 @@ impl Res {
 impl<'a> Painter<'a> {
     /// Draw the glass rim: one picture, one call, pixel for pixel.
     pub fn draw_rim(&self, r: &RimPic, opacity: f32) {
+        self.draw_rim_to(r, r.rect, opacity);
+    }
+
+    /// The same, drawn into `dst` (a picture made for an earlier size is stretched to the size the
+    /// notch has now, so no gap shows at its edges).
+    pub fn draw_rim_to(&self, r: &RimPic, dst: Rect, opacity: f32) {
         let a = opacity * self.alpha;
         if a <= 0.002 {
             return;
@@ -1279,7 +1285,7 @@ impl<'a> Painter<'a> {
             let mode = if r.step > 1 { D2D1_INTERPOLATION_MODE_LINEAR } else { D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
             // only the part that holds the rim (the picture may be a little bigger)
             let src = D2D_RECT_F { left: 0.0, top: 0.0, right: r.used.0 as f32, bottom: r.used.1 as f32 };
-            self.dc.DrawBitmap(&b, Some(&rf(r.rect)), a, mode, Some(&src), None);
+            self.dc.DrawBitmap(&b, Some(&rf(dst)), a, mode, Some(&src), None);
         }
     }
 }

@@ -460,6 +460,10 @@ pub struct App {
     /// The previous rim picture, while the new one melts in over it.
     rim_old: Option<(RimKey, gfx::RimPic)>,
     rim_x: f32,
+    /// The notch's rectangle when the glass pictures were made (they are stretched to fit the size now).
+    rim_rect: Option<Rect>,
+    rim_old_rect: Option<Rect>,
+    rim_last_rect: Option<Rect>,
     refr_retry: Option<Instant>,
     /// The window in front when the copy was taken; if another comes forward the copy is out of date.
     refr_fg: isize,
@@ -602,6 +606,9 @@ impl App {
             excl: false,
             rim_old: None,
             rim_x: 1.0,
+            rim_rect: None,
+            rim_old_rect: None,
+            rim_last_rect: None,
             refr_retry: None,
             refr_fg: 0,
             refr_dead: false,
@@ -2804,11 +2811,13 @@ impl App {
             return;
         }
         self.rim_last = Some((geo, shape));
+        self.rim_last_rect = Some(body);
         if self.refr_rim.as_ref().is_some_and(|(k, _)| *k == key) {
             self.rim_ok = true;
             return;
         }
         let prev = self.refr_rim.take();
+        let prev_rect = self.rim_rect;
         let t_rim = self.debug.then(Instant::now);
         let mut made = shape;
         if low {
@@ -2823,11 +2832,13 @@ impl App {
         if let Some(rim) = crate::refract::rim(shot, made, mstep) {
             if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                 self.refr_rim = Some((key, pic));
+                self.rim_rect = Some(body);
                 // the notch has just stopped and the fine rim replaces the coarse one made while it
                 // moved: the two melt into each other instead of one jumping to the other
                 if let Some(old) = prev {
                     if old.0 .5 > key.5 && rim_near(&old.0, &key) {
                         self.rim_old = Some(old);
+                        self.rim_old_rect = prev_rect;
                         self.rim_x = 0.0;
                     }
                 }
@@ -2990,6 +3001,8 @@ impl App {
                         if let Some(pic) = self.res.rim_pic(rim.x0, rim.y0, rim.w, rim.h, rim.step, &rim.px, sc) {
                             let key: RimKey = (geo.0, geo.1, geo.2, geo.3, geo.4, rim.step);
                             self.rim_old = self.refr_rim.take();
+                            self.rim_old_rect = self.rim_rect;
+                            self.rim_rect = self.rim_last_rect;
                             self.rim_x = if self.rim_old.is_some() { 0.0 } else { 1.0 };
                             self.refr_rim = Some((key, pic));
                             self.request_frame();
@@ -3418,15 +3431,28 @@ impl App {
                     // the glass edge: the screen behind, bent along the rim (see `prepare_rim`)
                     if let Some((key, pic)) = &self.refr_rim {
                         let a = a_glass * self.rim_k;
+                        // a glass picture made a moment ago (lighter animations rebuild it less often)
+                        // is stretched to the notch's size now, so nothing shows at its edges
+                        let fit = |r: &gfx::RimPic, at: Option<Rect>| -> Rect {
+                            match at {
+                                Some(o) if o.w > 8.0 && o.h > 8.0 && ((o.w - body.w).abs() + (o.h - body.h).abs()) > 0.05 => {
+                                    let (sx, sy) = (body.w / o.w, body.h / o.h);
+                                    let (ocx, ncx) = (o.x + o.w * 0.5, body.x + body.w * 0.5);
+                                    let r = r.rect;
+                                    Rect::new(ncx + (r.x - ocx) * sx, body.bottom() + (r.y - o.bottom()) * sy, r.w * sx, r.h * sy)
+                                }
+                                _ => r.rect,
+                            }
+                        };
                         match &self.rim_old {
                             // (only while the old picture still fits the notch's size)
                             Some((old_key, old)) if rim_near(old_key, key) => {
                                 let t = self.rim_x.clamp(0.0, 1.0);
                                 let t = t * t * (3.0 - 2.0 * t);
-                                p.draw_rim(old, a * (1.0 - t));
-                                p.draw_rim(pic, a * t);
+                                p.draw_rim_to(old, fit(old, self.rim_old_rect), a * (1.0 - t));
+                                p.draw_rim_to(pic, fit(pic, self.rim_rect), a * t);
                             }
-                            _ => p.draw_rim(pic, a),
+                            _ => p.draw_rim_to(pic, fit(pic, self.rim_rect), a),
                         }
                     }
                 }
