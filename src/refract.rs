@@ -132,7 +132,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             reach: g.reach.clamp(30.0, 200.0),
             soft: g.softness.clamp(0.5, 12.0),
             mid: g.middle.clamp(0.0, 1.0),
-            mid_warp: g.middle_warp.clamp(0.0, 1.0),
+            mid_warp: if g.stretch { 0.0 } else { g.middle_warp.clamp(0.0, 1.0) },
             mid_blur: g.middle_blur.clamp(0.0, 6.0),
             sharp: g.sharp_zone.clamp(0.3, 4.0),
             dir: if g.stretch { -1.0 } else { 1.0 },
@@ -316,6 +316,8 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let pull = t.pull * sc; // how far out the strongest pixels look
     let soft = t.soft * sc;
     let even_bend = (t.bend - 1.5).abs() < 0.001;
+    // the most the picture may stretch before it would fold over (see the rim loop)
+    let stretch_cap = -0.92 * width / if even_bend { 1.5 } else { t.bend.max(1.0) };
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + t.reach * sc; // how far up the sides it is drawn, fading out toward the top
     // The middle: wherever the notch is even a little see-through (the strip along the bottom, or
@@ -405,8 +407,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             if t.dir < 0.0 {
                 // stretching only works while the picture keeps its order across the rim; past this
                 // limit it folds over and the text reads backwards, so the stretch never folds
-                let steepest = if even_bend { 1.5 } else { t.bend.max(1.0) };
-                p = p.max(-0.92 * width / steepest);
+                p = p.max(stretch_cap);
             }
             ox = nx * p * k;
             oy = ny * p * k;
