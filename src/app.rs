@@ -2762,13 +2762,13 @@ impl App {
         let step = fine;
         let _ = late;
         let lite = self.cfg.appearance.lite_motion;
-        // lighter animations: while the size changes the glass edge is rebuilt at most every 45 ms and
+        // lighter animations: while the size changes the glass edge is rebuilt at most every 50 ms and
         // the picture already there keeps showing in between (it is a few pixels behind at worst)
         if lite
             && !self.settled
             && !still
             && self.refr_rim.is_some()
-            && self.rim_t.is_some_and(|t| now.saturating_duration_since(t) < (self.rim_cost * 3).clamp(Duration::from_millis(16), Duration::from_millis(45)))
+            && self.rim_t.is_some_and(|t| now.saturating_duration_since(t) < (self.rim_cost * 10 / 3).clamp(Duration::from_millis(18), Duration::from_millis(50)))
         {
             self.rim_ok = true;
             return;
