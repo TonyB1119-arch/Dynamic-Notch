@@ -1672,7 +1672,7 @@ impl App {
         let b = self.body_rect();
         let k = self.anim.split.value;
         let y = b.y.min(0.0);
-        (Rect::new(b.x - (s + 8.0) * k, y, s, s), Rect::new(b.right() - s + (s + 8.0) * k, y, s, s))
+        (Rect::new(b.x - (s + SPLIT_GAP) * k, y, s, s), Rect::new(b.right() - s + (s + SPLIT_GAP) * k, y, s, s))
     }
 
     /// The lingering bubbles (oldest nearest the notch): rect, opacity, icon and colour. Each pops
@@ -2254,6 +2254,9 @@ impl App {
             Mode::Idle => {
                 if let Some(a) = &self.activity {
                     t.w = if self.split_media() { base_w } else { base_w + 2.0 * a.wing * base_h };
+                    if self.split_media() {
+                        t.ear = 0.0;
+                    }
                     t.compact = true;
                     t.sec = self.secondary.is_some() && t.shown;
                 } else {
@@ -2492,7 +2495,7 @@ impl App {
         let t = self.targets();
         let shown = t.shown;
         let bubble = if t.sec { self.cfg.appearance.notch_height + 8.0 + ear } else { 0.0 };
-        let side = if self.split_media() { self.cfg.appearance.notch_height + 8.0 } else { 0.0 };
+        let side = if self.split_media() { self.cfg.appearance.notch_height + SPLIT_GAP } else { 0.0 };
         let tb = Rect::new(self.win_w * 0.5 - t.w * 0.5 - ear - side, 0.0, t.w + 2.0 * (ear + side) + bubble, t.h);
         let cur = self.body_rect();
         let mut cb = Rect::new(cur.x - ear, 0.0, cur.w + 2.0 * ear, cur.bottom().max(0.0));
@@ -3388,7 +3391,7 @@ impl App {
                             interactive: false,
                         };
                         for (br, slot, left) in [(lb, &act.left, true), (rb, &act.right, false)] {
-                            if let Some(g) = gfx::notch_path(ui.p, br, br.w * 0.5, a_ear.min(6.0)) {
+                            if let Some(g) = gfx::notch_path(ui.p, br, br.w * 0.5, 0.0) {
                                 ui.p.fill_geometry(&g, Color::black(ap.collapsed_opacity));
                             }
                             ui.p.alpha = split_v.clamp(0.0, 1.0);
@@ -5399,3 +5402,7 @@ mod calendar_tests {
         assert_eq!(weekday_of(days_from_civil(2026, 10, 26)), 1);
     }
 }
+
+
+/// Alcove music: the clear space between the notch and each of its two side bubbles.
+const SPLIT_GAP: f32 = 10.0;
