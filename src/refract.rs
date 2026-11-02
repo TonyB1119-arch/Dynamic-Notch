@@ -318,10 +318,12 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let even_bend = (t.bend - 1.5).abs() < 0.001;
     // the most the picture may stretch before it would fold over (see the rim loop)
     let stretch_cap = -0.92 * width / if even_bend { 1.5 } else { t.bend.max(1.0) };
-    // the fan: how far the stretch turns sideways at the ends of the bottom edge (radians), and the
-    // middle and half width it is measured from
+    // the waves: how far the stretch turns sideways at the most (radians), where they start from,
+    // and how fast they repeat. A wave is never shorter than where the picture would fold over
+    // sideways (the turn changes by less than the stretch gives, per pixel).
     const FAN: f32 = 1.0;
-    let (fan_c, fan_h) = ((sh.left + sh.right) * 0.5, ((sh.right - sh.left) * 0.5).max(1.0));
+    let fan_c = (sh.left + sh.right) * 0.5;
+    let wave_k = std::f32::consts::TAU / (110.0 * sc).max(7.0 * stretch_cap.abs());
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + t.reach * sc; // how far up the sides it is drawn, fading out toward the top
     // The middle: wherever the notch is even a little see-through (the strip along the bottom, or
@@ -417,10 +419,9 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 p = p.max(stretch_cap);
             }
             let (nx, ny) = if t.dir < 0.0 && ny > 0.0 {
-                // turn the direction sideways by more the further from the middle (and by less the
-                // closer it already points sideways, so it still meets the straight sides)
-                let s = ((x - fan_c) / fan_h).clamp(-1.0, 1.0);
-                let (sn, cs) = (FAN * s.signum() * smooth(0.0, 1.0, s.abs()) * ny).sin_cos();
+                // turn the direction sideways, left then right then left again as x moves along (and
+                // by less the closer it already points sideways, so it still meets the straight sides)
+                let (sn, cs) = (FAN * ((x - fan_c) * wave_k).sin() * ny).sin_cos();
                 (nx * cs + ny * sn, ny * cs - nx * sn)
             } else {
                 (nx, ny)
