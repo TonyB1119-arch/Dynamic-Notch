@@ -309,6 +309,53 @@ type RimPool = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32, ID2D1Bitmap1)>>>;
 /// Cache key for a realized shape: kind + quantized dimensions.
 pub type RKey = (u8, i32, i32, i32, i32);
 
+/// The dashes of a rounded-rectangle outline as little quads (`half` = half the line width). The
+/// dash count is rounded so the pattern closes evenly instead of ending in a stub.
+fn dash_quads(w: f32, h: f32, rad: f32, dash: f32, gap: f32, half: f32) -> Vec<[(f32, f32); 4]> {
+    let rad = rad.min(w * 0.5).min(h * 0.5).max(0.0);
+    let (a, b) = (w - 2.0 * rad, h - 2.0 * rad);
+    let arc = std::f32::consts::FRAC_PI_2 * rad;
+    let total = 2.0 * (a + b) + 4.0 * arc;
+    if total < dash + gap {
+        return Vec::new();
+    }
+    let n = (total / (dash + gap)).round().max(1.0) as usize;
+    let step = total / n as f32;
+    let segs = [(a, 0), (arc, 1), (b, 2), (arc, 3), (a, 4), (arc, 5), (b, 6), (arc, 7)];
+    let at = |s: f32| -> (f32, f32) {
+        let mut s = s.rem_euclid(total);
+        for (len, k) in segs {
+            if s <= len {
+                let t = if rad > 0.0 { s / rad } else { 0.0 };
+                let pi = std::f32::consts::PI;
+                let on = |cx: f32, cy: f32, t: f32| (cx + rad * t.sin(), cy - rad * t.cos());
+                return match k {
+                    0 => (rad + s, 0.0),
+                    1 => on(w - rad, rad, t),
+                    2 => (w, rad + s),
+                    3 => on(w - rad, h - rad, pi * 0.5 + t),
+                    4 => (w - rad - s, h),
+                    5 => on(rad, h - rad, pi + t),
+                    6 => (0.0, h - rad - s),
+                    _ => on(rad, rad, pi * 1.5 + t),
+                };
+            }
+            s -= len;
+        }
+        (rad, 0.0)
+    };
+    (0..n)
+        .map(|i| {
+            let s0 = i as f32 * step + (step - dash) * 0.5;
+            let (p0, p1) = (at(s0), at(s0 + dash));
+            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+            let l = (dx * dx + dy * dy).sqrt().max(1e-4);
+            let (nx, ny) = (-dy / l * half, dx / l * half);
+            [(p0.0 + nx, p0.1 + ny), (p1.0 + nx, p1.1 + ny), (p1.0 - nx, p1.1 - ny), (p0.0 - nx, p0.1 - ny)]
+        })
+        .collect()
+}
+
 /// Quantize to 1/4 DIP so nearly identical shapes share one realization.
 pub fn q(v: f32) -> i32 {
     (v * 4.0).round() as i32
@@ -761,6 +808,25 @@ impl<'a> Painter<'a> {
         let key = (31, q(radius), ang(start), ang(sweep), q(width));
         self.fill_cached(key, cx, cy, c, |b| {
             b.arc_stroke(0.0, 0.0, uq(key.1), key.2 as f32 / 256.0, key.3 as f32 / 256.0, uq(key.4))
+        });
+    }
+
+    /// A dashed outline in the style of a drop zone: short straight dashes along a rounded rectangle.
+    /// Built once per size (all dashes in one cached shape), so a frame costs a single draw.
+    pub fn dashed_rounded(&self, r: Rect, radius: f32, width: f32, c: Color) {
+        if c.a * self.alpha <= 0.001 || r.w <= 8.0 || r.h <= 8.0 {
+            return;
+        }
+        let rad = radius.min(r.w * 0.5).min(r.h * 0.5);
+        let key = (32, q(r.w), q(r.h), q(rad), q(width));
+        self.fill_cached(key, r.x, r.y, c, |b| {
+            for d in dash_quads(uq(key.1), uq(key.2), uq(key.3), 7.0, 6.0, uq(key.4) * 0.5) {
+                b.move_to(d[0].0, d[0].1);
+                b.line_to(d[1].0, d[1].1);
+                b.line_to(d[2].0, d[2].1);
+                b.line_to(d[3].0, d[3].1);
+                b.close();
+            }
         });
     }
 

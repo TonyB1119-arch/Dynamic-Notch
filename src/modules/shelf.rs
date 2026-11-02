@@ -252,8 +252,10 @@ impl Module for Shelf {
         // drop zone highlight while files hover over the notch
         if self.drop_hover {
             let zone = Rect::new(body.x, body.y, body.w, body.h - GAP * 0.5);
-            ui.p.fill_rounded(zone, 14.0, accent.with_a(0.08));
-            ui.p.stroke_rounded(zone.inset(0.75), 14.0, 1.5, accent.with_a(0.7));
+            // monochrome look: a quiet white fill and small white dashes instead of a solid coloured line
+            let tint = if crate::ui::mono_icons() { Color::white(1.0) } else { accent };
+            ui.p.fill_rounded(zone, 14.0, tint.with_a(0.05));
+            ui.p.dashed_rounded(zone.inset(1.5), 12.5, 1.6, tint.with_a(0.75));
             ui.ticks_sweep(Rect::new(zone.x + 16.0, zone.bottom() - 18.0, zone.w - 32.0, 10.0), accent);
         }
         if self.items.is_empty() {
@@ -336,9 +338,10 @@ impl Shelf {
         crate::alcove::title(ui, head, Icon::Package, palette::YELLOW, "Shelf", "");
         let below = Rect::new(r.x, head.bottom() + 6.0, r.w, r.bottom() - head.bottom() - 6.0);
         if self.drop_hover {
-            ui.p.fill_rounded(below, 26.0, palette::YELLOW.with_a(0.10));
-            ui.p.stroke_rounded(below.inset(0.75), 26.0, 1.5, palette::YELLOW.with_a(0.7));
-            ui.p.text("Drop to park files here", below, &TextStyle::new(15.0, palette::YELLOW).semibold().center());
+            let tint = if crate::ui::mono_icons() { Color::white(1.0) } else { palette::YELLOW };
+            ui.p.fill_rounded(below, 26.0, tint.with_a(0.05));
+            ui.p.dashed_rounded(below.inset(1.5), 24.5, 1.6, tint.with_a(0.75));
+            ui.p.text("Drop to park files here", below, &TextStyle::new(15.0, tint).semibold().center());
             return;
         }
         if self.items.is_empty() {
