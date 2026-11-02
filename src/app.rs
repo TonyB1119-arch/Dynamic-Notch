@@ -2255,7 +2255,7 @@ impl App {
                 if let Some(a) = &self.activity {
                     t.w = if self.split_media() { base_w } else { base_w + 2.0 * a.wing * base_h };
                     if self.split_media() {
-                        t.ear = 0.0;
+                        t.ear = 5.0;
                     }
                     t.compact = true;
                     t.sec = self.secondary.is_some() && t.shown;
@@ -3391,7 +3391,7 @@ impl App {
                             interactive: false,
                         };
                         for (br, slot, left) in [(lb, &act.left, true), (rb, &act.right, false)] {
-                            if let Some(g) = gfx::notch_path(ui.p, br, br.w * 0.5, 0.0) {
+                            if let Some(g) = gfx::notch_path(ui.p, br, br.w * 0.5, a_ear.min(5.0)) {
                                 ui.p.fill_geometry(&g, Color::black(ap.collapsed_opacity));
                             }
                             ui.p.alpha = split_v.clamp(0.0, 1.0);
@@ -5405,4 +5405,4 @@ mod calendar_tests {
 
 
 /// Alcove music: the clear space between the notch and each of its two side bubbles.
-const SPLIT_GAP: f32 = 10.0;
+const SPLIT_GAP: f32 = 14.0;
