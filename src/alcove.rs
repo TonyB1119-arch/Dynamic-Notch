@@ -486,9 +486,21 @@ pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
     }
     let (cx, cy, rad) = (c.cx(), c.cy(), c.w.min(c.h) * 0.5);
     ui.p.fill_circle(cx, cy, rad, Color::white(0.07 + 0.05 * h));
-    ui.p.stroke_circle(cx, cy, rad - 0.5, 1.0, Color::white(0.10 + 0.10 * h));
-    ui.p.arc(cx, cy, rad - 0.5, -1.15, 2.3, 1.4, Color::white(0.34 + 0.30 * h));
-    ui.p.arc(cx, cy, rad - 0.5, std::f32::consts::PI - 0.6, 1.2, 1.2, Color::white(0.10 + 0.08 * h));
+    ui.p.stroke_circle(cx, cy, rad - 0.5, 1.0, Color::white(0.045 + 0.05 * h));
+    // two short white highlights, one at the top right and one at the bottom left, only at those
+    // corners. Each is a few arcs laid over each other, shorter and shorter, so the light is
+    // brightest in the middle of the highlight and fades out quickly toward both ends.
+    let peak = 0.22 + 0.10 * h;
+    for centre in [std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4 + std::f32::consts::PI] {
+        for sweep in [1.2_f32, 0.9, 0.6, 0.3] {
+            glint_arc(ui, cx, cy, rad - 0.5, centre - sweep * 0.5, sweep, peak);
+        }
+    }
+}
+
+/// One layer of a corner highlight (angles run clockwise from straight up).
+fn glint_arc(ui: &mut Ui, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, a: f32) {
+    ui.p.arc(cx, cy, r, start, sweep, 1.5, Color::white(a));
 }
 
 /// A page title: a small round icon, the name and a dim note beside it.
