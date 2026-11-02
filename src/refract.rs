@@ -318,6 +318,10 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let even_bend = (t.bend - 1.5).abs() < 0.001;
     // the most the picture may stretch before it would fold over (see the rim loop)
     let stretch_cap = -0.92 * width / if even_bend { 1.5 } else { t.bend.max(1.0) };
+    // the fan: how far the stretch turns sideways at the ends of the bottom edge (radians), and the
+    // middle and half width it is measured from
+    const FAN: f32 = 1.0;
+    let (fan_c, fan_h) = ((sh.left + sh.right) * 0.5, ((sh.right - sh.left) * 0.5).max(1.0));
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + t.reach * sc; // how far up the sides it is drawn, fading out toward the top
     // The middle: wherever the notch is even a little see-through (the strip along the bottom, or
@@ -412,6 +416,15 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 // limit it folds over and the text reads backwards, so the stretch never folds
                 p = p.max(stretch_cap);
             }
+            let (nx, ny) = if t.dir < 0.0 && ny > 0.0 {
+                // turn the direction sideways by more the further from the middle (and by less the
+                // closer it already points sideways, so it still meets the straight sides)
+                let s = ((x - fan_c) / fan_h).clamp(-1.0, 1.0);
+                let (sn, cs) = (FAN * s.signum() * smooth(0.0, 1.0, s.abs()) * ny).sin_cos();
+                (nx * cs + ny * sn, ny * cs - nx * sn)
+            } else {
+                (nx, ny)
+            };
             ox = nx * p * k;
             oy = ny * p * k;
         }
@@ -500,6 +513,9 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let row_span = |y: f32| -> (usize, usize) {
         let db = sh.bottom - y;
         let (mut xa, mut xb) = if db < width {
+            if t.dir < 0.0 {
+                return (usize::MAX, 0);
+            }
             (sh.left + db, sh.right - db)
         } else if t.mid_warp <= 0.0 {
             (sh.left + width, sh.right - width)
@@ -647,47 +663,53 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 // along: each needed row of the picture, blurred sideways, for the columns wanted
                 let mut hb = vec![[0.0_f32; 3]; rows * cols];
                 let last = shot.w as i32 - 1;
-                for (ri, row) in hb.chunks_mut(cols).enumerate() {
-                    let src = &shot.px[(lo + ri) * shot.w..(lo + ri + 1) * shot.w];
-                    for (ci, o) in row.iter_mut().enumerate() {
-                        let gx = x0 + (ca + ci) as i32 - shot.ox;
-                        let mut acc = [0.0_f32; 3];
-                        for (off, wgt) in k {
-                            let p = src[(gx + off).clamp(0, last) as usize];
-                            acc[0] += wgt * ((p >> 16) & 255) as f32;
-                            acc[1] += wgt * ((p >> 8) & 255) as f32;
-                            acc[2] += wgt * (p & 255) as f32;
+                let threads = if rows * cols >= PAR_MIN / 2 { workers() } else { 1 };
+                par_rows(&mut hb, cols, threads, |ri0, chunk| {
+                    for (dr, row) in chunk.chunks_mut(cols).enumerate() {
+                        let ri = ri0 + dr;
+                        let src = &shot.px[(lo + ri) * shot.w..(lo + ri + 1) * shot.w];
+                        for (ci, o) in row.iter_mut().enumerate() {
+                            let gx = x0 + (ca + ci) as i32 - shot.ox;
+                            let mut acc = [0.0_f32; 3];
+                            for (off, wgt) in k {
+                                let p = src[(gx + off).clamp(0, last) as usize];
+                                acc[0] += wgt * ((p >> 16) & 255) as f32;
+                                acc[1] += wgt * ((p >> 8) & 255) as f32;
+                                acc[2] += wgt * (p & 255) as f32;
+                            }
+                            *o = acc;
                         }
-                        *o = acc;
                     }
-                }
+                });
                 // down: the four wanted rows blended, then the glass over it
-                for j in ra..=rb {
-                    let (a, b) = spans[j];
-                    if a >= b {
-                        continue;
-                    }
-                    let al = alphas[j];
-                    let a24 = ((al * 255.0).round().clamp(0.0, 255.0) as u32) << 24;
-                    let r4: [&[[f32; 3]]; 4] = std::array::from_fn(|n| {
-                        let ri = src_row(j, n) - lo;
-                        &hb[ri * cols..(ri + 1) * cols]
-                    });
-                    let out = &mut px[j * w..(j + 1) * w];
-                    for i in a..b {
-                        let c = i - ca;
-                        let mut acc = [0.0_f32; 3];
-                        for n in 0..4 {
-                            let wgt = k[n].1;
-                            let v = r4[n][c];
-                            acc[0] += wgt * v[0];
-                            acc[1] += wgt * v[1];
-                            acc[2] += wgt * v[2];
+                par_rows(&mut px, w, threads, |j0, chunk| {
+                    for (dj, out) in chunk.chunks_mut(w).enumerate() {
+                        let j = j0 + dj;
+                        let (a, b) = spans[j];
+                        if a >= b {
+                            continue;
                         }
-                        let ch = |v: f32| (v * al).round().clamp(0.0, 255.0) as u32;
-                        out[i] = a24 | (ch(acc[0]) << 16) | (ch(acc[1]) << 8) | ch(acc[2]);
+                        let al = alphas[j];
+                        let a24 = ((al * 255.0).round().clamp(0.0, 255.0) as u32) << 24;
+                        let r4: [&[[f32; 3]]; 4] = std::array::from_fn(|n| {
+                            let ri = src_row(j, n) - lo;
+                            &hb[ri * cols..(ri + 1) * cols]
+                        });
+                        for i in a..b {
+                            let c = i - ca;
+                            let mut acc = [0.0_f32; 3];
+                            for n in 0..4 {
+                                let wgt = k[n].1;
+                                let v = r4[n][c];
+                                acc[0] += wgt * v[0];
+                                acc[1] += wgt * v[1];
+                                acc[2] += wgt * v[2];
+                            }
+                            let ch = |v: f32| (v * al).round().clamp(0.0, 255.0) as u32;
+                            out[i] = a24 | (ch(acc[0]) << 16) | (ch(acc[1]) << 8) | ch(acc[2]);
+                        }
                     }
-                }
+                });
                 deep_spans = spans;
             }
         }
@@ -766,6 +788,23 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
         }
     }
     Some(Rim { x0, y0, w, h, step: st, px })
+}
+
+/// Run `f(first_row, rows)` on pieces of `data` (rows of `width` items) side by side; one piece on
+/// this thread when `threads` is 1.
+fn par_rows<T: Send>(data: &mut [T], width: usize, threads: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let rows = data.len() / width.max(1);
+    if threads <= 1 || rows < 2 {
+        f(0, data);
+        return;
+    }
+    let per = rows.div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (n, chunk) in data.chunks_mut(per * width).enumerate() {
+            scope.spawn(move || f(n * per, chunk));
+        }
+    });
 }
 
 /// Pictures smaller than this are worked out on the one thread (starting threads costs more CPU
