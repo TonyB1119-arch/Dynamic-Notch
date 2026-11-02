@@ -250,8 +250,17 @@ impl Module for Timer {
         let is = 18.0;
         let sw = !self.timer_active() && self.sw_active();
         let color = if sw { SW_COLOR } else { TIMER_COLOR };
-        ui.p.icon(Icon::Timer, Rect::new(inner.x, r.cy() - is * 0.5, is, is), color);
-        let label_x = inner.x + is + 8.0;
+        // in the Alcove look the icon sits on the same soft badge as the other pages
+        let disc = crate::ui::look_alcove() && crate::ui::mono_icons();
+        let lead = if disc { 26.0 } else { is };
+        if disc {
+            let c = Rect::new(inner.x, r.cy() - 13.0, 26.0, 26.0);
+            crate::alcove::icon_chip(ui, c, 5);
+            ui.p.icon(Icon::Timer, c.inset(5.0), color);
+        } else {
+            ui.p.icon(Icon::Timer, Rect::new(inner.x, r.cy() - is * 0.5, is, is), color);
+        }
+        let label_x = inner.x + lead + 8.0;
         let bh = (r.h - 12.0).clamp(22.0, 30.0);
         if self.timer_active() || sw {
             let txt = if sw {

@@ -582,6 +582,7 @@ impl App {
         crate::ui::set_white_beams(cfg.appearance.white_beams);
         crate::ui::set_look(&cfg.appearance.look);
         crate::ui::set_mono_icons(cfg.appearance.mono_icons);
+        crate::ui::set_icon_square(cfg.appearance.icon_square);
         let anim = Anim::new(cfg.appearance.notch_width, cfg.appearance.notch_height);
         Ok(Box::new(App {
             hwnd,
@@ -1970,6 +1971,7 @@ impl App {
                 crate::ui::set_white_beams(self.cfg.appearance.white_beams);
                 crate::ui::set_look(&self.cfg.appearance.look);
                 crate::ui::set_mono_icons(self.cfg.appearance.mono_icons);
+                crate::ui::set_icon_square(self.cfg.appearance.icon_square);
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
                 }

@@ -745,6 +745,25 @@ impl<'a> Painter<'a> {
         self.fill_cached(key, cx, cy, c, |b| b.circle(0.0, 0.0, uq(key.1), true));
     }
 
+    /// `arc` for arcs that are drawn every frame (a badge's corner highlights): the outline is built
+    /// once per size and angle (angles to 1/256 rad) and later frames only move and tint it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arc_cached(&self, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32, width: f32, c: Color) {
+        if sweep.abs() < 0.001 || c.a * self.alpha <= 0.001 {
+            return;
+        }
+        if sweep.abs() >= std::f32::consts::TAU - 0.001 {
+            self.stroke_circle(cx, cy, radius, width, c);
+            return;
+        }
+        let (start, sweep) = if sweep < 0.0 { (start + sweep, -sweep) } else { (start, sweep) };
+        let ang = |v: f32| (v * 256.0).round() as i32;
+        let key = (31, q(radius), ang(start), ang(sweep), q(width));
+        self.fill_cached(key, cx, cy, c, |b| {
+            b.arc_stroke(0.0, 0.0, uq(key.1), key.2 as f32 / 256.0, key.3 as f32 / 256.0, uq(key.4))
+        });
+    }
+
     /// Ring of `width` centered on a circle of `radius`.
     pub fn stroke_circle(&self, cx: f32, cy: f32, radius: f32, width: f32, c: Color) {
         if c.a * self.alpha <= 0.001 {
@@ -802,24 +821,7 @@ impl<'a> Painter<'a> {
             return;
         }
         let (start, sweep) = if sweep < 0.0 { (start + sweep, -sweep) } else { (start, sweep) };
-        let end = start + sweep;
-        let h = width * 0.5;
-        let pt = |a: f32, r: f32| (cx + r * a.sin(), cy - r * a.cos());
-        let large = sweep > std::f32::consts::PI;
-        let ri = (radius - h).max(0.0);
-        if let Some(g) = self.path(|b| {
-            let (x, y) = pt(start, radius + h);
-            b.move_to(x, y);
-            let (x, y) = pt(end, radius + h);
-            b.arc_to_ex(x, y, radius + h, true, large);
-            let (x, y) = pt(end, ri);
-            b.arc_to(x, y, h, true); // end cap
-            let (x, y) = pt(start, ri);
-            b.arc_to_ex(x, y, ri, false, large);
-            let (x, y) = pt(start, radius + h);
-            b.arc_to(x, y, h, true); // start cap
-            b.close();
-        }) {
+        if let Some(g) = self.path(|b| b.arc_stroke(cx, cy, radius, start, sweep, width)) {
             self.fill_geometry(&g, c);
         }
     }
@@ -1749,6 +1751,26 @@ impl PathBuilder {
                 arcSize: if large { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
             })
         }
+    }
+
+    /// The outline of a stroked arc with round caps (`start` clockwise from 12 o'clock, `sweep` > 0).
+    pub fn arc_stroke(&self, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32, width: f32) {
+        let end = start + sweep;
+        let h = width * 0.5;
+        let pt = |a: f32, r: f32| (cx + r * a.sin(), cy - r * a.cos());
+        let large = sweep > std::f32::consts::PI;
+        let ri = (radius - h).max(0.0);
+        let (x, y) = pt(start, radius + h);
+        self.move_to(x, y);
+        let (x, y) = pt(end, radius + h);
+        self.arc_to_ex(x, y, radius + h, true, large);
+        let (x, y) = pt(end, ri);
+        self.arc_to(x, y, h, true); // end cap
+        let (x, y) = pt(start, ri);
+        self.arc_to_ex(x, y, ri, false, large);
+        let (x, y) = pt(start, radius + h);
+        self.arc_to(x, y, h, true); // start cap
+        self.close();
     }
 
     /// Closed rounded-rect figure. Opposite windings punch holes (winding fill).

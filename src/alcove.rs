@@ -265,6 +265,7 @@ pub fn status_tile(
     tile(ui, r, r.h * 0.5, false);
     let d = r.h - 14.0;
     let c = Rect::new(r.x + 7.0, r.y + 7.0, d, d);
+    icon_chip(ui, c, 4);
     ui.p.icon(icon, c.inset(d * 0.2), tint);
     let mut right = r.right() - 12.0;
     let mut toggled = false;
@@ -473,9 +474,9 @@ pub fn title_w(ui: &mut Ui, r: Rect, name: &str) -> f32 {
     d + 10.0 + w + 18.0
 }
 
-/// A small disc of frosted glass for an icon to sit on: a faint fill, a hairline ring and a bright
-/// arc along the top where the light catches it. The ring and the arc brighten under the pointer.
-/// Only in the monochrome look; nothing about it is coloured.
+/// The soft badge behind a page's icon, the same on every page: a quiet fill, a hairline ring and
+/// two short white highlights on the top-right and bottom-left corners. A rounded square, or a
+/// circle when `[appearance] icon_square` is off. It brightens under the pointer. Monochrome look only.
 pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
     if !crate::ui::mono_icons() {
         return;
@@ -484,23 +485,65 @@ pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
     if h > 0.01 && h < 0.99 {
         ui.animate();
     }
-    let (cx, cy, rad) = (c.cx(), c.cy(), c.w.min(c.h) * 0.5);
-    ui.p.fill_circle(cx, cy, rad, Color::white(0.07 + 0.05 * h));
-    ui.p.stroke_circle(cx, cy, rad - 0.5, 1.0, Color::white(0.045 + 0.05 * h));
-    // two short white highlights, one at the top right and one at the bottom left, only at those
-    // corners. Each is a few arcs laid over each other, shorter and shorter, so the light is
-    // brightest in the middle of the highlight and fades out quickly toward both ends.
-    let peak = 0.22 + 0.10 * h;
-    for centre in [std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4 + std::f32::consts::PI] {
-        for sweep in [1.2_f32, 0.9, 0.6, 0.3] {
-            glint_arc(ui, cx, cy, rad - 0.5, centre - sweep * 0.5, sweep, peak);
+    let side = c.w.min(c.h);
+    let radius = if crate::ui::icon_square() { side * 0.30 } else { side * 0.5 };
+    chip_body(ui, c, radius, h, 1.0);
+}
+
+/// The badge itself: fill, hairline ring and the two corner highlights, all scaled by `k` (0 - 1).
+/// `h` is the pointer glow. The highlights are arcs of the corner circles, so they follow a round
+/// badge, a rounded square or the end of a capsule alike, and come from the realization cache.
+fn chip_body(ui: &mut Ui, c: Rect, radius: f32, h: f32, k: f32) {
+    let radius = radius.min(c.w * 0.5).min(c.h * 0.5);
+    ui.p.fill_rounded(c, radius, Color::white((0.07 + 0.05 * h) * k));
+    ui.p.stroke_rounded(c.inset(0.5), radius - 0.5, 1.0, Color::white((0.045 + 0.05 * h) * k));
+    let peak = (0.22 + 0.10 * h) * k;
+    if peak <= 0.004 {
+        return;
+    }
+    // each highlight is a few arcs laid over each other, shorter and shorter, so the light is
+    // brightest in the middle and fades out quickly toward both ends; a rounded square has less
+    // corner to light, so its layers run closer to the full quarter turn
+    let round = radius >= c.w.min(c.h) * 0.5 - 0.01;
+    let sweeps: [f32; 4] = if round { [1.2, 0.9, 0.6, 0.3] } else { [1.5, 1.12, 0.75, 0.38] };
+    let r = (radius - 0.5).max(1.0);
+    let quarter = std::f32::consts::FRAC_PI_4;
+    let corners = [(c.right() - radius, c.y + radius, quarter), (c.x + radius, c.bottom() - radius, quarter + std::f32::consts::PI)];
+    for (cx, cy, mid) in corners {
+        for sw in sweeps {
+            ui.p.arc_cached(cx, cy, r, mid - sw * 0.5, sw, 1.5, Color::white(peak));
         }
     }
 }
 
-/// One layer of a corner highlight (angles run clockwise from straight up).
-fn glint_arc(ui: &mut Ui, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, a: f32) {
-    ui.p.arc(cx, cy, r, start, sweep, 1.5, Color::white(a));
+/// A Wi-Fi / Bluetooth style tab. The chosen one is the badge (fill, ring, corner highlights, white
+/// text); the others are plain, dim text on the notch itself. Without monochrome icons it is the
+/// ordinary white-when-chosen `chip`.
+pub fn tab_chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool) -> bool {
+    if !crate::ui::mono_icons() {
+        return chip(ui, r, label, icon, on);
+    }
+    let (h, p) = ui.touch(r, "alcove-tab-touch");
+    let a = ui.glide(crate::ui::rect_key(r, "alcove-tab"), if on { 1.0 } else { 0.0 });
+    let rr = r.inset(1.2 * p);
+    if a < 0.99 {
+        ui.p.fill_rounded(rr, rr.h * 0.5, Color::white(0.05 * h * (1.0 - a)));
+    }
+    if a > 0.01 {
+        chip_body(ui, rr, rr.h * 0.5, h, a);
+    }
+    let fg = Color::white(0.52 + 0.14 * h * (1.0 - a)).lerp(Color::white(0.97), a);
+    let st = TextStyle::new(12.5, fg).semibold();
+    let mut x = r.x + 13.0;
+    if let Some(i) = icon {
+        ui.p.icon(i, Rect::new(x, r.cy() - 7.0, 14.0, 14.0), fg);
+        x += 20.0;
+    } else {
+        let (tw, _) = ui.p.measure(label, &st);
+        x = r.x + ((r.w - tw) * 0.5).max(6.0);
+    }
+    ui.p.text(label, Rect::new(x, r.y, (r.right() - x).max(0.0), r.h), &st);
+    ui.clicked(r)
 }
 
 /// A page title: a small round icon, the name and a dim note beside it.

@@ -169,7 +169,7 @@ impl Module for ControlCenter {
             for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
                 let w = crate::alcove::chip_w(ui, label, Some(*icon)) + 10.0;
                 let b = Rect::new(x, bar.y + 4.0, w, 30.0);
-                if crate::alcove::chip(ui, b, label, Some(*icon), self.tab == i) {
+                if crate::alcove::tab_chip(ui, b, label, Some(*icon), self.tab == i) {
                     self.tab = i;
                 }
                 x += w + 8.0;

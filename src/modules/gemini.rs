@@ -624,6 +624,7 @@ impl Gemini {
     /// Alcove: the key form as one soft card with a round badge.
     fn draw_key_form_alcove(&mut self, ui: &mut Ui, r: Rect) {
         let badge = Rect::new(r.x + 20.0, r.y + 20.0, 46.0, 46.0);
+        crate::alcove::icon_chip(ui, badge, 2);
         ui.p.icon(Icon::Sparkle, badge.inset(12.0), GEM.lerp(Color::white(1.0), 0.3));
         ui.p.text(
             "Connect Gemini",
@@ -768,9 +769,10 @@ impl Gemini {
         if msgs.is_empty() {
             self.text_h = 0.0;
             let cx = area.cx();
+            crate::alcove::icon_chip(ui, Rect::centered(cx, area.cy() - 34.0, 38.0, 38.0), 3);
             ui.p.icon(
                 Icon::Sparkle,
-                Rect::centered(cx, area.cy() - 34.0, 24.0, 24.0),
+                Rect::centered(cx, area.cy() - 34.0, 22.0, 22.0),
                 GEM.lerp(Color::white(1.0), 0.3),
             );
             ui.p.text(
