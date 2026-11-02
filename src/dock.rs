@@ -397,12 +397,11 @@ impl Dock {
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
             p.set_local(1.0, 0.0, 0.0, 0.0, dy);
-            p.shadow(bar, radius, 0.6 * (0.4 + 0.6 * op));
-            p.fill_rounded(bar, radius, Color::rgba(0.07, 0.07, 0.09, op));
-            let sheen = Rect::new(bar.x + radius * 0.8, bar.y + 1.0, bar.w - radius * 1.6, 1.0);
-            p.fill_rounded(sheen, 0.5, Color::white(0.26));
-            p.stroke_rounded(bar.inset(0.5), radius - 0.5, 1.0, Color::white(0.20));
-            p.stroke_rounded(bar.inset(1.5), radius - 1.5, 1.0, Color::white(0.05));
+            // frosted glass: the blurred screen behind it shows through a light tint; the slider
+            // sets how strong the tint is. No shadow and no outline.
+            p.fill_rounded(bar, radius, Color::rgba(0.80, 0.84, 0.92, 0.04 + op * 0.46));
+            let top = Rect::new(bar.x, bar.y, bar.w, bar.h * 0.5);
+            p.fill_rounded(top, radius, Color::white(0.05 + op * 0.05));
             let icon_bottom = bar.bottom() - pad;
             let mut label: Option<(f32, f32, String)> = None;
             for (k, &(x, wd)) in lay.iter().enumerate() {
