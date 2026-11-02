@@ -126,8 +126,6 @@ pub struct Appearance {
     pub lite_motion: bool,
     /// Icons are drawn in white or grey whatever colour a page gives them (no coloured tints).
     pub mono_icons: bool,
-    /// The soft badge behind each page icon is a rounded square (true) or a circle (false).
-    pub icon_square: bool,
     /// Most frames a second the notch draws while it moves (30 - 240). 60 is smooth and light; raise it on a fast display for
     /// even smoother motion at a higher CPU cost.
     pub max_fps: f32,
@@ -157,7 +155,6 @@ impl Default for Appearance {
             glass_live: true,
             lite_motion: true,
             mono_icons: true,
-            icon_square: true,
             max_fps: 60.0,
             scale: 1.0,
         }
@@ -859,8 +856,6 @@ glass_live = true
 lite_motion = true
 # Monochrome icons: every icon is white or grey, no coloured tints or halos. false = coloured icons
 mono_icons = true
-# Shape of the soft badge behind each page icon: true = rounded square, false = circle
-icon_square = true
 # Most frames a second while the notch moves (30 - 240). 60 is smooth and light; raise it on a fast display
 # for smoother motion at a higher CPU cost.
 max_fps = 60

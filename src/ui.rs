@@ -135,17 +135,6 @@ pub fn mono_icons() -> bool {
     MONO_ICONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Icon badges are rounded squares (`[appearance] icon_square`) instead of circles.
-static ICON_SQUARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-pub fn set_icon_square(on: bool) {
-    ICON_SQUARE.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn icon_square() -> bool {
-    ICON_SQUARE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The accent of the Bloom look (iOS blue).
 pub const BLOOM_BLUE: Color = Color::hex(0x0A84FF);
 

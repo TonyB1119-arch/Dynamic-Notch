@@ -251,7 +251,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 19.0,
+        1 => 18.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -784,7 +784,6 @@ impl Settings {
             "lite_motion",
         );
         toggle_row(ui, row_rect(body, 17), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
-        toggle_row(ui, row_rect(body, 18), "Rounded-square icon badges (off = circles)", a.icon_square, "appearance", "icon_square");
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {

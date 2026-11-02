@@ -265,7 +265,6 @@ pub fn status_tile(
     tile(ui, r, r.h * 0.5, false);
     let d = r.h - 14.0;
     let c = Rect::new(r.x + 7.0, r.y + 7.0, d, d);
-    icon_chip(ui, c, 4);
     ui.p.icon(icon, c.inset(d * 0.2), tint);
     let mut right = r.right() - 12.0;
     let mut toggled = false;
@@ -475,8 +474,8 @@ pub fn title_w(ui: &mut Ui, r: Rect, name: &str) -> f32 {
 }
 
 /// The soft badge behind a page's icon, the same on every page: a quiet fill, a hairline ring and
-/// two short white highlights on the top-right and bottom-left corners. A rounded square, or a
-/// circle when `[appearance] icon_square` is off. It brightens under the pointer. Monochrome look only.
+/// two faint white highlights on the top-right and bottom-left corners. It brightens a little under
+/// the pointer. Monochrome look only.
 pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
     if !crate::ui::mono_icons() {
         return;
@@ -485,9 +484,7 @@ pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
     if h > 0.01 && h < 0.99 {
         ui.animate();
     }
-    let side = c.w.min(c.h);
-    let radius = if crate::ui::icon_square() { side * 0.30 } else { side * 0.5 };
-    chip_body(ui, c, radius, h, 1.0);
+    chip_body(ui, c, c.w.min(c.h) * 0.5, h, 1.0);
 }
 
 /// The badge itself: fill, hairline ring and the two corner highlights, all scaled by `k` (0 - 1).
@@ -497,27 +494,25 @@ fn chip_body(ui: &mut Ui, c: Rect, radius: f32, h: f32, k: f32) {
     let radius = radius.min(c.w * 0.5).min(c.h * 0.5);
     ui.p.fill_rounded(c, radius, Color::white((0.07 + 0.05 * h) * k));
     ui.p.stroke_rounded(c.inset(0.5), radius - 0.5, 1.0, Color::white((0.045 + 0.05 * h) * k));
-    let peak = (0.22 + 0.10 * h) * k;
+    let peak = (0.11 + 0.06 * h) * k;
     if peak <= 0.004 {
         return;
     }
     // each highlight is a few arcs laid over each other, shorter and shorter, so the light is
-    // brightest in the middle and fades out quickly toward both ends; a rounded square has less
-    // corner to light, so its layers run closer to the full quarter turn
-    let round = radius >= c.w.min(c.h) * 0.5 - 0.01;
-    let sweeps: [f32; 4] = if round { [1.2, 0.9, 0.6, 0.3] } else { [1.5, 1.12, 0.75, 0.38] };
+    // brightest in the middle and fades out quickly toward both ends
+    let sweeps: [f32; 4] = [1.2, 0.9, 0.6, 0.3];
     let r = (radius - 0.5).max(1.0);
     let quarter = std::f32::consts::FRAC_PI_4;
     let corners = [(c.right() - radius, c.y + radius, quarter), (c.x + radius, c.bottom() - radius, quarter + std::f32::consts::PI)];
     for (cx, cy, mid) in corners {
         for sw in sweeps {
-            ui.p.arc_cached(cx, cy, r, mid - sw * 0.5, sw, 1.5, Color::white(peak));
+            ui.p.arc_cached(cx, cy, r, mid - sw * 0.5, sw, 1.3, Color::white(peak));
         }
     }
 }
 
-/// A Wi-Fi / Bluetooth style tab. The chosen one is the badge (fill, ring, corner highlights, white
-/// text); the others are plain, dim text on the notch itself. Without monochrome icons it is the
+/// A Wi-Fi / Bluetooth style tab. The chosen one is a soft fill with white text (no ring or
+/// highlights); the others are plain, dim text on the notch itself. Without monochrome icons it is the
 /// ordinary white-when-chosen `chip`.
 pub fn tab_chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool) -> bool {
     if !crate::ui::mono_icons() {
@@ -530,7 +525,7 @@ pub fn tab_chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool)
         ui.p.fill_rounded(rr, rr.h * 0.5, Color::white(0.05 * h * (1.0 - a)));
     }
     if a > 0.01 {
-        chip_body(ui, rr, rr.h * 0.5, h, a);
+        ui.p.fill_rounded(rr, rr.h * 0.5, Color::white((0.10 + 0.04 * h) * a));
     }
     let fg = Color::white(0.52 + 0.14 * h * (1.0 - a)).lerp(Color::white(0.97), a);
     let st = TextStyle::new(12.5, fg).semibold();
