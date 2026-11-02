@@ -3662,6 +3662,16 @@ impl App {
         d.handle(&self.gfx, hidden, msg, wp, lp)
     }
 
+    /// What a right-click at `lp` landed on in the dock: (label, path, pinned).
+    pub fn dock_menu_target(&self, lp: LPARAM) -> Option<(String, String, bool)> {
+        self.dock.as_ref()?.menu_target(lp)
+    }
+
+    /// The pinned list as written in the settings.
+    pub fn dock_items(&self) -> Vec<String> {
+        self.cfg.dock.items.clone()
+    }
+
     /// Start, update or remove the dock to match the settings.
     fn dock_apply(&mut self) {
         if !self.cfg.dock.enabled {

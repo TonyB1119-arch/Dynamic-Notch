@@ -12,7 +12,10 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_EXCLUDED_FROM_PEEK,
     DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -561,6 +564,13 @@ impl Dock {
         (x, y)
     }
 
+    /// What a right-click at `lp` landed on: (label, path, pinned).
+    pub fn menu_target(&self, lp: LPARAM) -> Option<(String, String, bool)> {
+        let (x, y) = self.point(lp);
+        let it = self.items.get(self.item_at(x, y)?)?;
+        Some((it.label.clone(), it.path.clone(), it.pinned))
+    }
+
     fn item_at(&self, x: f32, y: f32) -> Option<usize> {
         if self.hide_t > 0.3 {
             return None;
@@ -892,7 +902,84 @@ fn create_window() -> windows::core::Result<HWND> {
     }
 }
 
+fn wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn same_path(entry: &str, path: &str) -> bool {
+    parse_item(entry).path.eq_ignore_ascii_case(path)
+}
+
+fn save_items(items: &[String]) {
+    let arr: Vec<String> = items.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect();
+    crate::config::set_value("dock", "items", &format!("[{}]", arr.join(", ")));
+    crate::window::with_app(|a| a.on_menu(crate::tray::CMD_RELOAD));
+}
+
+/// A file picker for programs and shortcuts.
+fn pick_app(owner: HWND) -> Option<String> {
+    unsafe {
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let spec = [COMDLG_FILTERSPEC { pszName: w!("Programs and shortcuts"), pszSpec: w!("*.exe;*.lnk") }];
+        let _ = dlg.SetFileTypes(&spec);
+        let _ = dlg.SetTitle(w!("Add an app to the dock"));
+        dlg.Show(Some(owner)).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let out = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        out
+    }
+}
+
+/// The right-click menu: keep / remove the app under the pointer, or add any app. Runs outside the
+/// app borrow because the menu and the picker wait for the user.
+fn context_menu(hwnd: HWND, lp: LPARAM) {
+    let target = crate::window::with_app(|a| a.dock_menu_target(lp)).flatten();
+    let cmd = unsafe {
+        let menu = CreatePopupMenu().unwrap_or_default();
+        if let Some((label, _, pinned)) = &target {
+            let t = wstr(&if *pinned { format!("Remove {label} from the dock") } else { format!("Keep {label} in the dock") });
+            let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(t.as_ptr()));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        let add = wstr("Add an app…");
+        let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(add.as_ptr()));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let c = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0, pt.x, pt.y, hwnd, None);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        c.0
+    };
+    let mut items = crate::window::with_app(|a| a.dock_items()).unwrap_or_default();
+    match (cmd, target) {
+        (1, Some((_, path, pinned))) => {
+            if pinned {
+                items.retain(|s| !same_path(s, &path));
+            } else if !items.iter().any(|s| same_path(s, &path)) {
+                items.push(format!("{}|{}", nice_name(&path), path));
+            }
+            save_items(&items);
+        }
+        (2, _) => {
+            if let Some(p) = pick_app(hwnd) {
+                if !items.iter().any(|s| same_path(s, &p)) {
+                    items.push(format!("{}|{}", nice_name(&p), p));
+                    save_items(&items);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 extern "system" fn dock_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_RBUTTONUP {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| context_menu(hwnd, lp)));
+        return LRESULT(0);
+    }
     let r = std::panic::catch_unwind(|| crate::window::with_app(|a| a.dock_message(msg, wp, lp)).flatten());
     match r {
         Ok(Some(v)) => v,

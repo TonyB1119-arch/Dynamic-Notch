@@ -799,8 +799,13 @@ pub fn set_value(section: &str, key: &str, value: &str) {
     let mut in_section = false;
     let mut done = false;
     let mut section_seen = false;
+    let mut skipping = false;
     for line in text.lines() {
         let t = line.trim();
+        if skipping {
+            skipping = !line.contains(']');
+            continue;
+        }
         if t.starts_with('[') && t.ends_with(']') {
             if in_section && !done {
                 out.push(format!("{key} = {value}"));
@@ -813,6 +818,8 @@ pub fn set_value(section: &str, key: &str, value: &str) {
             if k == key && !t.starts_with('#') {
                 out.push(format!("{key} = {value}"));
                 done = true;
+                let rest = t.splitn(2, '=').nth(1).unwrap_or("").trim();
+                skipping = rest.starts_with('[') && !rest.contains(']');
                 continue;
             }
         }
