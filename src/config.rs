@@ -415,6 +415,14 @@ pub struct DockCfg {
     pub bottom_margin: f32,
     /// "path", "Name|path" or "Name|path|icon.png".
     pub items: Vec<String>,
+    /// Slide the dock away until the pointer touches the bottom edge.
+    pub auto_hide: bool,
+    /// Hide the Windows taskbar while the dock runs.
+    pub hide_taskbar: bool,
+    /// How solid the dock is (0.1 = nearly clear, 1.0 = solid).
+    pub opacity: f32,
+    /// Programs that never show up in the dock.
+    pub hide_apps: Vec<String>,
 }
 
 impl Default for DockCfg {
@@ -426,6 +434,10 @@ impl Default for DockCfg {
             show_running: true,
             bottom_margin: 6.0,
             items: vec![r"Explorer|%WINDIR%\explorer.exe".to_string()],
+            auto_hide: false,
+            hide_taskbar: false,
+            opacity: 0.42,
+            hide_apps: vec!["raycast.exe".to_string()],
         }
     }
 }
@@ -435,6 +447,8 @@ impl DockCfg {
         self.icon_size = self.icon_size.clamp(32.0, 96.0);
         self.magnify = self.magnify.clamp(1.0, 2.2);
         self.bottom_margin = self.bottom_margin.clamp(0.0, 80.0);
+        self.opacity = self.opacity.clamp(0.1, 1.0);
+        self.hide_apps.truncate(60);
         self.items.truncate(40);
     }
 }
@@ -1071,6 +1085,14 @@ icon_size = 56.0
 magnify = 1.6
 show_running = true
 bottom_margin = 6.0
+# Slide away until the pointer touches the bottom of the screen
+auto_hide = false
+# Hide the Windows taskbar while the dock is running (it comes back when the app closes)
+hide_taskbar = false
+# 0.1 = nearly clear, 1.0 = solid
+opacity = 0.42
+# Programs that never appear in the dock
+hide_apps = ['raycast.exe']
 # Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.
 items = ['Explorer|%WINDIR%\explorer.exe']
 

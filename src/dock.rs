@@ -38,6 +38,7 @@ const CLASS: PCWSTR = w!("DynamicNotch.Dock");
 const MOUSELEAVE: u32 = 0x02A3;
 const T_ANIM: usize = 1;
 const T_SCAN: usize = 2;
+const T_HIDE: usize = 3;
 /// Windows that are not apps in the dock's sense.
 const SKIP_EXE: [&str; 8] = [
     "applicationframehost.exe",
@@ -83,7 +84,10 @@ pub struct Dock {
     win_w: f32,
     win_h: f32,
     win_px: (i32, i32, i32, i32),
-    region_full: Option<bool>,
+    region_full: Option<u8>,
+    /// Auto-hide: 0 = shown, 1 = slid away; `hide_to` is where it is heading.
+    hide_t: f32,
+    hide_to: f32,
     mx: f32,
     my: f32,
     mx_to: f32,
@@ -117,6 +121,8 @@ impl Dock {
             win_h: 0.0,
             win_px: (0, 0, 0, 0),
             region_full: None,
+            hide_t: 0.0,
+            hide_to: 0.0,
             mx: 0.0,
             my: 0.0,
             mx_to: 0.0,
@@ -131,11 +137,25 @@ impl Dock {
     /// New settings (or a first start): re-read the items and icons, then lay the bar out.
     pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32) {
         self.cfg = cfg.clone();
+        if !cfg.auto_hide {
+            self.hide_t = 0.0;
+            self.hide_to = 0.0;
+        } else if self.hide_to == 0.0 && self.engage_to == 0.0 && self.hide_t == 0.0 {
+            self.hide_to = 1.0;
+            self.start_anim();
+        }
+        self.region_full = None;
+        if cfg.hide_taskbar {
+            crate::taskbar::hide_taskbar();
+        } else {
+            crate::taskbar::recover_taskbar();
+        }
         self.pinned = cfg.items.iter().filter(|s| !s.trim().is_empty()).map(|s| parse_item(s)).collect();
         self.icons.clear();
         self.mon = mon;
         self.ui_scale = ui_scale;
         self.refresh_items();
+        crate::log!("dock: {} items, monitor ok: {}", self.items.len(), !mon.is_invalid());
         self.place(gfx);
         unsafe {
             SetTimer(Some(self.hwnd), T_SCAN, 2500, None);
@@ -167,9 +187,20 @@ impl Dock {
         (base, self.cfg.magnify, (base * 0.16).round(), (base * 0.22).round())
     }
 
+    /// Room under the bar: the shadow, plus (with auto-hide) the gap to the screen edge, so the
+    /// window can touch the edge and catch the pointer there.
+    fn foot(&self) -> f32 {
+        if self.cfg.auto_hide {
+            FOOT + self.cfg.bottom_margin
+        } else {
+            FOOT
+        }
+    }
+
     fn place(&mut self, gfx: &Gfx) {
         let _ = gfx;
         if self.mon.is_invalid() {
+            crate::log!("dock: no monitor");
             return;
         }
         let (base, mag, gap, pad) = self.sizes();
@@ -183,13 +214,14 @@ impl Dock {
             let scale = dx as f32 / 96.0 * self.ui_scale;
             let work = mi.rcWork;
             let n = self.cells.len() as f32;
-            let rest = n * base + (n - 1.0).max(0.0) * gap;
+            let rest = n * base + (n - 1.0).max(0.0) * gap + base * 0.5;
             let room = (work.right - work.left) as f32 / scale - 8.0;
             let win_w = (rest + 2.0 * pad + base * (mag - 1.0) * 2.4 + 24.0).min(room).max(120.0);
-            let win_h = base * mag + 2.0 * pad + 44.0;
+            let win_h = base * mag + 2.0 * pad + 44.0 + self.foot() - FOOT;
             let (wpx, hpx) = ((win_w * scale).ceil() as i32, (win_h * scale).ceil() as i32);
             let x = (work.left + work.right) / 2 - wpx / 2;
-            let y = work.bottom - hpx - (self.cfg.bottom_margin * scale) as i32;
+            let lift = if self.cfg.auto_hide { 0 } else { (self.cfg.bottom_margin * scale) as i32 };
+            let y = work.bottom - hpx - lift;
             let geom = (x, y, wpx, hpx);
             if geom != self.win_px || (scale - self.scale).abs() > 0.001 {
                 self.scale = scale;
@@ -198,6 +230,7 @@ impl Dock {
                 self.win_px = geom;
                 let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, wpx, hpx, SWP_NOACTIVATE);
                 let _ = self.host.resize(wpx, hpx);
+                crate::log!("dock: window {wpx}x{hpx} at {x},{y} scale {scale:.2}");
                 self.region_full = None;
             }
             if !self.shown {
@@ -208,17 +241,34 @@ impl Dock {
         self.set_region(self.engage_to > 0.0);
     }
 
+    fn hidden(&self) -> bool {
+        self.cfg.auto_hide && self.hide_t >= 0.999
+    }
+
     /// Clicks only land on the bar while the pointer is away, and on the whole window (room for the
     /// grown icons and the label) while it is over the dock.
     fn set_region(&mut self, full: bool) {
-        if self.region_full == Some(full) || self.win_px.2 == 0 {
+        let mode = if self.hidden() && !full {
+            2u8
+        } else if full {
+            1
+        } else {
+            0
+        };
+        if self.region_full == Some(mode) || self.win_px.2 == 0 {
             return;
         }
-        self.region_full = Some(full);
+        self.region_full = Some(mode);
         let (_, _, wpx, hpx) = self.win_px;
         let s = self.scale;
-        let (l, t, r, b) = if full {
+        let (l, t, r, b) = if mode == 1 {
             (0, 0, wpx, hpx)
+        } else if mode == 2 {
+            // only a thin strip on the screen edge wakes the dock
+            let (divider, _) = self.divider_flags();
+            let lay = layout(&divider, self.win_w, self.sizes().0, self.sizes().1, self.sizes().2, 0.0, 0.0);
+            let bar = self.bar_rect(&lay);
+            ((bar.x * s).floor() as i32, hpx - (4.0 * s).ceil() as i32, (bar.right() * s).ceil() as i32, hpx)
         } else {
             let (divider, _) = self.divider_flags();
             let lay = layout(&divider, self.win_w, self.sizes().0, self.sizes().1, self.sizes().2, 0.0, 0.0);
@@ -238,12 +288,13 @@ impl Dock {
     /// The bar behind the icons, from the row's current layout.
     fn bar_rect(&self, lay: &[(f32, f32)]) -> Rect {
         let (base, _, _, pad) = self.sizes();
-        let bottom = self.win_h - FOOT;
+        let bottom = self.win_h - self.foot();
         let (x0, x1) = match (lay.first(), lay.last()) {
             (Some(f), Some(l)) => (f.0, l.0 + l.1),
             _ => (self.win_w * 0.5, self.win_w * 0.5),
         };
-        Rect::new(x0 - pad, bottom - base - 2.0 * pad, x1 - x0 + 2.0 * pad, base + 2.0 * pad)
+        let hp = pad + (base + 2.0 * pad) * 0.12;
+        Rect::new(x0 - hp, bottom - base - 2.0 * pad, x1 - x0 + 2.0 * hp, base + 2.0 * pad)
     }
 
     // -- the list of items --------------------------------------------------------------------------
@@ -251,7 +302,7 @@ impl Dock {
     /// Pinned apps first, then the other open apps in the order they appeared. True when the set of
     /// shown apps changed (the bar then needs a new size).
     fn refresh_items(&mut self) -> bool {
-        let run = if self.cfg.show_running { running_apps() } else { Vec::new() };
+        let run = if self.cfg.show_running { running_apps(&self.cfg.hide_apps) } else { Vec::new() };
         let mut used = vec![false; run.len()];
         let mut items: Vec<Item> = Vec::new();
         for p in &self.pinned {
@@ -324,18 +375,31 @@ impl Dock {
         let (divider, _) = self.divider_flags();
         let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, self.engage);
         let bar = self.bar_rect(&lay);
-        let radius = bar.h * 0.32;
+        let radius = bar.h * 0.5;
         let sc = self.scale;
-        self.host.set_backdrop_rounded(Rect::new(bar.x * sc, bar.y * sc, bar.w * sc, bar.h * sc), radius * sc, 1.0);
+        let dy = self.hide_t * (bar.h + self.foot() + 6.0);
+        let op = self.cfg.opacity;
+        self.host.set_backdrop_rounded(
+            Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, bar.h * sc),
+            radius * sc,
+            if self.hide_t > 0.98 { 0.0 } else { 1.0 },
+        );
         let hover =
-            if self.engage_to > 0.5 { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
-        let Ok((dc, _)) = self.host.begin_draw() else { return };
+            if self.engage_to > 0.5 && self.hide_t < 0.3 { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
+        let (dc, _) = match self.host.begin_draw() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::log!("dock: begin_draw failed: {e}");
+                return;
+            }
+        };
         {
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
-            p.shadow(bar, radius, 0.6);
-            p.fill_rounded(bar, radius, Color::rgba(0.07, 0.07, 0.09, 0.42));
-            let sheen = Rect::new(bar.x + radius * 0.6, bar.y + 1.0, bar.w - radius * 1.2, 1.0);
+            p.set_local(1.0, 0.0, 0.0, 0.0, dy);
+            p.shadow(bar, radius, 0.6 * (0.4 + 0.6 * op));
+            p.fill_rounded(bar, radius, Color::rgba(0.07, 0.07, 0.09, op));
+            let sheen = Rect::new(bar.x + radius * 0.8, bar.y + 1.0, bar.w - radius * 1.6, 1.0);
             p.fill_rounded(sheen, 0.5, Color::white(0.26));
             p.stroke_rounded(bar.inset(0.5), radius - 0.5, 1.0, Color::white(0.20));
             p.stroke_rounded(bar.inset(1.5), radius - 1.5, 1.0, Color::white(0.05));
@@ -378,8 +442,14 @@ impl Dock {
                 p.text(&text, pill, &st);
             }
         }
-        let _ = self.host.end_draw();
+        if let Err(e) = self.host.end_draw() {
+            crate::log!("dock: end_draw failed: {e}");
+        }
         self.res.end_frame();
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            crate::log!("dock: drew a frame ({} cells, bar {:.0}x{:.0})", self.cells.len(), bar.w, bar.h);
+        }
     }
 
     // -- input and timers -----------------------------------------------------------------------------
@@ -402,6 +472,14 @@ impl Dock {
                 }
                 self.my = y;
                 self.mx_to = x;
+                if self.cfg.auto_hide {
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), T_HIDE);
+                    }
+                    if self.hide_to != 0.0 {
+                        self.hide_to = 0.0;
+                    }
+                }
                 if self.engage_to < 0.5 {
                     // start right under the pointer instead of sweeping in from the side
                     self.mx = x;
@@ -415,7 +493,22 @@ impl Dock {
                 self.tracking = false;
                 self.pressed = None;
                 self.engage_to = 0.0;
+                if self.cfg.auto_hide {
+                    unsafe {
+                        SetTimer(Some(self.hwnd), T_HIDE, 700, None);
+                    }
+                }
                 self.start_anim();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == T_HIDE => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), T_HIDE);
+                }
+                if self.cfg.auto_hide && self.engage_to == 0.0 {
+                    self.hide_to = 1.0;
+                    self.start_anim();
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
@@ -443,6 +536,10 @@ impl Dock {
             }
             WM_TIMER if wp.0 == T_SCAN => {
                 let changed = self.refresh_items();
+                if self.cfg.hide_taskbar {
+                    crate::taskbar::hide_taskbar();
+                    self.place(gfx);
+                }
                 if fs_hidden == self.shown {
                     self.shown = !fs_hidden;
                     unsafe {
@@ -469,6 +566,9 @@ impl Dock {
     }
 
     fn item_at(&self, x: f32, y: f32) -> Option<usize> {
+        if self.hide_t > 0.3 {
+            return None;
+        }
         let (base, mag, gap, _) = self.sizes();
         let (divider, _) = self.divider_flags();
         let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, self.engage);
@@ -485,6 +585,15 @@ impl Dock {
     fn step(&mut self, gfx: &Gfx) {
         self.mx += (self.mx_to - self.mx) * 0.32;
         self.engage += (self.engage_to - self.engage) * 0.22;
+        if self.hide_t != self.hide_to {
+            let k = if self.hide_to > self.hide_t { 0.2 } else { 0.3 };
+            self.hide_t += (self.hide_to - self.hide_t) * k;
+            if (self.hide_t - self.hide_to).abs() < 0.01 {
+                self.hide_t = self.hide_to;
+                self.region_full = None;
+                self.set_region(self.engage_to > 0.0);
+            }
+        }
         if (self.mx - self.mx_to).abs() < 0.15 {
             self.mx = self.mx_to;
         }
@@ -492,7 +601,7 @@ impl Dock {
             self.engage = self.engage_to;
         }
         self.draw(gfx);
-        if self.mx == self.mx_to && self.engage == self.engage_to {
+        if self.mx == self.mx_to && self.engage == self.engage_to && self.hide_t == self.hide_to {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_ANIM);
             }
@@ -521,6 +630,10 @@ impl Drop for Dock {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_ANIM);
             let _ = KillTimer(Some(self.hwnd), T_SCAN);
+            let _ = KillTimer(Some(self.hwnd), T_HIDE);
+            if self.cfg.hide_taskbar {
+                crate::taskbar::recover_taskbar();
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -661,7 +774,7 @@ fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
 // -- open windows -------------------------------------------------------------------------------------
 
 /// The apps with a normal window right now: (exe path, one of its windows), topmost first.
-fn running_apps() -> Vec<(String, isize)> {
+fn running_apps(hide: &[String]) -> Vec<(String, isize)> {
     unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
         let out = &mut *(lp.0 as *mut Vec<(isize, u32)>);
         if is_app_window(h) {
@@ -687,7 +800,7 @@ fn running_apps() -> Vec<(String, isize)> {
             continue;
         }
         let file = path.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
-        if SKIP_EXE.contains(&file.as_str()) || out.iter().any(|o| o.0.eq_ignore_ascii_case(&path)) {
+        if SKIP_EXE.contains(&file.as_str()) || hide.iter().any(|h| h.trim().eq_ignore_ascii_case(&file)) || out.iter().any(|o| o.0.eq_ignore_ascii_case(&path)) {
             continue;
         }
         out.push((path, h));

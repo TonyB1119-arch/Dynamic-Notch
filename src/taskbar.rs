@@ -4,7 +4,7 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, ShowWindow, SW_SHOWNA};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, ShowWindow, SW_HIDE, SW_SHOWNA};
 
 use crate::util::app_dir;
 
@@ -19,6 +19,25 @@ pub fn recover_taskbar() {
         let old = text.trim().parse::<usize>().unwrap_or(0);
         show_taskbar(old);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// Hide the Windows taskbar (auto-hide on, windows hidden). The old state is remembered in a marker
+/// file so `recover_taskbar` can undo this even after a crash. Safe to call again and again.
+pub fn hide_taskbar() {
+    unsafe {
+        let p = marker_path();
+        let mut abd = APPBARDATA { cbSize: std::mem::size_of::<APPBARDATA>() as u32, ..Default::default() };
+        if !p.exists() {
+            let old = SHAppBarMessage(4, &mut abd); // ABM_GETSTATE
+            let _ = std::fs::write(&p, old.to_string());
+        }
+        let old = std::fs::read_to_string(&p).ok().and_then(|t| t.trim().parse::<isize>().ok()).unwrap_or(0);
+        abd.lParam = LPARAM(old | 1); // ABS_AUTOHIDE
+        SHAppBarMessage(10, &mut abd); // ABM_SETSTATE
+        for b in taskbar_windows() {
+            let _ = ShowWindow(b, SW_HIDE);
+        }
     }
 }
 

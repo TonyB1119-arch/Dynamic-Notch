@@ -251,7 +251,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 19.0,
+        1 => 22.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -786,6 +786,19 @@ impl Settings {
         toggle_row(ui, row_rect(body, 17), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
         let dock_on = self.cfg.dock.enabled;
         toggle_row(ui, row_rect(body, 18), "Dock at the bottom of the screen", dock_on, "dock", "enabled");
+        let (d_hide, d_tb, d_op) = (self.cfg.dock.auto_hide, self.cfg.dock.hide_taskbar, self.cfg.dock.opacity);
+        toggle_row(ui, row_rect(body, 19), "Auto-hide the dock", d_hide, "dock", "auto_hide");
+        toggle_row(ui, row_rect(body, 20), "Hide the Windows taskbar", d_tb, "dock", "hide_taskbar");
+        slider_row(
+            ui,
+            row_rect(body, 21),
+            "Dock transparency (higher = more solid)",
+            d_op,
+            (0.1, 1.0),
+            format!("{:.0}%", d_op * 100.0),
+            "dock",
+            "opacity",
+        );
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {
