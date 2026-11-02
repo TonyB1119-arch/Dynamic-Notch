@@ -124,6 +124,8 @@ pub struct Appearance {
     /// and the slow last stretch of a move uses fewer frames. Looks the same once the notch rests.
     /// Turn off for the full-rate animation.
     pub lite_motion: bool,
+    /// Icons are drawn in white or grey whatever colour a page gives them (no coloured tints).
+    pub mono_icons: bool,
     /// Most frames a second the notch draws while it moves (30 - 240). 60 is smooth and light; raise it on a fast display for
     /// even smoother motion at a higher CPU cost.
     pub max_fps: f32,
@@ -152,6 +154,7 @@ impl Default for Appearance {
             glass_look: true,
             glass_live: true,
             lite_motion: true,
+            mono_icons: true,
             max_fps: 60.0,
             scale: 1.0,
         }
@@ -636,6 +639,16 @@ pub struct GlassCfg {
     /// Stretch the glass edge like iOS Liquid Glass: the picture under the glass is pulled out toward
     /// the edge (it can fold over right at the rim) instead of the picture outside being pulled in.
     pub stretch: bool,
+    /// A thin bright line along the very edge of the glass, like the light catching it (0 - 1).
+    pub edge_light: f32,
+    /// A light frost over the glass (0 - 1).
+    pub tint: f32,
+    /// Stretch mode: how far the stretch leans sideways toward the ends of the bottom edge (radians).
+    pub fan: f32,
+    /// Stretch mode: how long the stretch may be, relative to the longest one that never folds over.
+    pub stretch_len: f32,
+    /// How much the glass dims when the picture behind it is bright, so white text stays clear (0 - 1).
+    pub readable: f32,
 }
 
 impl Default for GlassCfg {
@@ -660,6 +673,11 @@ impl Default for GlassCfg {
             sharpen_at: 0.12,
             sharp_zone: 4.0,
             stretch: false,
+            edge_light: 0.35,
+            tint: 0.0,
+            fan: 0.7,
+            stretch_len: 1.0,
+            readable: 0.4,
         }
     }
 }
@@ -684,6 +702,11 @@ impl GlassCfg {
         self.melt = self.melt.clamp(0.03, 0.5);
         self.sharpen_at = self.sharpen_at.clamp(0.02, 0.5);
         self.sharp_zone = self.sharp_zone.clamp(0.3, 4.0);
+        self.edge_light = self.edge_light.clamp(0.0, 1.0);
+        self.tint = self.tint.clamp(0.0, 1.0);
+        self.fan = self.fan.clamp(0.0, 1.2);
+        self.stretch_len = self.stretch_len.clamp(0.5, 1.6);
+        self.readable = self.readable.clamp(0.0, 1.0);
     }
 }
 
@@ -831,6 +854,8 @@ glass_live = true
 # Lighter animations: less CPU while the notch moves (the glass edge is refreshed less often, the slow
 # end of a move uses fewer frames). false = the full-rate animation
 lite_motion = true
+# Monochrome icons: every icon is white or grey, no coloured tints or halos. false = coloured icons
+mono_icons = true
 # Most frames a second while the notch moves (30 - 240). 60 is smooth and light; raise it on a fast display
 # for smoother motion at a higher CPU cost.
 max_fps = 60
@@ -1019,6 +1044,16 @@ sharp_zone = 4.0
 # true = the glass edge stretches the picture under it toward the edge (iOS Liquid Glass look);
 # false = it pulls in the picture from outside the notch (the original look)
 stretch = false
+# a thin bright line along the very edge of the glass (0 - 1)
+edge_light = 0.35
+# a light frost over the glass (0 - 1)
+tint = 0.0
+# stretch mode: how far the stretch leans sideways toward the ends of the bottom edge (0 - 1.2)
+fan = 0.7
+# stretch mode: how long the stretch may be (1 = the longest that never folds over, up to 1.6)
+stretch_len = 1.0
+# the glass dims a little when what is behind it is bright, so white text stays clear (0 - 1)
+readable = 0.4
 
 [tabs]
 # Order of the header tabs (Settings → Tabs). Empty = default order.

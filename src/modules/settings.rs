@@ -251,14 +251,14 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 17.0,
+        1 => 18.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        _ => 20.0,
+        _ => 25.0,
     }
 }
 
@@ -783,6 +783,7 @@ impl Settings {
             "appearance",
             "lite_motion",
         );
+        toggle_row(ui, row_rect(body, 17), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {
@@ -938,7 +939,7 @@ impl Settings {
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
         let g = self.cfg.glass.clone();
         // (label, value, range, shown, key)
-        let rows: [(&str, f32, (f32, f32), String, &str); 18] = [
+        let rows: [(&str, f32, (f32, f32), String, &str); 23] = [
             ("Edge width", g.edge_width, (20.0, 160.0), format!("{:.0}", g.edge_width), "edge_width"),
             ("Warp strength", g.pull, (0.0, 60.0), format!("{:.0}", g.pull), "pull"),
             ("Bend curve", g.bend, (0.8, 3.0), format!("{:.1}", g.bend), "bend"),
@@ -963,13 +964,18 @@ impl Settings {
                 if g.sharp_zone >= 3.95 { "Everywhere".to_string() } else { format!("{:.1}x", g.sharp_zone) },
                 "sharp_zone",
             ),
+            ("Edge highlight", g.edge_light, (0.0, 1.0), format!("{:.0}%", g.edge_light * 100.0), "edge_light"),
+            ("Frost tint", g.tint, (0.0, 1.0), format!("{:.0}%", g.tint * 100.0), "tint"),
+            ("Readability dim", g.readable, (0.0, 1.0), format!("{:.0}%", g.readable * 100.0), "readable"),
+            ("Stretch lean", g.fan, (0.0, 1.2), format!("{:.2}", g.fan), "fan"),
+            ("Stretch length", g.stretch_len, (0.5, 1.6), format!("{:.2}x", g.stretch_len), "stretch_len"),
         ];
         for (i, (text, val, range, shown, key)) in rows.into_iter().enumerate() {
             slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
         }
         let d = crate::config::GlassCfg::default();
-        toggle_row(ui, row_rect(body, 18), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
-        let b = row_rect(body, 19);
+        toggle_row(ui, row_rect(body, 23), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
+        let b = row_rect(body, 24);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
             for (key, v) in [
@@ -991,6 +997,11 @@ impl Settings {
                 ("melt", d.melt),
                 ("sharpen_at", d.sharpen_at),
                 ("sharp_zone", d.sharp_zone),
+                ("edge_light", d.edge_light),
+                ("tint", d.tint),
+                ("readable", d.readable),
+                ("fan", d.fan),
+                ("stretch_len", d.stretch_len),
             ] {
                 put(ui, "glass", key, format!("{v:.2}"));
             }

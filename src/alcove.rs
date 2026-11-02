@@ -311,10 +311,13 @@ pub fn peek_conn(pk: &crate::modules::Peek) -> bool {
 
 /// A small rounded label.
 fn tag(ui: &mut Ui, right: f32, cy: f32, text: &str, color: Color) -> f32 {
+    // monochrome: a plain frosted label, white text, no coloured fill
+    let mono = crate::ui::mono_icons();
+    let (fill, color) = if mono { (Color::white(0.12), Color::white(0.92)) } else { (color.with_a(0.18), color) };
     let st = TextStyle::new(13.0, color).semibold();
     let (w, _) = ui.p.measure(text, &st);
     let r = Rect::new(right - w - 24.0, cy - 14.0, w + 24.0, 28.0);
-    ui.p.fill_rounded(r, 14.0, color.with_a(0.18));
+    ui.p.fill_rounded(r, 14.0, fill);
     ui.p.text(text, Rect::new(r.x + 12.0, r.y, w + 6.0, r.h), &st);
     r.x
 }
@@ -337,7 +340,8 @@ pub fn peek_content(ui: &mut Ui, inner: Rect, pk: &crate::modules::Peek) {
     match &pk.image {
         Some(img) => ui.p.image(img, tile_r, 15.0, 1.0),
         None => {
-            // just the icon, in the notice's colour, on the plain black
+            // just the icon on the plain black (on a little glass disc in the monochrome look)
+            icon_chip(ui, tile_r.inset(1.0), 1);
             ui.p.icon(pk.icon, tile_r.inset(5.0), pk.accent.lerp(Color::white(1.0), 0.15));
         }
     }
@@ -469,10 +473,29 @@ pub fn title_w(ui: &mut Ui, r: Rect, name: &str) -> f32 {
     d + 10.0 + w + 18.0
 }
 
+/// A small disc of frosted glass for an icon to sit on: a faint fill, a hairline ring and a bright
+/// arc along the top where the light catches it. The ring and the arc brighten under the pointer.
+/// Only in the monochrome look; nothing about it is coloured.
+pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
+    if !crate::ui::mono_icons() {
+        return;
+    }
+    let h = ui.glide(gkey("alcove-chip-glint", key), if ui.hovered(c) { 1.0 } else { 0.0 });
+    if h > 0.01 && h < 0.99 {
+        ui.animate();
+    }
+    let (cx, cy, rad) = (c.cx(), c.cy(), c.w.min(c.h) * 0.5);
+    ui.p.fill_circle(cx, cy, rad, Color::white(0.07 + 0.05 * h));
+    ui.p.stroke_circle(cx, cy, rad - 0.5, 1.0, Color::white(0.10 + 0.10 * h));
+    ui.p.arc(cx, cy, rad - 0.5, -1.15, 2.3, 1.4, Color::white(0.34 + 0.30 * h));
+    ui.p.arc(cx, cy, rad - 0.5, std::f32::consts::PI - 0.6, 1.2, 1.2, Color::white(0.10 + 0.08 * h));
+}
+
 /// A page title: a small round icon, the name and a dim note beside it.
 pub fn title(ui: &mut Ui, r: Rect, icon: Icon, tint: Color, name: &str, note: &str) {
     let d = r.h.min(30.0);
     let c = Rect::new(r.x, r.cy() - d * 0.5, d, d);
+    icon_chip(ui, c, 0);
     ui.p.icon(icon, c.inset(d * 0.2), tint);
     let st = TextStyle::new(16.0, Color::white(1.0)).semibold();
     let (w, _) = ui.p.measure(name, &st);

@@ -118,6 +118,13 @@ pub struct Tune {
     pub sharp: f32,
     /// 1 pulls the picture from outside the notch in; -1 stretches the picture under it outward.
     pub dir: f32,
+    /// The bright line along the edge, the frost, the lean of the stretch, its length and the
+    /// dimming for a bright background (see `GlassCfg`).
+    pub edge_light: f32,
+    pub tint: f32,
+    pub fan: f32,
+    pub len: f32,
+    pub readable: f32,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -136,6 +143,11 @@ impl From<&crate::config::GlassCfg> for Tune {
             mid_blur: g.middle_blur.clamp(0.0, 6.0) * 0.7,
             sharp: g.sharp_zone.clamp(0.3, 4.0),
             dir: if g.stretch { -1.0 } else { 1.0 },
+            edge_light: g.edge_light.clamp(0.0, 1.0),
+            tint: g.tint.clamp(0.0, 1.0),
+            fan: g.fan.clamp(0.0, 1.2),
+            len: g.stretch_len.clamp(0.5, 1.6),
+            readable: g.readable.clamp(0.0, 1.0),
         }
     }
 }
@@ -317,11 +329,11 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let soft = t.soft * sc;
     let even_bend = (t.bend - 1.5).abs() < 0.001;
     // the most the picture may stretch before it would fold over (see the rim loop)
-    let stretch_cap = -0.92 * width / if even_bend { 1.5 } else { t.bend.max(1.0) };
+    let stretch_cap = -0.92 * t.len * width / if even_bend { 1.5 } else { t.bend.max(1.0) };
     // the linear fan: how far the stretch turns sideways at the very ends of the bottom edge
     // (radians), and the middle and half width it is measured from. Straight down in the middle,
     // turning more and more to the left on the left half and to the right on the right half.
-    const FAN: f32 = 0.7;
+    let fan_a = t.fan;
     let (fan_c, fan_h) = ((sh.left + sh.right) * 0.5, ((sh.right - sh.left) * 0.5).max(1.0));
     let r = sh.radius.max(2.0 * sc).min((sh.right - sh.left) * 0.5);
     let reach = r + t.reach * sc; // how far up the sides it is drawn, fading out toward the top
@@ -421,7 +433,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 // turn the direction sideways in step with the distance from the middle (and by less the
                 // closer it already points sideways, so it still meets the straight sides)
                 let s = ((x - fan_c) / fan_h).clamp(-1.0, 1.0);
-                let (sn, cs) = (FAN * s * ny).sin_cos();
+                let (sn, cs) = (fan_a * s * ny).sin_cos();
                 (nx * cs + ny * sn, ny * cs - nx * sn)
             } else {
                 (nx, ny)
@@ -473,6 +485,26 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
         }
         Some((alpha, ox, oy, blur))
     };
+    // The light along the edge: a thin bright line right at the outer boundary, stronger in the
+    // corners, fading out up the sides with the glass. `lift` lays that white over a finished pixel.
+    let hw = 1.8 * sc;
+    let light = |x: f32, y: f32| -> f32 {
+        if t.edge_light <= 0.0 {
+            return 0.0;
+        }
+        let (d, _, _, corner) = geom(x, y);
+        if d >= hw || d <= -1.0 {
+            return 0.0;
+        }
+        let f = 1.0 - d.max(0.0) / hw;
+        let up = smooth(0.0, 0.5, (y - top) / reach);
+        (t.edge_light * f * f.sqrt() * (1.0 + 0.6 * corner) * up).clamp(0.0, 1.0)
+    };
+    let lift = |p: u32, h: f32| -> u32 {
+        let (m, w) = (1.0 - h, 255.0 * h);
+        let c = |sft: u32| -> u32 { (((p >> sft) & 255) as f32 * m + w).round().min(255.0) as u32 };
+        (c(24) << 24) | (c(16) << 16) | (c(8) << 8) | c(0)
+    };
     let shade = |x: f32, y: f32| -> u32 {
         let Some((alpha, ox, oy, blur)) = params(x, y) else {
             return 0;
@@ -503,7 +535,13 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             )
         };
         let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
-        (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(rc) << 16) | (ch(gc) << 8) | ch(bc)
+        let out = (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(rc) << 16) | (ch(gc) << 8) | ch(bc);
+        let hl = light(x, y);
+        if hl > 0.0 {
+            lift(out, hl)
+        } else {
+            out
+        }
     };
     // Whole stretches of a row come out the same: the straight middle of the bottom edge, and the
     // inside of the notch. They are worked out once for the row instead of once per pixel (the
@@ -550,6 +588,8 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
         }
         let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
         let a24 = ((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24;
+        // the edge light is the same along the whole row here
+        let hl = light(xr, y);
         let col0 = x0 - shot.ox;
         let last = shot.w as i32 - 1;
         let hmax = shot.h as i32 - 1;
@@ -559,7 +599,8 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             let row = &shot.px[ri * shot.w..(ri + 1) * shot.w];
             for (k, o) in out[a..b].iter_mut().enumerate() {
                 let p = row[(col0 + (a + k) as i32).clamp(0, last) as usize];
-                *o = a24 | (ch(((p >> 16) & 255) as f32) << 16) | (ch(((p >> 8) & 255) as f32) << 8) | ch((p & 255) as f32);
+                let v = a24 | (ch(((p >> 16) & 255) as f32) << 16) | (ch(((p >> 8) & 255) as f32) << 8) | ch((p & 255) as f32);
+                *o = if hl > 0.0 { lift(v, hl) } else { v };
             }
         } else {
             // pulled straight up or down: the same two rows of the screen for the whole stretch,
@@ -578,7 +619,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                     let hi = ((shot.px[r1 * shot.w + xi] >> sft) & 255) as f32;
                     v |= ch(lo + (hi - lo) * ty) << sft;
                 }
-                *o = v;
+                *o = if hl > 0.0 { lift(v, hl) } else { v };
             }
         }
         true
@@ -788,6 +829,24 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             band_fn(bj, out);
         }
     }
+    // Frost and dimming: a light veil of white over the glass, and a little less light when the
+    // picture behind the notch is bright (white text then keeps its contrast).
+    let dim = if t.readable > 0.0 && t.mid > 0.0 { backdrop_dim(shot, sh) * t.readable } else { 0.0 };
+    let keep = ((1.0 - dim) * 256.0).round().clamp(0.0, 256.0) as u32;
+    let veil = (t.tint * 0.30 * 256.0).round().clamp(0.0, 256.0) as u32;
+    if keep < 256 || veil > 0 {
+        par_rows(&mut px, w, threads, |_, chunk| {
+            for p in chunk.iter_mut() {
+                let a = *p >> 24;
+                if a == 0 {
+                    continue;
+                }
+                let add = (a * veil) >> 8;
+                let c = |sft: u32| -> u32 { (((((*p >> sft) & 255) * keep) >> 8) + add).min(255) };
+                *p = (a << 24) | (c(16) << 16) | (c(8) << 8) | c(0);
+            }
+        });
+    }
     Some(Rim { x0, y0, w, h, step: st, px })
 }
 
@@ -806,6 +865,30 @@ fn par_rows<T: Send>(data: &mut [T], width: usize, threads: usize, f: impl Fn(us
             scope.spawn(move || f(n * per, chunk));
         }
     });
+}
+
+/// How much to dim the glass for the picture behind the notch: 0 for a dark or middling one, up to
+/// 0.45 for a bright one. Looks at a sparse grid of the copy over the notch.
+fn backdrop_dim(shot: &Shot, sh: Shape) -> f32 {
+    let (x0, x1) = ((sh.left as i32 - shot.ox).max(0), (sh.right as i32 - shot.ox).min(shot.w as i32));
+    let (y0, y1) = ((sh.top as i32 - shot.oy).max(0), (sh.bottom as i32 - shot.oy).min(shot.h as i32));
+    if x1 - x0 < 8 || y1 - y0 < 8 {
+        return 0.0;
+    }
+    let (sx, sy) = (((x1 - x0) / 32).max(1) as usize, ((y1 - y0) / 16).max(1) as usize);
+    let (mut sum, mut n) = (0.0_f32, 0u32);
+    for y in (y0..y1).step_by(sy) {
+        let row = &shot.px[y as usize * shot.w..(y as usize + 1) * shot.w];
+        for x in (x0..x1).step_by(sx) {
+            let p = row[x as usize];
+            sum += 0.2126 * ((p >> 16) & 255) as f32 + 0.7152 * ((p >> 8) & 255) as f32 + 0.0722 * (p & 255) as f32;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    0.45 * smooth(0.55, 0.92, sum / (n as f32 * 255.0))
 }
 
 /// Pictures smaller than this are worked out on the one thread (starting threads costs more CPU

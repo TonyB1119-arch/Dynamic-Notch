@@ -70,6 +70,12 @@ pub enum Icon {
 
 /// Every icon is a glyph from the Phosphor set (see `pack.rs`), filled from cached geometry.
 pub fn draw(p: &mut Painter, icon: Icon, r: Rect, c: Color) {
+    // monochrome: a coloured icon is drawn white (greys, whites and dark ink stay as they are)
+    let c = if crate::ui::mono_icons() && c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b) > 0.12 {
+        Color::white(c.a)
+    } else {
+        c
+    };
     // the Phosphor glyphs fill more of their box than the old hand-drawn set did
     let s = r.w.min(r.h) * 0.94;
     let b = r.center_square(s);

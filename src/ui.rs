@@ -124,6 +124,17 @@ pub fn look_alcove() -> bool {
     LOOK.load(std::sync::atomic::Ordering::Relaxed) == 5
 }
 
+/// Monochrome icons (`[appearance] mono_icons`): any coloured icon is drawn white.
+static MONO_ICONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_mono_icons(on: bool) {
+    MONO_ICONS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn mono_icons() -> bool {
+    MONO_ICONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The accent of the Bloom look (iOS blue).
 pub const BLOOM_BLUE: Color = Color::hex(0x0A84FF);
 
