@@ -9,6 +9,7 @@ mod bloom;
 mod bus;
 mod claude;
 mod config;
+mod dock;
 mod gfx;
 mod host;
 mod hotkeys;

@@ -37,6 +37,7 @@ pub struct Config {
     pub notch: NotchCfg,
     pub tabs: TabsCfg,
     pub glass: GlassCfg,
+    pub dock: DockCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -396,6 +397,45 @@ pub struct ShelfCfg {
 impl Default for ShelfCfg {
     fn default() -> Self {
         Self { remember: true }
+    }
+}
+
+/// The dock at the bottom of the screen.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockCfg {
+    pub enabled: bool,
+    /// Icon size in logical pixels.
+    pub icon_size: f32,
+    /// How much an icon grows under the pointer (1.0 = not at all).
+    pub magnify: f32,
+    /// Also show the apps that are open but not pinned.
+    pub show_running: bool,
+    /// Gap between the dock and the bottom of the work area.
+    pub bottom_margin: f32,
+    /// "path", "Name|path" or "Name|path|icon.png".
+    pub items: Vec<String>,
+}
+
+impl Default for DockCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            icon_size: 56.0,
+            magnify: 1.6,
+            show_running: true,
+            bottom_margin: 6.0,
+            items: vec![r"Explorer|%WINDIR%\explorer.exe".to_string()],
+        }
+    }
+}
+
+impl DockCfg {
+    fn clamped(&mut self) {
+        self.icon_size = self.icon_size.clamp(32.0, 96.0);
+        self.magnify = self.magnify.clamp(1.0, 2.2);
+        self.bottom_margin = self.bottom_margin.clamp(0.0, 80.0);
+        self.items.truncate(40);
     }
 }
 
@@ -792,6 +832,7 @@ impl Config {
         self.bluetooth.low_battery = self.bluetooth.low_battery.min(100);
         self.weather.refresh_minutes = self.weather.refresh_minutes.clamp(5, 360);
         self.glass.clamped();
+        self.dock.clamped();
         self.home.widgets.truncate(4);
         self.notch.widgets.truncate(3);
         self
@@ -1020,6 +1061,18 @@ name = ""
 # Optional: the name of an installed handwriting font to write the hello with (e.g. "Sacramento", "Yellowtail").
 # Empty = Yellowtail if it is installed, otherwise the built-in pen drawing. Also in Settings → General ("Script Regular" needs that font installed).
 font = ""
+
+[dock]
+# A glass dock at the bottom of the screen: your pinned apps, then the apps that are open.
+# To change an icon, put a .png named after the item (Chrome.png) or its exe (chrome.png)
+# in %APPDATA%\DynamicNotch\dock-icons
+enabled = true
+icon_size = 56.0
+magnify = 1.6
+show_running = true
+bottom_margin = 6.0
+# Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.
+items = ['Explorer|%WINDIR%\explorer.exe']
 
 [glass]
 # The Alcove glass edge (Settings → Glass). Sizes are in logical pixels; delete a line to get its default.

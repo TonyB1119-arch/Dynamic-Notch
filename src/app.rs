@@ -529,6 +529,7 @@ pub struct App {
     dirty: bool,
     /// When to release GPU caches (set when a frame burst ends).
     trim_at: Option<Instant>,
+    dock: Option<crate::dock::Dock>,
     /// No spring is moving: the backdrop blur may be shown.
     settled: bool,
     region: Option<(i32, i32, i32, i32)>,
@@ -655,6 +656,7 @@ impl App {
             last_frame: Instant::now(),
             dirty: true,
             trim_at: None,
+            dock: None,
             settled: true,
             region: None,
             region_anim: None,
@@ -687,6 +689,7 @@ impl App {
     /// Second-stage init once the app is reachable from the window proc.
     pub fn start(&mut self) {
         self.place();
+        self.dock_apply();
         self.tray = Some(Tray::new(self.hwnd));
         self.register_hotkeys();
         unsafe {
@@ -1970,6 +1973,7 @@ impl App {
                 crate::ui::set_white_beams(self.cfg.appearance.white_beams);
                 crate::ui::set_look(&self.cfg.appearance.look);
                 crate::ui::set_mono_icons(self.cfg.appearance.mono_icons);
+                self.dock_apply();
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
                 }
@@ -2043,6 +2047,7 @@ impl App {
                 self.region_anim = None;
             }
         }
+        self.dock_relocate();
         self.check_fullscreen();
         self.request_frame();
     }
@@ -3650,9 +3655,54 @@ impl App {
         fx
     }
 
+    /// Messages for the dock's own window.
+    pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let hidden = self.fs_hidden;
+        let d = self.dock.as_mut()?;
+        d.handle(&self.gfx, hidden, msg, wp, lp)
+    }
+
+    /// Start, update or remove the dock to match the settings.
+    fn dock_apply(&mut self) {
+        if !self.cfg.dock.enabled {
+            self.dock = None;
+            return;
+        }
+        if self.dock.is_none() {
+            match crate::dock::Dock::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(d) => self.dock = Some(d),
+                Err(e) => {
+                    log!("dock failed to start: {e}");
+                    return;
+                }
+            }
+        }
+        let (mon, scale) = (self.monitor, self.cfg.appearance.scale);
+        if mon.is_invalid() {
+            return;
+        }
+        if let Some(d) = self.dock.as_mut() {
+            d.configure(&self.gfx, &self.cfg.dock, mon, scale);
+        }
+    }
+
+    /// The screen or the monitor changed: put the dock where it belongs.
+    fn dock_relocate(&mut self) {
+        let (mon, scale) = (self.monitor, self.cfg.appearance.scale);
+        if mon.is_invalid() {
+            return;
+        }
+        if let Some(d) = self.dock.as_mut() {
+            d.relocate(&self.gfx, mon, scale);
+        }
+    }
+
     fn recover_device(&mut self) {
         if self.gfx.recreate_devices().is_ok() {
             let _ = self.host.set_rendering_device(&self.gfx);
+            if let Some(d) = self.dock.as_mut() {
+                d.recover(&self.gfx);
+            }
             self.snap_all = None;
             self.snap_pages = None;
             if let Ok(r) = Res::new(&self.gfx) {

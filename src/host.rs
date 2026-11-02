@@ -68,6 +68,11 @@ impl Host {
         Self::build(hwnd, gfx, w, h, None)
     }
 
+    /// Another window drawn with the compositor of the first one (the dock).
+    pub fn new_shared(hwnd: HWND, gfx: &Gfx, w: i32, h: i32, compositor: Compositor) -> Result<Self> {
+        Self::build(hwnd, gfx, w, h, Some(compositor))
+    }
+
     fn build(hwnd: HWND, gfx: &Gfx, w: i32, h: i32, shared: Option<Compositor>) -> Result<Self> {
         unsafe {
             let (dq, compositor) = match shared {
@@ -218,6 +223,30 @@ impl Host {
         self.backdrop_last = now;
         let _ = self.backdrop_geom.SetOffset(v2(body_px.x, body_px.y - r));
         let _ = self.backdrop_geom.SetSize(v2(body_px.w, body_px.h + r));
+        let _ = self.backdrop_geom.SetCornerRadius(v2(r, r));
+        let _ = self.backdrop.SetOpacity(opacity);
+    }
+}
+
+impl Host {
+    /// The blur behind a bar with all four corners round (pixel coordinates).
+    pub fn set_backdrop_rounded(&mut self, body_px: Rect, radius_px: f32, opacity: f32) {
+        let visible = opacity > 0.002;
+        if visible != self.backdrop_visible {
+            let _ = self.backdrop.SetIsVisible(visible);
+            self.backdrop_visible = visible;
+        }
+        if !visible {
+            return;
+        }
+        let r = radius_px.max(0.0);
+        let now = [body_px.x, body_px.y, body_px.w, body_px.h, r + opacity * 1000.0];
+        if now == self.backdrop_last {
+            return;
+        }
+        self.backdrop_last = now;
+        let _ = self.backdrop_geom.SetOffset(v2(body_px.x, body_px.y));
+        let _ = self.backdrop_geom.SetSize(v2(body_px.w, body_px.h));
         let _ = self.backdrop_geom.SetCornerRadius(v2(r, r));
         let _ = self.backdrop.SetOpacity(opacity);
     }
