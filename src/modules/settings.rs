@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 9.0,
+        8 => 8.0,
         _ => 25.0,
     }
 }
@@ -944,7 +944,6 @@ impl Settings {
         toggle_row(ui, row_rect(body, 1), "Auto-hide", d.auto_hide, "dock", "auto_hide");
         toggle_row(ui, row_rect(body, 2), "Hide the Windows taskbar", d.hide_taskbar, "dock", "hide_taskbar");
         toggle_row(ui, row_rect(body, 3), "Show open apps", d.show_running, "dock", "show_running");
-        toggle_row(ui, row_rect(body, 8), "Liquid glass edge", d.glass, "dock", "glass");
         slider_row(
             ui,
             row_rect(body, 4),

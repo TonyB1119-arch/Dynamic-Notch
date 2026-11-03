@@ -3709,7 +3709,7 @@ impl App {
             return;
         }
         if let Some(d) = self.dock.as_mut() {
-            d.configure(&self.gfx, &self.cfg.dock, mon, scale, crate::refract::Tune::from(&self.cfg.glass));
+            d.configure(&self.gfx, &self.cfg.dock, mon, scale);
         }
     }
 

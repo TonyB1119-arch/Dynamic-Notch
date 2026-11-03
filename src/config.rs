@@ -438,7 +438,7 @@ impl Default for DockCfg {
             items: vec![r"Explorer|%WINDIR%\explorer.exe".to_string()],
             auto_hide: false,
             hide_taskbar: false,
-            opacity: 0.42,
+            opacity: 0.30,
             hide_apps: vec!["raycast.exe".to_string()],
             glass: true,
         }
@@ -1100,7 +1100,7 @@ auto_hide = false
 # Hide the Windows taskbar while the dock is running (it comes back when the app closes)
 hide_taskbar = false
 # 0.1 = nearly clear, 1.0 = solid
-opacity = 0.42
+opacity = 0.30
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
 # The liquid glass edge, the same glass as the notch
