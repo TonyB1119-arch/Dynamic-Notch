@@ -23,8 +23,9 @@ use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -60,6 +61,8 @@ const T_LIVE: usize = 6;
 const WM_INDEX: u32 = WM_APP + 31;
 /// Gemini has sent more of the answer.
 const WM_AI: u32 = WM_APP + 32;
+/// Today's exchange rates have arrived.
+const WM_RATES: u32 = WM_APP + 33;
 
 // -- layout (dips) -------------------------------------------------------------------------------------
 const PAD: f32 = 14.0;
@@ -93,6 +96,10 @@ enum Kind {
     Day,
     /// An item of the clipboard history (its `path` is `clip:<id>`).
     Clip,
+    /// A command for the computer (`idx` is its place in `conv::SYSTEM`).
+    System,
+    /// An emoji or symbol (its `path` is the character).
+    Emoji,
 }
 
 impl Kind {
@@ -107,6 +114,8 @@ impl Kind {
             Kind::Weather => "Weather",
             Kind::Day => "Forecast",
             Kind::Clip => "Clipboard",
+            Kind::System => "System",
+            Kind::Emoji => "Emoji",
         }
     }
     fn has_icon(self) -> bool {
@@ -130,6 +139,14 @@ enum Act {
     Paste,
     CopyClip,
     DeleteClip,
+    /// Pick an app to open the file with, or a folder to move or copy it to.
+    OpenWith,
+    MoveTo,
+    CopyTo,
+    /// Run a system command.
+    Run,
+    PasteEmoji,
+    CopyEmoji,
 }
 
 impl Act {
@@ -149,6 +166,12 @@ impl Act {
             Act::Paste => "Paste",
             Act::CopyClip => "Copy",
             Act::DeleteClip => "Remove from history",
+            Act::OpenWith => "Open with\u{2026}",
+            Act::MoveTo => "Move to\u{2026}",
+            Act::CopyTo => "Copy to\u{2026}",
+            Act::Run => "Run",
+            Act::PasteEmoji => "Paste",
+            Act::CopyEmoji => "Copy",
         }
     }
     fn icon(self) -> Icon {
@@ -166,6 +189,11 @@ impl Act {
             Act::Paste => Icon::Clipboard,
             Act::CopyClip => Icon::Copy,
             Act::DeleteClip => Icon::Trash,
+            Act::OpenWith => Icon::Grid,
+            Act::MoveTo => Icon::Folder,
+            Act::CopyTo | Act::CopyEmoji => Icon::Copy,
+            Act::Run => Icon::Bolt,
+            Act::PasteEmoji => Icon::Clipboard,
         }
     }
 }
@@ -175,12 +203,14 @@ fn actions(h: &Hit) -> &'static [Act] {
     match h.kind {
         Kind::App if h.path.starts_with("shell:") => &[Act::Open],
         Kind::App => &[Act::Open, Act::Admin, Act::Reveal, Act::Quit, Act::Restart, Act::ForceQuit],
-        Kind::Folder | Kind::File => &[Act::Open, Act::Reveal, Act::CopyPath],
+        Kind::Folder | Kind::File => &[Act::Open, Act::Reveal, Act::CopyPath, Act::OpenWith, Act::MoveTo, Act::CopyTo],
         Kind::Calc => &[Act::CopyResult],
         Kind::Url => &[Act::OpenLink, Act::CopyPath],
         Kind::Web => &[Act::Search],
         Kind::Weather | Kind::Day => &[Act::Forecast],
         Kind::Clip => &[Act::Paste, Act::CopyClip, Act::DeleteClip],
+        Kind::System => &[Act::Run],
+        Kind::Emoji => &[Act::PasteEmoji, Act::CopyEmoji],
     }
 }
 
@@ -222,16 +252,16 @@ enum Mode {
     Search,
     Clip,
     Ai,
+    Notes,
+    Emoji,
 }
 
 impl Mode {
     /// The next mode (or the one before) when Tab (Shift+Tab) is pressed.
     fn cycle(self, back: bool) -> Mode {
-        match (self, back) {
-            (Mode::Search, false) | (Mode::Ai, true) => Mode::Clip,
-            (Mode::Clip, false) | (Mode::Search, true) => Mode::Ai,
-            (Mode::Ai, false) | (Mode::Clip, true) => Mode::Search,
-        }
+        const ORDER: [Mode; 5] = [Mode::Search, Mode::Clip, Mode::Ai, Mode::Notes, Mode::Emoji];
+        let i = ORDER.iter().position(|m| *m == self).unwrap_or(0);
+        ORDER[(i + if back { 4 } else { 1 }) % 5]
     }
 }
 
@@ -454,6 +484,15 @@ pub struct Launcher {
     /// The picture behind the glass is renewed ten times a second while the launcher is open (a video
     /// behind it keeps moving). The window is hidden from screen copies for that.
     live: bool,
+    /// Picking the target of an action: the action and the thing it is for.
+    pending: Option<(Act, Hit)>,
+    /// A command that asked for a second Enter.
+    armed: Option<String>,
+    /// Quick notes (newest first) and how they are shown.
+    notes: Vec<(u64, String)>,
+    notes_text: String,
+    /// The first lines of the text file on the left.
+    texts: HashMap<String, String>,
 }
 
 impl Launcher {
@@ -511,6 +550,11 @@ impl Launcher {
             sw: 1.0,
             sw_dir: 1.0,
             live: false,
+            pending: None,
+            armed: None,
+            notes: Vec::new(),
+            notes_text: String::new(),
+            texts: HashMap::new(),
         })
     }
 
@@ -609,6 +653,12 @@ impl Launcher {
         self.mouse = (-1.0, -1.0);
         self.ai.clear();
         self.ai.q = Glide::new(Q_SIZES[0]);
+        self.pending = None;
+        self.armed = None;
+        if self.mode == Mode::Notes {
+            self.notes = load_notes();
+            self.notes_text = notes_text(&self.notes);
+        }
         // nothing typed yet: the apps used most are what the Down arrow lists (a combo shows its own thing)
         if let Some(h) = self.pinned.take() {
             self.hits.push(h);
@@ -617,7 +667,7 @@ impl Launcher {
         }
 
         // the clipboard history is a list: it is open from the start
-        self.list_open = self.mode == Mode::Clip && !self.hits.is_empty();
+        self.list_open = matches!(self.mode, Mode::Clip | Mode::Emoji) && !self.hits.is_empty();
         if self.cfg.files && !self.files_started && self.mode == Mode::Search {
             self.files_started = true;
             spawn_files(self.files_slot.clone(), SendHwnd::new(self.hwnd), self.cfg.folders.clone());
@@ -688,6 +738,8 @@ impl Launcher {
 
     fn finish_hide(&mut self) {
         self.visible = false;
+        self.pending = None;
+        self.armed = None;
         if self.live {
             self.live = false;
             unsafe {
@@ -748,7 +800,7 @@ impl Launcher {
             || self.pop_s < 1.0
             || self.pop_a < 1.0
             || self.sw < 1.0
-            || (self.mode == Mode::Ai && self.ai.moving())
+            || (matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai.moving())
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
     }
@@ -832,9 +884,59 @@ impl Launcher {
     // -- search -----------------------------------------------------------------------------------------
 
     fn search(&mut self) {
-        if self.mode == Mode::Ai {
+        self.search_inner();
+        self.armed = None;
+        // choosing where an action goes: only apps (open with) or folders (move, copy) are offered
+        if let Some((a, _)) = &self.pending {
+            let apps = *a == Act::OpenWith;
+            self.hits.retain(|h| {
+                if apps {
+                    h.kind == Kind::App && !h.path.starts_with("shell:")
+                } else {
+                    h.kind == Kind::Folder
+                }
+            });
+            if self.hits.is_empty() && !apps && self.query.trim().is_empty() {
+                let folders: Vec<Hit> = self
+                    .files
+                    .iter()
+                    .filter(|e| e.kind == Kind::Folder)
+                    .take(12)
+                    .map(|e| Hit {
+                        name: e.name().to_string(),
+                        detail: e.path.to_string(),
+                        path: e.path.to_string(),
+                        kind: Kind::Folder,
+                        spans: Vec::new(),
+                        idx: 0,
+                    })
+                    .collect();
+                self.hits = folders;
+            }
+        }
+    }
+
+    fn search_inner(&mut self) {
+        if matches!(self.mode, Mode::Ai | Mode::Notes) {
             self.hits.clear();
             self.wx = None;
+            return;
+        }
+        if self.mode == Mode::Emoji {
+            self.hits.clear();
+            self.wx = None;
+            for i in emoji::search(&self.query) {
+                let (ch, keys) = emoji::LIST[i];
+                let name: Vec<&str> = keys.split_whitespace().take(2).collect();
+                self.hits.push(Hit {
+                    name: name.join(" "),
+                    detail: "Emoji".into(),
+                    path: ch.to_string(),
+                    kind: Kind::Emoji,
+                    spans: Vec::new(),
+                    idx: i,
+                });
+            }
             return;
         }
         if self.mode == Mode::Clip {
@@ -884,7 +986,9 @@ impl Launcher {
                 }),
             }
         }
-        if let Some(r) = logic::calc(&q) {
+        if let Some(h) = self.convert_hit(&q) {
+            self.hits.push(h);
+        } else if let Some(r) = logic::calc(&q) {
             self.hits.push(Hit {
                 name: r,
                 detail: q.clone(),
@@ -901,6 +1005,17 @@ impl Launcher {
                 kind: Kind::Url,
                 spans: Vec::new(),
                 idx: 0,
+            });
+        }
+        // "restart", "shut down", "lock" ...
+        for i in conv::system(&q) {
+            self.hits.push(Hit {
+                name: conv::SYSTEM[i].0.to_string(),
+                detail: "System".into(),
+                path: format!("sys:{i}"),
+                kind: Kind::System,
+                spans: Vec::new(),
+                idx: i,
             });
         }
         let ql = q.to_ascii_lowercase();
@@ -1103,6 +1218,110 @@ impl Launcher {
 
     // -- doing it ----------------------------------------------------------------------------------------
 
+    /// "5 km in miles", "20 usd in eur", "time in tokyo": the answer as a calculator hit.
+    fn convert_hit(&mut self, q: &str) -> Option<Hit> {
+        let (name, detail) = match conv::convert(q) {
+            Some(conv::Conv::Done { result, detail }) => (result, detail),
+            Some(conv::Conv::Money { amount, from, to }) => match rate(&from, &to) {
+                Some(r) => match conv::money(amount, &from, &to, r) {
+                    conv::Conv::Done { result, detail } => (result, detail),
+                    _ => return None,
+                },
+                None => {
+                    start_rates(SendHwnd::new(self.hwnd));
+                    (
+                        "\u{2026}".to_string(),
+                        format!("{} {from} \u{2192} {to} \u{b7} getting today's rates", conv::fmt(amount)),
+                    )
+                }
+            },
+            None => conv::time(q, unix_secs() as i64)?,
+        };
+        Some(Hit { name, detail, path: String::new(), kind: Kind::Calc, spans: Vec::new(), idx: 0 })
+    }
+
+    /// Save the note that was typed (Enter in the notes mode).
+    fn save_note(&mut self) {
+        let line: String = self.query.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        if line.is_empty() {
+            return;
+        }
+        let at = unix_secs();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(notes_path()) {
+            use std::io::Write;
+            let _ = writeln!(f, "{at}\t{line}");
+        }
+        self.notes.insert(0, (at, line));
+        self.notes.truncate(12);
+        self.notes_text = notes_text(&self.notes);
+        self.query.clear();
+        self.ai.q = Glide::new(Q_SIZES[0]);
+        self.ai.scroll = 0.0;
+    }
+
+    /// Open the file with the chosen app, or move or copy it into the chosen folder.
+    fn run_target(&mut self, act: Act, subject: Hit, target: Hit) {
+        self.hide();
+        let (src, dst) = (subject.path, target.path);
+        std::thread::spawn(move || match act {
+            Act::OpenWith => {
+                let exe = if dst.to_ascii_lowercase().ends_with(".exe") {
+                    Some(dst.clone())
+                } else {
+                    crate::dock::lnk_target(&dst)
+                };
+                match exe {
+                    Some(exe) => {
+                        let _ = std::process::Command::new(exe).arg(&src).spawn();
+                    }
+                    None => sys::shell_open(&src),
+                }
+            }
+            Act::MoveTo | Act::CopyTo => {
+                let from = Path::new(&src);
+                let Some(name) = from.file_name() else { return };
+                let to = Path::new(&dst).join(name);
+                if to.exists() {
+                    return;
+                }
+                if act == Act::MoveTo && std::fs::rename(from, &to).is_ok() {
+                    return;
+                }
+                if copy_all(from, &to).is_ok() && act == Act::MoveTo {
+                    let _ = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+                }
+            }
+            _ => {}
+        });
+    }
+
+    /// The picture or the first lines of the file on the left, loaded the first time it is shown.
+    fn load_peek(&mut self, path: &str) {
+        let ext = Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        const IMAGES: [&str; 9] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico"];
+        const TEXTS: [&str; 22] = [
+            "txt", "md", "log", "json", "toml", "yaml", "yml", "csv", "rs", "py", "js", "ts", "html", "css", "xml",
+            "ini", "cfg", "c", "h", "cpp", "bat", "ps1",
+        ];
+        if IMAGES.contains(&ext.as_str()) {
+            let key = format!("prev:{path}");
+            if !self.icons.contains_key(&key) {
+                let img = dragdrop::thumbnail(path, 256);
+                self.icons.insert(key, img);
+            }
+        } else if TEXTS.contains(&ext.as_str()) && !self.texts.contains_key(path) {
+            use std::io::Read;
+            if self.texts.len() > 16 {
+                self.texts.clear();
+            }
+            let mut buf = vec![0u8; 1500];
+            let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
+            buf.truncate(n);
+            let text = if buf.contains(&0) { String::new() } else { String::from_utf8_lossy(&buf).into_owned() };
+            self.texts.insert(path.to_string(), text);
+        }
+    }
+
     /// Send the question to Gemini (the key is the one from Settings → Gemini).
     fn ask(&mut self) {
         let question = self.query.trim().to_string();
@@ -1159,6 +1378,7 @@ impl Launcher {
     fn ai_key(&mut self, vk: u16, ctrl: bool) -> bool {
         let step = |me: &mut Self, d: f32| me.ai.scroll = (me.ai.scroll + d).clamp(0.0, me.ai.max_scroll);
         match VIRTUAL_KEY(vk) {
+            VK_RETURN if self.mode == Mode::Notes => self.save_note(),
             VK_RETURN => self.ask(),
             VK_DOWN => step(self, 24.0),
             VK_UP => step(self, -24.0),
@@ -1176,7 +1396,7 @@ impl Launcher {
     }
 
     fn query_limit(&self) -> usize {
-        if self.mode == Mode::Ai {
+        if matches!(self.mode, Mode::Ai | Mode::Notes) {
             400
         } else {
             200
@@ -1187,6 +1407,36 @@ impl Launcher {
         let Some(h) = self.cur().cloned() else { return };
         let acts = actions(&h);
         let a = acts[self.act.min(acts.len() - 1)];
+        // choosing where an action goes: Enter finishes it
+        if let Some((pa, subject)) = self.pending.take() {
+            self.run_target(pa, subject, h);
+            return;
+        }
+        if matches!(a, Act::OpenWith | Act::MoveTo | Act::CopyTo) {
+            self.pending = Some((a, h));
+            self.query.clear();
+            self.sel = 0;
+            self.top = 0;
+            self.act = 0;
+            self.focus = Focus::Subject;
+            self.list_open = false;
+            self.search();
+            self.ul = 0.0;
+            self.pop_s = 0.0;
+            self.pop_a = 0.0;
+            self.kick();
+            return;
+        }
+        if a == Act::Run {
+            // putting the computer off asks twice
+            if conv::SYSTEM.get(h.idx).is_some_and(|c| c.2) && self.armed.as_deref() != Some(h.path.as_str()) {
+                self.armed = Some(h.path.clone());
+                return;
+            }
+            self.hide();
+            run_system(h.idx);
+            return;
+        }
         let hwnd = self.hwnd;
         let typed = self.query.trim().to_ascii_lowercase();
         if a == Act::DeleteClip {
@@ -1211,7 +1461,13 @@ impl Launcher {
                     }
                 }
             }
-            Act::DeleteClip => {}
+            Act::DeleteClip | Act::OpenWith | Act::MoveTo | Act::CopyTo | Act::Run => {}
+            Act::PasteEmoji | Act::CopyEmoji => {
+                clip::set_text(hwnd, &h.path);
+                if a == Act::PasteEmoji {
+                    paste_soon();
+                }
+            }
             Act::Open | Act::OpenLink | Act::Search | Act::Forecast => sys::shell_open(&h.path),
             Act::Admin => run_as_admin(&h.path),
             Act::Reveal => sys::shell_reveal(&h.path),
@@ -1285,13 +1541,21 @@ impl Launcher {
             self.show(gfx, 1.0, true);
             return;
         }
-        if self.mode == Mode::Ai && self.ai_key(vk, ctrl) {
+        if matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai_key(vk, ctrl) {
             self.draw(gfx);
             return;
         }
         match VIRTUAL_KEY(vk) {
             VK_ESCAPE => {
-                if self.list_open && self.mode == Mode::Search {
+                if self.pending.is_some() {
+                    // back from choosing where it goes
+                    self.pending = None;
+                    self.query.clear();
+                    self.search();
+                    self.ul = 0.0;
+                    self.pop_s = 0.0;
+                    self.pop_a = 0.0;
+                } else if self.list_open && self.mode == Mode::Search {
                     self.list_open = false;
                 } else {
                     self.hide();
@@ -1300,6 +1564,7 @@ impl Launcher {
             }
             VK_RETURN => {
                 self.run();
+                self.draw(gfx);
                 return;
             }
             // Ctrl+K: the menu of things to do with the match (quit, restart, force quit, ...)
@@ -1391,7 +1656,7 @@ impl Launcher {
             VK_V if ctrl => {
                 if let Some(t) = clip::get_text(self.hwnd) {
                     let room = self.query_limit().saturating_sub(self.query.chars().count());
-                    let one: String = if self.mode == Mode::Ai {
+                    let one: String = if matches!(self.mode, Mode::Ai | Mode::Notes) {
                         // a question may run over several lines: they are joined
                         t.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(room).collect()
                     } else {
@@ -1511,7 +1776,7 @@ impl Launcher {
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL if self.open => {
-                if self.mode == Mode::Ai {
+                if matches!(self.mode, Mode::Ai | Mode::Notes) {
                     let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 / 120;
                     self.ai.scroll = (self.ai.scroll - d as f32 * 36.0).clamp(0.0, self.ai.max_scroll);
                     self.draw(gfx);
@@ -1586,6 +1851,16 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_RATES => {
+                if self.open && self.mode == Mode::Search && self.pending.is_none() {
+                    let (sel, top) = (self.sel, self.top);
+                    self.search();
+                    self.sel = sel.min(self.hits.len().saturating_sub(1));
+                    self.top = top.min(self.hits.len().saturating_sub(VIS));
+                    self.draw(gfx);
+                }
+                Some(LRESULT(0))
+            }
             WM_AI => {
                 if self.ai_poll() && self.open && self.mode == Mode::Ai {
                     self.draw(gfx);
@@ -1618,6 +1893,17 @@ impl Launcher {
     /// Shell icons of what is on screen, a few per frame so typing never stalls. True while more are due.
     fn load_icons(&mut self) -> bool {
         let mut want: Vec<String> = Vec::new();
+        // the file on the left: its picture or its first lines
+        let shown = self.pending.as_ref().map(|(_, h)| h).or_else(|| self.cur());
+        if let Some(h) = shown.filter(|h| h.kind == Kind::File) {
+            let path = h.path.clone();
+            self.load_peek(&path);
+        }
+        if let Some((_, h)) = &self.pending {
+            if h.kind.has_icon() {
+                want.push(h.path.clone());
+            }
+        }
         if let Some(h) = self.cur() {
             if h.kind.has_icon() {
                 want.push(h.path.clone());
@@ -1753,9 +2039,17 @@ impl Launcher {
                     p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(0.15 + 0.40 * on));
                 }
             }
-            let icon = cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
+            // choosing a target: the left box keeps the thing the action is for
+            let subj = self.pending.as_ref().map(|(_, h)| h).or(cur.as_ref());
+            let icon = subj.and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
+            let peek = subj.filter(|h| h.kind == Kind::File).and_then(|h| {
+                match self.icons.get(&format!("prev:{}", h.path)).and_then(|o| o.as_ref()) {
+                    Some(img) => Some(Peek::Img(img)),
+                    None => self.texts.get(&h.path).filter(|t| !t.trim().is_empty()).map(|t| Peek::Text(t)),
+                }
+            });
             let subject = Look {
-                cur: cur.as_ref(),
+                cur: subj,
                 icon,
                 wx: wx.as_deref(),
                 pop: self.pop_s,
@@ -1763,25 +2057,28 @@ impl Launcher {
                 tr: &ct,
                 ready: self.apps_ready,
                 clip: self.mode == Mode::Clip,
+                peek,
             };
             // the contents of both boxes slide and fade in when the mode changes
             let keep = p.alpha;
             p.alpha = keep * (0.25 + 0.75 * sw);
             card_xf(&mut p, &ct);
-            if self.mode == Mode::Ai {
+            if matches!(self.mode, Mode::Ai | Mode::Notes) {
+                let notes = self.mode == Mode::Notes;
                 let qh = text_hash(&self.query);
                 if qh != self.ai.q.fit_for || self.query.is_empty() {
                     ai_goal = Some((qh, fit_text(&mut p, &self.query, BOX - 28.0, BOX - 28.0, &Q_SIZES, 600, true)));
                 }
                 let ah = text_hash(&self.ai.text);
-                if ah != self.ai.a.fit_for || self.ai.text.is_empty() {
+                if !notes && (ah != self.ai.a.fit_for || self.ai.text.is_empty()) {
                     ai_agoal =
                         Some((ah, fit_text(&mut p, &self.ai.text, BOX - 36.0, BOX - 28.0, &A_SIZES, 500, false)));
                 }
                 let view = AiView {
                     query: &self.query,
                     state: self.ai.state,
-                    text: &self.ai.text,
+                    text: if notes { &self.notes_text } else { &self.ai.text },
+                    notes,
                     scroll: self.ai.scroll,
                     pop_s: self.pop_s,
                     pop_a: self.pop_a,
@@ -1791,7 +2088,24 @@ impl Launcher {
                 ai_max = draw_ai(&mut p, sub, act, &view);
             } else {
                 draw_subject(&mut p, sub, &subject);
-                draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &ct);
+                match &self.pending {
+                    Some((a, _)) => {
+                        let target_icon = cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
+                        draw_target(
+                            &mut p,
+                            act,
+                            cur.as_ref(),
+                            target_icon,
+                            a.label().trim_end_matches('\u{2026}'),
+                            self.pop_a,
+                            &ct,
+                        );
+                    }
+                    None => {
+                        let armed = cur.as_ref().is_some_and(|h| self.armed.as_deref() == Some(h.path.as_str()));
+                        draw_action(&mut p, act, cur.as_ref(), self.act, armed, self.pop_a, &ct);
+                    }
+                }
             }
             p.alpha = keep;
             card_xf(&mut p, &tr);
@@ -1928,6 +2242,11 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Op
             p.text("=", r, &TextStyle::new(r.w * 0.55, white(0.92)).semibold().center());
         }
         Kind::Url | Kind::Web => p.icon(Icon::Globe, r.inset(r.w * 0.1), white(0.9)),
+        Kind::System => {
+            p.fill_rounded(r, r.w * 0.26, white(0.12));
+            p.icon(sys_icon(h.idx), r.inset(r.w * 0.22), white(0.9));
+        }
+        Kind::Emoji => p.text(&h.path, r, &TextStyle::new(r.w * 0.72, white(0.95)).center()),
         Kind::Clip => match img {
             Some(i) => p.image(i, r, 5.0, 1.0),
             None => {
@@ -1975,6 +2294,13 @@ struct Look<'a> {
     tr: &'a Tr,
     ready: bool,
     clip: bool,
+    /// The picture or the first lines of the file.
+    peek: Option<Peek<'a>>,
+}
+
+enum Peek<'a> {
+    Img(&'a ImageData),
+    Text(&'a str),
 }
 
 fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
@@ -2000,6 +2326,10 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     };
     if h.kind == Kind::Clip {
         draw_clip_preview(p, r, h, v);
+        return;
+    }
+    if let (Kind::File, Some(pk)) = (h.kind, &v.peek) {
+        draw_peek(p, r, h, pk, v);
         return;
     }
     let a0 = p.alpha;
@@ -2100,6 +2430,8 @@ struct AiView<'a> {
     query: &'a str,
     state: AiState,
     text: &'a str,
+    /// Notes mode: the answer box lists the saved notes, small.
+    notes: bool,
     scroll: f32,
     pop_s: f32,
     pop_a: f32,
@@ -2115,8 +2447,10 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
     // left: what was typed, the end of it kept in view
     p.alpha = a0 * (0.35 + 0.65 * logic::ease_out((v.pop_s * 1.6).min(1.0)));
     if v.query.is_empty() {
-        p.icon(Icon::Sparkle, Rect::centered(sub.cx(), sub.y + 68.0, 52.0, 52.0), white(0.62));
-        p.text("Ask Gemini\u{2026}", Rect::new(sub.x + 10.0, sub.y + 118.0, sub.w - 20.0, 20.0), &centered);
+        let (glyph, hint) =
+            if v.notes { (Icon::Edit, "Jot a note\u{2026}") } else { (Icon::Sparkle, "Ask Gemini\u{2026}") };
+        p.icon(glyph, Rect::centered(sub.cx(), sub.y + 68.0, 52.0, 52.0), white(0.62));
+        p.text(hint, Rect::new(sub.x + 10.0, sub.y + 118.0, sub.w - 20.0, 20.0), &centered);
     } else {
         let view = Rect::new(sub.x + 14.0, sub.y + 14.0, sub.w - 28.0, sub.h - 28.0);
         let mut st = TextStyle::new(v.q.0, white(0.94)).semibold().top().wrap();
@@ -2134,14 +2468,16 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
     if v.text.is_empty() {
         let (icon, msg) = match v.state {
             AiState::Waiting => (Icon::Sparkle, "Thinking\u{2026}"),
+            _ if v.notes => (Icon::Clipboard, "Enter saves it"),
             _ => (Icon::Chat, "Press Enter to ask"),
         };
         p.icon(icon, Rect::centered(act.cx(), act.y + 68.0, 52.0, 52.0), white(0.62));
         p.text(msg, Rect::new(act.x + 10.0, act.y + 118.0, act.w - 20.0, 20.0), &centered);
     } else {
         let view = Rect::new(act.x + 14.0, act.y + 14.0, act.w - 28.0, act.h - 28.0);
-        let mut st = TextStyle::new(v.a.0, white(0.92)).medium().top().wrap();
-        if v.a.2 {
+        let (asz, ay, acenter) = if v.notes { (12.5, 0.0, false) } else { v.a };
+        let mut st = TextStyle::new(asz, white(0.92)).medium().top().wrap();
+        if acenter {
             st = st.center();
         }
         let text_w = view.w - 8.0;
@@ -2149,7 +2485,7 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
         max = (h - view.h).max(0.0);
         let off = v.scroll.clamp(0.0, max);
         p.push_clip(view);
-        p.text(v.text, Rect::new(view.x, view.y + v.a.1 - off, text_w, h), &st);
+        p.text(v.text, Rect::new(view.x, view.y + ay - off, text_w, h), &st);
         p.pop_clip();
         if max > 0.0 {
             // a thin bar shows there is more
@@ -2163,7 +2499,79 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
     max
 }
 
-fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, _focused: bool, pop: f32, tr: &Tr) {
+/// The glyph of a system command.
+fn sys_icon(i: usize) -> Icon {
+    match i {
+        0 => Icon::Lock,
+        1 => Icon::Moon,
+        2 => Icon::Moon,
+        3 => Icon::Refresh,
+        4 => Icon::Bolt,
+        5 => Icon::Close,
+        6 => Icon::Trash,
+        _ => Icon::Brightness,
+    }
+}
+
+/// The left box for a file: its picture, or its first lines in the biggest writing that fits.
+fn draw_peek(p: &mut Painter, r: Rect, h: &Hit, pk: &Peek, v: &Look) {
+    let a0 = p.alpha;
+    let fade = logic::ease_out((v.pop * 1.6).min(1.0));
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    let view = Rect::new(r.x + 14.0, r.y + 14.0, r.w - 28.0, r.h - 50.0);
+    match pk {
+        Peek::Img(img) => p.image_zoom(img, view, 10.0, 1.0, 0.0),
+        Peek::Text(t) => {
+            let text: String = t.trim().chars().take(600).collect();
+            let (sz, y, centered) = fit_text(p, &text, view.w, view.h, &C_SIZES, 500, false);
+            let mut st = TextStyle::new(sz, white(0.90)).medium().top().wrap();
+            if centered {
+                st = st.center();
+            }
+            let hh = p.measure_wrapped(&text, &st, view.w);
+            p.push_clip(view);
+            p.text(&text, Rect::new(view.x, view.y + y, view.w, hh), &st);
+            p.pop_clip();
+        }
+    }
+    p.alpha = a0 * fade;
+    p.text(
+        &logic::mid(&h.name, 24),
+        Rect::new(r.x + 10.0, r.bottom() - 32.0, r.w - 20.0, 18.0),
+        &TextStyle::new(10.5, white(0.7)).semibold().center(),
+    );
+    p.alpha = a0;
+}
+
+/// The right box while choosing where an action goes: the app or folder that is picked.
+fn draw_target(p: &mut Painter, r: Rect, cur: Option<&Hit>, icon: Option<&ImageData>, verb: &str, pop: f32, tr: &Tr) {
+    let a0 = p.alpha;
+    let Some(h) = cur else {
+        p.text(
+            "Type a name\u{2026}",
+            Rect::new(r.x + 10.0, r.y + 118.0, r.w - 20.0, 20.0),
+            &TextStyle::new(11.5, white(0.80)).semibold().center(),
+        );
+        return;
+    };
+    let fade = logic::ease_out((pop * 1.6).min(1.0));
+    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    let ir = Rect::centered(r.cx(), r.y + 62.0, 56.0, 56.0);
+    pop_xf(p, tr, k, r.cx(), ir.cy());
+    p.alpha = a0 * (0.3 + 0.7 * fade);
+    draw_thumb(p, ir, h, icon, None);
+    card_xf(p, tr);
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    p.text(verb, Rect::new(r.x + 10.0, r.y + 106.0, r.w - 20.0, 16.0), &TextStyle::new(10.5, white(0.60)).center());
+    p.text(
+        &logic::mid(&h.name, 22),
+        Rect::new(r.x + 10.0, r.y + 124.0, r.w - 20.0, 22.0),
+        &TextStyle::new(11.5, white(0.90)).semibold().center(),
+    );
+    p.alpha = a0;
+}
+
+fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, armed: bool, pop: f32, tr: &Tr) {
     let cx = r.cx();
     let Some(h) = cur else { return };
     let acts = actions(h);
@@ -2174,12 +2582,18 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, _focused
     let ir = Rect::centered(cx, r.y + 68.0, 56.0, 56.0);
     pop_xf(p, tr, k, cx, ir.cy());
     p.alpha = a0 * (0.3 + 0.7 * fade);
-    p.icon(a.icon(), ir, white(0.92));
+    p.icon(if h.kind == Kind::System { sys_icon(h.idx) } else { a.icon() }, ir, white(0.92));
     card_xf(p, tr);
     p.alpha = a0 * (0.35 + 0.65 * fade);
     let slide = (1.0 - fade) * 5.0;
+    // a command shows its own name, and asks again before it switches the computer off
+    let label = match (h.kind, armed) {
+        (Kind::System, true) => "Press Enter to confirm",
+        (Kind::System, false) => h.name.as_str(),
+        _ => a.label(),
+    };
     p.text(
-        a.label(),
+        label,
         Rect::new(r.x + 10.0, r.y + 116.0 + slide, r.w - 20.0, 22.0),
         &TextStyle::new(11.5, white(0.90)).semibold().center(),
     );
@@ -2230,7 +2644,8 @@ fn draw_list(p: &mut Painter, v: &ListView) {
         }
         Focus::Subject if v.query.trim().is_empty() => "Used most".to_string(),
         Focus::Subject => {
-            let n = v.hits.iter().filter(|h| h.kind.has_icon()).count();
+            let icons = v.hits.iter().filter(|h| h.kind.has_icon()).count();
+            let n = if icons > 0 { icons } else { v.hits.len() };
             let count = if n >= KEEP {
                 format!("{KEEP}+ results")
             } else if n == 1 {
@@ -2485,6 +2900,118 @@ fn finished(slot: &Slot, list: Vec<Entry>, hwnd: SendHwnd) {
     }
 }
 
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn notes_path() -> PathBuf {
+    app_dir().join("notes.txt")
+}
+
+/// The last twelve notes, newest first.
+fn load_notes() -> Vec<(u64, String)> {
+    let Ok(text) = std::fs::read_to_string(notes_path()) else { return Vec::new() };
+    text.lines()
+        .rev()
+        .filter_map(|l| {
+            let (at, note) = l.split_once('\t')?;
+            Some((at.parse().ok()?, note.to_string()))
+        })
+        .take(12)
+        .collect()
+}
+
+/// The notes as the right box shows them: each with how long ago it was written.
+fn notes_text(notes: &[(u64, String)]) -> String {
+    let now = unix_secs();
+    notes.iter().map(|(at, t)| format!("{t}\n{}", logic::ago(now.saturating_sub(*at)))).collect::<Vec<_>>().join("\n\n")
+}
+
+fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            copy_all(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+/// Do a system command (its place in `conv::SYSTEM`).
+fn run_system(i: usize) {
+    const NO_WINDOW: u32 = 0x0800_0000;
+    let (prog, args): (&str, &[&str]) = match i {
+        0 => ("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        1 => ("rundll32.exe", &["powrprof.dll,SetSuspendState", "0,1,0"]),
+        2 => ("shutdown.exe", &["/h"]),
+        3 => ("shutdown.exe", &["/r", "/t", "0"]),
+        4 => ("shutdown.exe", &["/s", "/t", "0"]),
+        5 => ("shutdown.exe", &["/l"]),
+        6 => ("powershell.exe", &["-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"]),
+        _ => (
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-Command",
+                "$p='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'; $n=1-(Get-ItemProperty $p).AppsUseLightTheme; Set-ItemProperty $p AppsUseLightTheme $n; Set-ItemProperty $p SystemUsesLightTheme $n",
+            ],
+        ),
+    };
+    let _ = std::process::Command::new(prog).args(args).creation_flags(NO_WINDOW).spawn();
+}
+
+/// Exchange rates against the US dollar, and when they were fetched.
+static RATES: Mutex<Option<(Instant, HashMap<String, f64>)>> = Mutex::new(None);
+static RATES_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// How many `to` one `from` is worth, from today's rates.
+fn rate(from: &str, to: &str) -> Option<f64> {
+    let g = RATES.lock().ok()?;
+    let (at, m) = g.as_ref()?;
+    if at.elapsed().as_secs() > 6 * 3600 {
+        return None;
+    }
+    Some(m.get(to)? / m.get(from)?)
+}
+
+/// Fetch the rates in the background (once at a time); the launcher is told when they are here.
+fn start_rates(hwnd: SendHwnd) {
+    if RATES_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("launcher-rates".into()).spawn(move || {
+        low_priority();
+        let cancel = AtomicBool::new(false);
+        let got = crate::sys::http::fetch(
+            "GET",
+            "https://open.er-api.com/v6/latest/USD",
+            &[],
+            &[],
+            crate::sys::http::Timeouts::DEFAULT,
+            1 << 20,
+            &cancel,
+        );
+        if let Ok((200, body)) = got {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                if let Some(obj) = v.get("rates").and_then(|r| r.as_object()) {
+                    let map: HashMap<String, f64> =
+                        obj.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect();
+                    if let Ok(mut g) = RATES.lock() {
+                        *g = Some((Instant::now(), map));
+                    }
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd.hwnd()), WM_RATES, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+        }
+        RATES_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 /// Ask Gemini in the background. The answer is written into `shared` as it streams in, and the
 /// launcher window is told each time.
 fn spawn_ai(
@@ -2718,6 +3245,807 @@ fn save_usage(m: &HashMap<String, u32>) {
 }
 
 // -- pure logic: matching, calculator, links (no Windows calls, unit-tested) ---------------------------------
+
+// Conversions typed into the search box: units (`5 km in miles`), money (`20 usd in eur`), the time
+// somewhere (`time in tokyo`, `3pm london in la`) and the system commands (`restart`, `shut down`).
+// Pure text in, text out: nothing here touches the system.
+mod conv {
+    /// What a conversion came to.
+    #[derive(Debug, PartialEq)]
+    pub enum Conv {
+        Done {
+            result: String,
+            detail: String,
+        },
+        /// Needs today's exchange rates: amount, from, to (upper-case codes).
+        Money {
+            amount: f64,
+            from: String,
+            to: String,
+        },
+    }
+
+    /// 1 to 6 significant figures, no trailing zeros, no exponent for ordinary sizes.
+    pub fn fmt(v: f64) -> String {
+        if !v.is_finite() {
+            return "?".into();
+        }
+        if v == 0.0 {
+            return "0".into();
+        }
+        let digits = 6 - 1 - (v.abs().log10().floor() as i32).clamp(-5, 5);
+        let s = format!("{:.*}", digits.clamp(0, 10) as usize, v);
+        let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+        // thousands separators in the whole part
+        let (sign, rest) = s.strip_prefix('-').map_or(("", s.as_str()), |r| ("-", r));
+        let (whole, frac) = rest.split_once('.').map_or((rest, ""), |(a, b)| (a, b));
+        let mut out = String::new();
+        for (i, c) in whole.chars().enumerate() {
+            if i > 0 && (whole.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        if !frac.is_empty() {
+            out.push('.');
+            out.push_str(frac);
+        }
+        format!("{sign}{out}")
+    }
+
+    // dimension, factor to the base unit, symbol, names
+    const UNITS: &[(u8, f64, &str, &str)] = &[
+        (0, 0.001, "mm", "mm|millimeter|millimeters|millimetre|millimetres"),
+        (0, 0.01, "cm", "cm|centimeter|centimeters|centimetre|centimetres"),
+        (0, 1.0, "m", "m|meter|meters|metre|metres"),
+        (0, 1000.0, "km", "km|kilometer|kilometers|kilometre|kilometres"),
+        (0, 0.0254, "in", "in|inch|inches"),
+        (0, 0.3048, "ft", "ft|foot|feet"),
+        (0, 0.9144, "yd", "yd|yard|yards"),
+        (0, 1609.344, "mi", "mi|mile|miles"),
+        (0, 1852.0, "nmi", "nmi"),
+        (1, 1e-6, "mg", "mg|milligram|milligrams"),
+        (1, 1e-3, "g", "g|gram|grams"),
+        (1, 1.0, "kg", "kg|kilo|kilos|kilogram|kilograms"),
+        (1, 0.028349523125, "oz", "oz|ounce|ounces"),
+        (1, 0.45359237, "lb", "lb|lbs|pound|pounds"),
+        (1, 6.35029318, "st", "st|stone"),
+        (1, 1000.0, "t", "t|tonne|tonnes"),
+        (2, 0.001, "ml", "ml|milliliter|milliliters|millilitre|millilitres"),
+        (2, 1.0, "l", "l|liter|liters|litre|litres"),
+        (2, 0.00492892, "tsp", "tsp|teaspoon|teaspoons"),
+        (2, 0.0147868, "tbsp", "tbsp|tablespoon|tablespoons"),
+        (2, 0.0295735, "fl oz", "floz|fl oz|fluid ounce|fluid ounces"),
+        (2, 0.236588, "cup", "cup|cups"),
+        (2, 0.473176, "pt", "pt|pint|pints"),
+        (2, 0.946353, "qt", "qt|quart|quarts"),
+        (2, 3.78541, "gal", "gal|gallon|gallons"),
+        (3, 1.0, "m/s", "m/s|mps"),
+        (3, 0.277778, "km/h", "km/h|kmh|kph|kmph"),
+        (3, 0.44704, "mph", "mph"),
+        (3, 0.514444, "kn", "kn|knot|knots"),
+        (4, 1.0, "B", "b|byte|bytes"),
+        (4, 1e3, "KB", "kb|kilobyte|kilobytes"),
+        (4, 1e6, "MB", "mb|megabyte|megabytes"),
+        (4, 1e9, "GB", "gb|gigabyte|gigabytes"),
+        (4, 1e12, "TB", "tb|terabyte|terabytes"),
+        (4, 1024.0, "KiB", "kib"),
+        (4, 1_048_576.0, "MiB", "mib"),
+        (4, 1_073_741_824.0, "GiB", "gib"),
+        (5, 0.001, "ms", "ms|millisecond|milliseconds"),
+        (5, 1.0, "s", "s|sec|secs|second|seconds"),
+        (5, 60.0, "min", "min|mins|minute|minutes"),
+        (5, 3600.0, "h", "h|hr|hrs|hour|hours"),
+        (5, 86400.0, "d", "d|day|days"),
+        (5, 604_800.0, "wk", "wk|week|weeks"),
+        (6, 1.0, "m²", "sqm|m2|m²"),
+        (6, 1e6, "km²", "sqkm|km2|km²"),
+        (6, 0.09290304, "ft²", "sqft|ft2|ft²"),
+        (6, 4046.8564, "ac", "ac|acre|acres"),
+        (6, 10000.0, "ha", "ha|hectare|hectares"),
+        // temperatures are handled apart (dimension 7)
+        (7, 0.0, "°C", "c|celsius|centigrade"),
+        (7, 1.0, "°F", "f|fahrenheit"),
+        (7, 2.0, "K", "k|kelvin"),
+    ];
+
+    fn unit(name: &str) -> Option<&'static (u8, f64, &'static str, &'static str)> {
+        let n = name.trim();
+        UNITS.iter().find(|u| u.3.split('|').any(|a| a == n))
+    }
+
+    const CURRENCIES: &[&str] = &[
+        "USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "CNY", "INR", "MXN", "BRL", "KRW", "SEK", "NOK", "DKK", "NZD",
+        "SGD", "HKD", "ZAR", "TRY", "PLN", "CZK", "HUF", "ILS", "AED", "SAR", "THB", "IDR", "PHP", "MYR", "TWD", "RUB",
+        "UAH", "EGP", "NGN", "VND", "ARS", "CLP", "COP", "PEN", "RON", "BGN",
+    ];
+
+    fn currency(name: &str) -> Option<String> {
+        let n = name.trim();
+        let code = match n {
+            "dollar" | "dollars" | "bucks" | "$" => "USD",
+            "euro" | "euros" | "€" => "EUR",
+            "yen" | "¥" => "JPY",
+            "£" | "sterling" => "GBP",
+            _ => &n.to_ascii_uppercase(),
+        };
+        CURRENCIES.contains(&code).then(|| code.to_string())
+    }
+
+    /// "20 usd in eur" -> (20, "usd", "eur").
+    fn parse(q: &str) -> Option<(f64, String, String)> {
+        let mut q = q.trim().to_lowercase().replace('°', "").replace(',', "");
+        // a money sign in front: "$20 in eur" -> "20 $ in eur"
+        if let Some(c) = q.chars().next().filter(|c| matches!(c, '$' | '€' | '£' | '¥')) {
+            let rest = q[c.len_utf8()..].trim_start();
+            let end = rest.find(|ch: char| !(ch.is_ascii_digit() || ch == '.')).unwrap_or(rest.len());
+            q = format!("{} {c}{}", &rest[..end], &rest[end..]);
+        }
+        let (lhs, rhs) = [" into ", " in ", " to ", " as ", "->", "="].iter().find_map(|s| q.split_once(s))?;
+        let lhs = lhs.trim();
+        let end = lhs.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))?;
+        if end == 0 {
+            return None;
+        }
+        let v: f64 = lhs[..end].parse().ok()?;
+        let from = lhs[end..].trim();
+        let to = rhs.trim();
+        (!from.is_empty() && !to.is_empty()).then(|| (v, from.to_string(), to.to_string()))
+    }
+
+    pub fn convert(q: &str) -> Option<Conv> {
+        let (v, from, to) = parse(q)?;
+        if let (Some(a), Some(b)) = (currency(&from), currency(&to)) {
+            return Some(Conv::Money { amount: v, from: a, to: b });
+        }
+        let (f, t) = (unit(&from)?, unit(&to)?);
+        if f.0 != t.0 {
+            return None;
+        }
+        let out = if f.0 == 7 {
+            let k = match f.1 as u8 {
+                0 => v + 273.15,
+                1 => (v - 32.0) * 5.0 / 9.0 + 273.15,
+                _ => v,
+            };
+            match t.1 as u8 {
+                0 => k - 273.15,
+                1 => (k - 273.15) * 9.0 / 5.0 + 32.0,
+                _ => k,
+            }
+        } else {
+            v * f.1 / t.1
+        };
+        Some(Conv::Done { result: format!("{} {}", fmt(out), t.2), detail: format!("{} {} → {}", fmt(v), f.2, t.2) })
+    }
+
+    /// The money answer once the rate is known (`rate` = how many `to` one `from` is worth).
+    pub fn money(amount: f64, from: &str, to: &str, rate: f64) -> Conv {
+        Conv::Done {
+            result: format!("{} {to}", fmt(amount * rate)), detail: format!("{} {from} → {to}", fmt(amount))
+        }
+    }
+
+    // -- time zones ---------------------------------------------------------------------------------------
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Dst {
+        No,
+        Us,
+        Eu,
+        Au,
+    }
+
+    // standard offset in minutes, daylight rule, display name, names
+    const ZONES: &[(i32, Dst, &str, &str)] = &[
+        (-480, Dst::Us, "Los Angeles", "la|los angeles|san francisco|sf|seattle|portland|san diego|las vegas|pst|pt|pacific|california"),
+        (-420, Dst::Us, "Denver", "denver|mst|mt|mountain|salt lake city"),
+        (-420, Dst::No, "Phoenix", "phoenix|arizona"),
+        (-360, Dst::Us, "Chicago", "chicago|cst|ct|central|dallas|houston|austin|texas|mexico city"),
+        (-300, Dst::Us, "New York", "new york|ny|nyc|est|et|eastern|boston|miami|atlanta|washington|dc|toronto|philadelphia"),
+        (-540, Dst::Us, "Anchorage", "anchorage|alaska"),
+        (-600, Dst::No, "Honolulu", "honolulu|hawaii"),
+        (-180, Dst::No, "São Paulo", "sao paulo|são paulo|brasilia|rio|buenos aires"),
+        (0, Dst::Eu, "London", "london|uk|britain|dublin|lisbon|bst|gmt"),
+        (0, Dst::No, "UTC", "utc|reykjavik|iceland"),
+        (60, Dst::Eu, "Paris", "paris|berlin|madrid|rome|amsterdam|brussels|vienna|zurich|stockholm|oslo|copenhagen|prague|warsaw|budapest|cet|france|germany|spain|italy"),
+        (120, Dst::Eu, "Athens", "athens|helsinki|kyiv|kiev|bucharest|eet"),
+        (120, Dst::No, "Cairo", "cairo|johannesburg|cape town|south africa|jerusalem|tel aviv"),
+        (180, Dst::No, "Istanbul", "istanbul|moscow|riyadh|nairobi|baghdad|turkey"),
+        (240, Dst::No, "Dubai", "dubai|abu dhabi|uae|baku"),
+        (330, Dst::No, "Mumbai", "mumbai|delhi|india|kolkata|bangalore|ist"),
+        (420, Dst::No, "Bangkok", "bangkok|jakarta|hanoi|ho chi minh|vietnam|thailand"),
+        (480, Dst::No, "Singapore", "singapore|hong kong|beijing|shanghai|china|manila|taipei|kuala lumpur|perth"),
+        (540, Dst::No, "Tokyo", "tokyo|japan|seoul|korea|osaka"),
+        (600, Dst::Au, "Sydney", "sydney|melbourne|canberra|australia"),
+        (600, Dst::No, "Brisbane", "brisbane"),
+        (720, Dst::Au, "Auckland", "auckland|new zealand|wellington"),
+    ];
+
+    fn zone(name: &str) -> Option<&'static (i32, Dst, &'static str, &'static str)> {
+        let n = name.trim();
+        ZONES.iter().find(|z| z.3.split('|').any(|a| a == n))
+    }
+
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    /// 0 = Sunday.
+    fn weekday(days: i64) -> i64 {
+        (days + 4).rem_euclid(7)
+    }
+
+    fn nth_sunday(y: i64, m: i64, n: i64) -> i64 {
+        let first = days_from_civil(y, m, 1);
+        first + (7 - weekday(first)) % 7 + (n - 1) * 7
+    }
+
+    fn last_sunday(y: i64, m: i64) -> i64 {
+        let next = if m == 12 { days_from_civil(y + 1, 1, 1) } else { days_from_civil(y, m + 1, 1) };
+        let last = next - 1;
+        last - weekday(last)
+    }
+
+    /// The offset from UTC in minutes at this moment (`utc` in seconds).
+    fn offset(z: &(i32, Dst, &str, &str), utc: i64) -> i32 {
+        let std = z.0 as i64;
+        let (y, _, _) = civil_from_days(utc.div_euclid(86_400));
+        let dst = match z.1 {
+            Dst::No => false,
+            Dst::Us => {
+                let on = nth_sunday(y, 3, 2) * 86_400 + 2 * 3600 - std * 60;
+                let off = nth_sunday(y, 11, 1) * 86_400 + 2 * 3600 - (std + 60) * 60;
+                utc >= on && utc < off
+            }
+            Dst::Eu => {
+                let on = last_sunday(y, 3) * 86_400 + 3600;
+                let off = last_sunday(y, 10) * 86_400 + 3600;
+                utc >= on && utc < off
+            }
+            Dst::Au => {
+                let on = nth_sunday(y, 10, 1) * 86_400 + 2 * 3600 - std * 60;
+                let off = nth_sunday(y, 4, 1) * 86_400 + 3 * 3600 - (std + 60) * 60;
+                utc >= on || utc < off
+            }
+        };
+        z.0 + if dst { 60 } else { 0 }
+    }
+
+    fn clock(min_of_day: i64) -> String {
+        let m = min_of_day.rem_euclid(1440);
+        let (h, mi) = (m / 60, m % 60);
+        format!("{}:{:02} {}", if h % 12 == 0 { 12 } else { h % 12 }, mi, if h < 12 { "AM" } else { "PM" })
+    }
+
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    /// "9am", "3:30 pm", "15:45" -> minutes after midnight.
+    fn parse_clock(s: &str) -> Option<i64> {
+        let s = s.trim();
+        let (body, pm) = if let Some(b) = s.strip_suffix("pm") {
+            (b.trim(), Some(true))
+        } else if let Some(b) = s.strip_suffix("am") {
+            (b.trim(), Some(false))
+        } else {
+            (s, None)
+        };
+        let (h, m) = body.split_once(':').map_or((body, "0"), |(a, b)| (a, b));
+        let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+        if m > 59 {
+            return None;
+        }
+        let h = match pm {
+            Some(true) if (1..=12).contains(&h) => h % 12 + 12,
+            Some(false) if (1..=12).contains(&h) => h % 12,
+            None if h <= 23 => h,
+            _ => return None,
+        };
+        Some(h * 60 + m)
+    }
+
+    /// `time in tokyo`, `now in paris`, `3pm tokyo in la`. `now` is the UTC time in seconds.
+    pub fn time(q: &str, now: i64) -> Option<(String, String)> {
+        let q = q.trim().to_lowercase();
+        for head in ["time in ", "time at ", "time ", "now in ", "what time is it in "] {
+            if let Some(city) = q.strip_prefix(head) {
+                let z = zone(city.trim_end_matches('?'))?;
+                let local = now + offset(z, now) as i64 * 60;
+                let day = DAYS[weekday(local.div_euclid(86_400)) as usize];
+                return Some((clock(local.div_euclid(60)), format!("{day} in {}", z.2)));
+            }
+        }
+        let (lhs, rhs) = [" in ", " to "].iter().find_map(|s| q.split_once(s))?;
+        let (clk, from) = lhs.trim().split_once(' ')?;
+        let clk = parse_clock(clk).or_else(|| {
+            // "3 pm tokyo": the am/pm came as its own word
+            let (n, rest) = lhs.trim().split_once(' ')?;
+            let (ap, _) = rest.split_once(' ')?;
+            parse_clock(&format!("{n}{ap}"))
+        })?;
+        // the zone is whatever follows the time (and a separate "pm"/"am" word)
+        let from = from.trim().trim_start_matches("pm ").trim_start_matches("am ").trim();
+        let (zf, zt) = (zone(from)?, zone(rhs.trim())?);
+        // which day: today in the source zone
+        let today = (now + offset(zf, now) as i64 * 60).div_euclid(86_400);
+        let utc = today * 86_400 + clk * 60 - offset(zf, now) as i64 * 60;
+        let local = utc + offset(zt, utc) as i64 * 60;
+        let shift = local.div_euclid(86_400) - today;
+        let note = match shift {
+            -1 => " (yesterday)",
+            1 => " (tomorrow)",
+            _ => "",
+        };
+        Some((format!("{}{note}", clock(local.div_euclid(60))), format!("{} {} → {}", clock(clk), zf.2, zt.2)))
+    }
+
+    // -- system commands --------------------------------------------------------------------------------
+
+    /// name, typed names, needs a second Enter to confirm
+    pub const SYSTEM: &[(&str, &str, bool)] = &[
+        ("Lock", "lock|lock screen|lock pc", false),
+        ("Sleep", "sleep|suspend|standby", false),
+        ("Hibernate", "hibernate", true),
+        ("Restart", "restart|reboot|restart pc|restart computer", true),
+        ("Shut down", "shut down|shutdown|power off|turn off|shut down pc|turn off pc", true),
+        ("Sign out", "sign out|signout|log out|logout|log off|logoff", true),
+        ("Empty Recycle Bin", "empty recycle bin|empty trash|recycle bin|recycle|trash|bin|empty bin", true),
+        ("Toggle dark mode", "dark mode|light mode|toggle dark mode|toggle theme|theme", false),
+    ];
+
+    /// The commands the typed text asks for (at least three letters, the start of what they are called).
+    pub fn system(q: &str) -> Vec<usize> {
+        let q = q.trim().to_lowercase();
+        if q.chars().count() < 3 {
+            return Vec::new();
+        }
+        SYSTEM
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.1.split('|').any(|a| a.starts_with(&q) || a == q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+// The emoji picker's list: the picture, then the words it can be found by (the first is its name).
+mod emoji {
+    pub const LIST: &[(&str, &str)] = &[
+        ("😀", "grinning happy smile face"),
+        ("😂", "joy laughing tears funny lol"),
+        ("🤣", "rofl rolling floor laughing"),
+        ("😊", "blush smiling happy"),
+        ("😍", "heart eyes love"),
+        ("🥰", "smiling hearts love adore"),
+        ("😘", "kiss blowing heart"),
+        ("😎", "cool sunglasses"),
+        ("🤩", "star struck wow excited"),
+        ("🥳", "party celebrate birthday"),
+        ("😉", "wink"),
+        ("😁", "beaming grin teeth"),
+        ("😅", "sweat smile nervous relief"),
+        ("😆", "squinting laugh"),
+        ("🙂", "slight smile"),
+        ("🙃", "upside down silly"),
+        ("😇", "angel innocent halo"),
+        ("🤔", "thinking hmm"),
+        ("🤨", "raised eyebrow skeptical"),
+        ("😐", "neutral meh"),
+        ("😑", "expressionless blank"),
+        ("😏", "smirk"),
+        ("😒", "unamused annoyed"),
+        ("🙄", "eye roll"),
+        ("😬", "grimace awkward"),
+        ("😴", "sleeping zzz tired"),
+        ("😪", "sleepy"),
+        ("🤤", "drooling yum"),
+        ("😋", "yum delicious tasty"),
+        ("😛", "tongue out playful"),
+        ("😜", "wink tongue crazy"),
+        ("🤪", "zany wild crazy"),
+        ("😢", "cry sad tear"),
+        ("😭", "sob crying loud"),
+        ("😤", "triumph steam huff"),
+        ("😠", "angry mad"),
+        ("😡", "rage furious red"),
+        ("🤬", "cursing swearing"),
+        ("😱", "scream scared shock"),
+        ("😨", "fearful afraid"),
+        ("😰", "anxious sweat worry"),
+        ("😳", "flushed embarrassed"),
+        ("🥺", "pleading puppy eyes"),
+        ("😮", "open mouth surprised"),
+        ("😲", "astonished shocked"),
+        ("🤯", "mind blown exploding head"),
+        ("🥵", "hot sweating"),
+        ("🥶", "cold freezing"),
+        ("🤢", "nauseated sick"),
+        ("🤮", "vomit sick"),
+        ("🤧", "sneeze sick"),
+        ("😷", "mask sick medical"),
+        ("🤒", "thermometer sick fever"),
+        ("🤕", "bandage hurt injured"),
+        ("🤗", "hug hugging"),
+        ("🤫", "shush quiet secret"),
+        ("🤭", "giggle hand over mouth"),
+        ("🫡", "salute"),
+        ("🫠", "melting"),
+        ("😈", "devil smiling imp"),
+        ("👿", "angry devil"),
+        ("💀", "skull dead"),
+        ("☠️", "skull crossbones danger"),
+        ("👻", "ghost halloween"),
+        ("👽", "alien"),
+        ("🤖", "robot"),
+        ("💩", "poop"),
+        ("🙈", "see no evil monkey"),
+        ("🙉", "hear no evil monkey"),
+        ("🙊", "speak no evil monkey"),
+        ("👍", "thumbs up yes good like ok"),
+        ("👎", "thumbs down no bad dislike"),
+        ("👌", "ok hand perfect"),
+        ("✌️", "victory peace"),
+        ("🤞", "crossed fingers luck"),
+        ("🤟", "love you hand"),
+        ("🤘", "rock on horns"),
+        ("👋", "wave hello hi bye"),
+        ("🤚", "raised back hand"),
+        ("✋", "raised hand stop high five"),
+        ("🖐️", "hand fingers splayed"),
+        ("👏", "clap applause bravo"),
+        ("🙌", "raised hands praise celebrate"),
+        ("🙏", "pray thanks please folded hands"),
+        ("🤝", "handshake deal agreement"),
+        ("💪", "muscle strong flex bicep"),
+        ("👈", "point left"),
+        ("👉", "point right"),
+        ("👆", "point up"),
+        ("👇", "point down"),
+        ("☝️", "index up one"),
+        ("🖕", "middle finger"),
+        ("✍️", "writing hand"),
+        ("🤳", "selfie"),
+        ("👀", "eyes looking"),
+        ("👁️", "eye"),
+        ("👂", "ear listen"),
+        ("👃", "nose smell"),
+        ("👄", "mouth lips"),
+        ("🧠", "brain smart"),
+        ("🫀", "heart organ anatomical"),
+        ("❤️", "red heart love"),
+        ("🧡", "orange heart"),
+        ("💛", "yellow heart"),
+        ("💚", "green heart"),
+        ("💙", "blue heart"),
+        ("💜", "purple heart"),
+        ("🖤", "black heart"),
+        ("🤍", "white heart"),
+        ("🤎", "brown heart"),
+        ("💔", "broken heart sad"),
+        ("❣️", "heart exclamation"),
+        ("💕", "two hearts love"),
+        ("💞", "revolving hearts"),
+        ("💖", "sparkling heart"),
+        ("💗", "growing heart"),
+        ("💘", "heart arrow cupid"),
+        ("💝", "heart ribbon gift"),
+        ("💯", "hundred 100 perfect score"),
+        ("🔥", "fire hot lit flame"),
+        ("✨", "sparkles shiny new magic"),
+        ("⭐", "star"),
+        ("🌟", "glowing star"),
+        ("💫", "dizzy star"),
+        ("⚡", "lightning bolt zap electric"),
+        ("💥", "boom collision explosion"),
+        ("💢", "anger symbol"),
+        ("💦", "sweat drops water splash"),
+        ("💨", "dash wind fast"),
+        ("🎉", "party popper tada celebrate congratulations"),
+        ("🎊", "confetti ball"),
+        ("🎂", "birthday cake"),
+        ("🎁", "gift present"),
+        ("🎈", "balloon"),
+        ("🏆", "trophy winner champion"),
+        ("🥇", "gold medal first"),
+        ("🥈", "silver medal second"),
+        ("🥉", "bronze medal third"),
+        ("🎯", "target bullseye goal"),
+        ("🎮", "video game controller"),
+        ("🎵", "music note"),
+        ("🎶", "music notes"),
+        ("🎤", "microphone sing karaoke"),
+        ("🎧", "headphones music"),
+        ("🎸", "guitar"),
+        ("🎬", "clapper movie film"),
+        ("📷", "camera photo"),
+        ("📱", "phone mobile smartphone"),
+        ("💻", "laptop computer"),
+        ("🖥️", "desktop computer"),
+        ("⌨️", "keyboard"),
+        ("🖱️", "mouse computer"),
+        ("💾", "floppy disk save"),
+        ("📁", "folder file"),
+        ("📂", "open folder"),
+        ("📄", "page document file"),
+        ("📝", "memo note write"),
+        ("📌", "pin pushpin"),
+        ("📎", "paperclip attachment"),
+        ("🔗", "link chain"),
+        ("🔒", "lock locked secure"),
+        ("🔓", "unlocked open"),
+        ("🔑", "key"),
+        ("🔔", "bell notification"),
+        ("🔕", "bell off mute"),
+        ("🔍", "magnifying glass search"),
+        ("💡", "light bulb idea"),
+        ("🔋", "battery"),
+        ("🔌", "plug power"),
+        ("⚙️", "gear settings"),
+        ("🔧", "wrench tool"),
+        ("🔨", "hammer"),
+        ("🧰", "toolbox"),
+        ("💰", "money bag"),
+        ("💵", "dollar cash money"),
+        ("💳", "credit card"),
+        ("📈", "chart increasing up growth"),
+        ("📉", "chart decreasing down"),
+        ("📊", "bar chart stats"),
+        ("📅", "calendar date"),
+        ("⏰", "alarm clock"),
+        ("⏳", "hourglass time"),
+        ("⌛", "hourglass done"),
+        ("📧", "email mail"),
+        ("✉️", "envelope mail letter"),
+        ("📞", "telephone call"),
+        ("📢", "loudspeaker announcement"),
+        ("📣", "megaphone cheering"),
+        ("📚", "books study"),
+        ("📖", "open book read"),
+        ("🎓", "graduation cap"),
+        ("✏️", "pencil"),
+        ("🖊️", "pen"),
+        ("✅", "check mark green done yes"),
+        ("✔️", "check tick"),
+        ("❌", "cross mark no wrong"),
+        ("❎", "cross mark button"),
+        ("⚠️", "warning caution"),
+        ("🚫", "prohibited forbidden no"),
+        ("⛔", "no entry stop"),
+        ("❓", "question mark red"),
+        ("❗", "exclamation red"),
+        ("‼️", "double exclamation"),
+        ("➕", "plus add"),
+        ("➖", "minus subtract"),
+        ("➡️", "right arrow"),
+        ("⬅️", "left arrow"),
+        ("⬆️", "up arrow"),
+        ("⬇️", "down arrow"),
+        ("🔄", "refresh arrows counterclockwise"),
+        ("🔁", "repeat loop"),
+        ("▶️", "play button"),
+        ("⏸️", "pause button"),
+        ("⏹️", "stop button"),
+        ("🔊", "speaker loud volume"),
+        ("🔇", "muted speaker"),
+        ("🐶", "dog puppy"),
+        ("🐱", "cat kitten"),
+        ("🐭", "mouse animal"),
+        ("🐹", "hamster"),
+        ("🐰", "rabbit bunny"),
+        ("🦊", "fox"),
+        ("🐻", "bear"),
+        ("🐼", "panda"),
+        ("🐨", "koala"),
+        ("🐯", "tiger"),
+        ("🦁", "lion"),
+        ("🐮", "cow"),
+        ("🐷", "pig"),
+        ("🐸", "frog"),
+        ("🐵", "monkey"),
+        ("🐔", "chicken"),
+        ("🐧", "penguin"),
+        ("🐦", "bird"),
+        ("🦉", "owl"),
+        ("🦄", "unicorn"),
+        ("🐝", "bee honeybee"),
+        ("🦋", "butterfly"),
+        ("🐢", "turtle"),
+        ("🐍", "snake python"),
+        ("🐙", "octopus"),
+        ("🐬", "dolphin"),
+        ("🐳", "whale"),
+        ("🦈", "shark"),
+        ("🐟", "fish"),
+        ("🌸", "cherry blossom flower"),
+        ("🌹", "rose flower"),
+        ("🌻", "sunflower"),
+        ("🌷", "tulip"),
+        ("🌱", "seedling plant sprout"),
+        ("🌲", "evergreen tree"),
+        ("🌳", "tree"),
+        ("🍀", "four leaf clover luck"),
+        ("🌵", "cactus"),
+        ("🌞", "sun face"),
+        ("☀️", "sun sunny"),
+        ("🌙", "crescent moon night"),
+        ("⭐", "star"),
+        ("☁️", "cloud"),
+        ("🌧️", "rain cloud"),
+        ("⛈️", "thunderstorm"),
+        ("❄️", "snowflake cold winter"),
+        ("☃️", "snowman"),
+        ("🌈", "rainbow"),
+        ("🌊", "wave ocean water"),
+        ("🌍", "earth globe europe africa world"),
+        ("🌎", "earth globe americas world"),
+        ("🍎", "red apple fruit"),
+        ("🍌", "banana"),
+        ("🍇", "grapes"),
+        ("🍓", "strawberry"),
+        ("🍉", "watermelon"),
+        ("🍑", "peach"),
+        ("🍒", "cherries"),
+        ("🍋", "lemon"),
+        ("🥑", "avocado"),
+        ("🍅", "tomato"),
+        ("🥕", "carrot"),
+        ("🌽", "corn"),
+        ("🍕", "pizza"),
+        ("🍔", "hamburger burger"),
+        ("🍟", "french fries"),
+        ("🌭", "hot dog"),
+        ("🌮", "taco"),
+        ("🌯", "burrito"),
+        ("🍣", "sushi"),
+        ("🍜", "noodles ramen"),
+        ("🍝", "spaghetti pasta"),
+        ("🍞", "bread"),
+        ("🧀", "cheese"),
+        ("🥚", "egg"),
+        ("🥓", "bacon"),
+        ("🍿", "popcorn"),
+        ("🍩", "doughnut donut"),
+        ("🍪", "cookie"),
+        ("🍫", "chocolate"),
+        ("🍦", "ice cream"),
+        ("🍰", "cake shortcake"),
+        ("☕", "coffee hot drink"),
+        ("🍵", "tea"),
+        ("🍺", "beer mug"),
+        ("🍻", "cheers beers"),
+        ("🍷", "wine glass"),
+        ("🥂", "champagne cheers toast"),
+        ("🍹", "cocktail tropical drink"),
+        ("🥤", "cup straw soda"),
+        ("🚗", "car automobile"),
+        ("🚕", "taxi"),
+        ("🚌", "bus"),
+        ("🚲", "bicycle bike"),
+        ("🏍️", "motorcycle"),
+        ("✈️", "airplane plane flight"),
+        ("🚀", "rocket launch space ship"),
+        ("🚁", "helicopter"),
+        ("🚂", "train locomotive"),
+        ("⛵", "sailboat"),
+        ("🏠", "house home"),
+        ("🏢", "office building"),
+        ("🏥", "hospital"),
+        ("🏫", "school"),
+        ("⚽", "soccer football"),
+        ("🏀", "basketball"),
+        ("🏈", "american football"),
+        ("⚾", "baseball"),
+        ("🎾", "tennis"),
+        ("🏐", "volleyball"),
+        ("🎱", "pool billiards"),
+        ("🏓", "ping pong table tennis"),
+        ("🥊", "boxing glove"),
+        ("♟️", "chess pawn"),
+        ("🧩", "puzzle piece"),
+        ("🎲", "dice game"),
+        ("🛒", "shopping cart"),
+        ("🛌", "sleeping in bed"),
+        ("🚽", "toilet"),
+        ("🛁", "bathtub"),
+        ("🧼", "soap"),
+        ("🧹", "broom clean"),
+        ("🧸", "teddy bear"),
+        ("👑", "crown king queen"),
+        ("💎", "gem diamond"),
+        ("💍", "ring wedding"),
+        ("👓", "glasses"),
+        ("🕶️", "sunglasses"),
+        ("👕", "t-shirt shirt"),
+        ("👖", "jeans pants"),
+        ("👗", "dress"),
+        ("👟", "sneaker shoe running"),
+        ("🎩", "top hat"),
+        ("🧢", "cap hat"),
+        ("🇺🇸", "flag united states usa america"),
+        ("🇬🇧", "flag united kingdom uk britain"),
+        ("🇨🇦", "flag canada"),
+        ("🇪🇺", "flag european union europe"),
+        ("🇯🇵", "flag japan"),
+        ("🇩🇪", "flag germany"),
+        ("🇫🇷", "flag france"),
+        ("🇲🇽", "flag mexico"),
+        ("🏳️‍🌈", "pride rainbow flag"),
+        ("🏁", "chequered flag finish race"),
+        ("🚩", "red flag"),
+        ("♻️", "recycle recycling"),
+        ("©️", "copyright"),
+        ("™️", "trademark"),
+        ("®️", "registered"),
+        ("°", "degree symbol"),
+        ("→", "arrow right symbol"),
+        ("←", "arrow left symbol"),
+        ("•", "bullet point dot"),
+        ("…", "ellipsis dots"),
+        ("—", "em dash"),
+        ("×", "multiplication times"),
+        ("÷", "division divide"),
+        ("≠", "not equal"),
+        ("≈", "approximately equal"),
+        ("€", "euro currency"),
+        ("£", "pound sterling currency"),
+        ("¥", "yen yuan currency"),
+        ("✓", "check tick symbol"),
+        ("¯\\_(ツ)_/¯", "shrug"),
+        ("(╯°□°)╯︵ ┻━┻", "table flip rage"),
+        ("┬─┬ノ( º _ ºノ)", "put table back calm"),
+        ("ಠ_ಠ", "disapproval look"),
+        ("( ͡° ͜ʖ ͡°)", "lenny face"),
+    ];
+
+    /// The pictures matching what was typed: every typed word must start one of a picture's words;
+    /// the ones matching its name (first word) come first. Nothing typed: the first few.
+    pub fn search(q: &str) -> Vec<usize> {
+        let q = q.trim().to_lowercase();
+        if q.is_empty() {
+            return (0..LIST.len().min(60)).collect();
+        }
+        let words: Vec<&str> = q.split_whitespace().collect();
+        let mut hits: Vec<(i32, usize)> = Vec::new();
+        for (i, (_, keys)) in LIST.iter().enumerate() {
+            let kw: Vec<&str> = keys.split_whitespace().collect();
+            let mut score = 0;
+            let mut ok = true;
+            for w in &words {
+                match kw.iter().position(|k| k.starts_with(w)) {
+                    Some(p) => score += 10 - p.min(9) as i32 + if kw[p] == *w { 5 } else { 0 },
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                hits.push((score, i));
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        hits.dedup_by_key(|h| LIST[h.1].0);
+        hits.into_iter().take(60).map(|h| h.1).collect()
+    }
+}
 
 mod logic {
     /// A new word starts here: the first letter, a letter after a separator, or a capital after a small letter.
