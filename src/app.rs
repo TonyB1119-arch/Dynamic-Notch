@@ -3669,7 +3669,17 @@ impl App {
 
     /// The pinned list as written in the settings.
     pub fn dock_items(&self) -> Vec<String> {
-        self.cfg.dock.items.clone()
+        match self.dock.as_ref() {
+            Some(d) => d.items_cfg(),
+            None => self.cfg.dock.items.clone(),
+        }
+    }
+
+    /// Open the pin picker panel above the dock.
+    pub fn dock_open_picker(&mut self) {
+        if let Some(d) = self.dock.as_mut() {
+            d.open_picker(&self.gfx);
+        }
     }
 
     /// Start, update or remove the dock to match the settings.
