@@ -220,12 +220,12 @@ impl Media {
     /// The button that moves the sound to the next output device. The icon (a laptop for the
     /// built-in speakers, headphones for AirPods and the like) turns into the other one with a
     /// short fade and turn.
-    fn output_button(&mut self, ui: &mut Ui, r: Rect, fg: Color) {
+    fn output_button(&mut self, ui: &mut Ui, r: Rect, fg: Color, scale: f32) {
         let hp = self.out_headphones();
         let (h, p) = ui.touch(r, "output-button");
         ui.p.fill_rounded(r.inset(r.w * 0.07 * p), r.h * 0.5, Color::white(0.08 * h));
         let k = ui.glide(0x0A07_0001, if hp { 1.0 } else { 0.0 });
-        let size = r.w.min(r.h) * 0.5 * (1.0 - 0.14 * p) * (1.0 + 0.03 * h);
+        let size = r.w.min(r.h) * scale * (1.0 - 0.14 * p) * (1.0 + 0.03 * h);
         let (cx, cy) = (r.cx(), r.cy());
         let old = ui.p.alpha;
         // the laptop leaves downward as the headphones come up from below
@@ -580,7 +580,7 @@ impl Module for Media {
         if ui.icon_button(Rect::centered(cx + 76.0, cy, 44.0, 40.0), Icon::Next, side.fg(dim(self.snap.can_next))) {
             self.send(Cmd::Next);
         }
-        self.output_button(ui, Rect::centered(cx + 130.0, cy, 40.0, 40.0), Color::white(0.9));
+        self.output_button(ui, Rect::centered(cx + 152.0, cy, 44.0, 40.0), Color::white(0.97), 0.85);
     }
 
     fn card(&self) -> Option<CardSize> {
@@ -698,8 +698,8 @@ impl Module for Media {
         if ui.icon_button(next, Icon::Next, style.fg(dim(self.snap.can_next))) {
             self.send(Cmd::Next);
         }
-        let out = Rect::centered(next.cx() + small + 8.0, cy, small, small);
-        self.output_button(ui, out, palette::TEXT);
+        let out = Rect::centered(next.cx() + small + 14.0, cy, small, small);
+        self.output_button(ui, out, palette::TEXT, 0.5);
     }
 }
 
