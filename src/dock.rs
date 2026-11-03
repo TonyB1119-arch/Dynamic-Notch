@@ -1307,6 +1307,11 @@ fn items_value(items: &[String]) -> String {
     format!("[{}]", arr.join(", "))
 }
 
+/// Where a shortcut points to (None for Store apps), for the launcher's quit / restart.
+pub fn lnk_target(path: &str) -> Option<String> {
+    resolve_lnk(path)
+}
+
 /// The program a shortcut points to ("" when it has none, as with Store apps).
 fn resolve_lnk(path: &str) -> Option<String> {
     unsafe {

@@ -113,6 +113,9 @@ enum Act {
     OpenLink,
     Search,
     Forecast,
+    Quit,
+    Restart,
+    ForceQuit,
 }
 
 impl Act {
@@ -126,6 +129,9 @@ impl Act {
             Act::OpenLink => "Open link",
             Act::Search => "Search the web",
             Act::Forecast => "Open forecast",
+            Act::Quit => "Quit",
+            Act::Restart => "Restart",
+            Act::ForceQuit => "Force quit",
         }
     }
     fn icon(self) -> Icon {
@@ -137,6 +143,9 @@ impl Act {
             Act::OpenLink => Icon::Link,
             Act::Search => Icon::Globe,
             Act::Forecast => Icon::Cloud,
+            Act::Quit => Icon::Close,
+            Act::Restart => Icon::Refresh,
+            Act::ForceQuit => Icon::Stop,
         }
     }
 }
@@ -145,7 +154,7 @@ impl Act {
 fn actions(h: &Hit) -> &'static [Act] {
     match h.kind {
         Kind::App if h.path.starts_with("shell:") => &[Act::Open],
-        Kind::App => &[Act::Open, Act::Admin, Act::Reveal],
+        Kind::App => &[Act::Open, Act::Admin, Act::Reveal, Act::Quit, Act::Restart, Act::ForceQuit],
         Kind::Folder | Kind::File => &[Act::Open, Act::Reveal, Act::CopyPath],
         Kind::Calc => &[Act::CopyResult],
         Kind::Url => &[Act::OpenLink, Act::CopyPath],
@@ -591,7 +600,7 @@ impl Launcher {
         let mut best: Vec<(i32, u32)> = Vec::with_capacity(KEEP + 1);
         for (k, e) in self.apps.iter().chain(self.files.iter()).enumerate() {
             let name = e.name();
-            let Some(s) = logic::fuzzy(name.as_bytes(), qb, k < na, &mut pos) else { continue };
+            let Some(s) = logic::fuzzy(name.as_bytes(), qb, k < na || qb.len() >= 3, &mut pos) else { continue };
             let mut s = s - name.len().min(80) as i32;
             s += match e.kind {
                 Kind::App => 800,
@@ -610,7 +619,7 @@ impl Launcher {
         for &(_, k) in &best {
             let k = k as usize;
             let e = if k < na { &self.apps[k] } else { &self.files[k - na] };
-            let _ = logic::fuzzy(e.name().as_bytes(), qb, k < na, &mut pos);
+            let _ = logic::fuzzy(e.name().as_bytes(), qb, k < na || qb.len() >= 3, &mut pos);
             let detail = match e.kind {
                 Kind::App if e.path.starts_with("shell:") => "Store app".to_string(),
                 Kind::App => "Application".to_string(),
@@ -758,6 +767,16 @@ impl Launcher {
             Act::Open | Act::OpenLink | Act::Search | Act::Forecast => sys::shell_open(&h.path),
             Act::Admin => run_as_admin(&h.path),
             Act::Reveal => sys::shell_reveal(&h.path),
+            Act::Quit | Act::ForceQuit => {
+                if let Some(exe) = exe_name(&h.path) {
+                    taskkill(&exe, a == Act::ForceQuit);
+                }
+            }
+            Act::Restart => {
+                if let Some(exe) = exe_name(&h.path) {
+                    restart_app(exe, h.path.clone());
+                }
+            }
             Act::CopyPath => {
                 clip::set_text(hwnd, &h.path);
             }
@@ -765,7 +784,7 @@ impl Launcher {
                 clip::set_text(hwnd, &h.name);
             }
         }
-        if h.kind.has_icon() {
+        if h.kind.has_icon() && matches!(a, Act::Open | Act::Admin) {
             self.bump(&h.path);
         }
     }
@@ -799,6 +818,20 @@ impl Launcher {
             VK_RETURN => {
                 self.run();
                 return;
+            }
+            // Ctrl+K: the menu of things to do with the match (quit, restart, force quit, ...)
+            VIRTUAL_KEY(0x4B) if ctrl => {
+                if self.focus == Focus::Action && self.list_open {
+                    self.focus = Focus::Subject;
+                    self.list_open = false;
+                } else if self.cur().is_some_and(|h| actions(h).len() > 1) {
+                    self.focus = Focus::Action;
+                    self.list_open = true;
+                    self.act = 0;
+                    self.pop_a = 0.0;
+                    let c = self.cursor();
+                    self.set_cursor(c);
+                }
             }
             VK_TAB => {
                 if self.cur().is_some() {
@@ -1594,6 +1627,75 @@ fn capture_blur(x: i32, y: i32, w: i32, h: i32, blur: f32) -> Option<ImageData> 
     Some(ImageData::from_pbgra(w2 as u32, h2 as u32, px))
 }
 
+/// The program behind an app match (its shortcut's target), when it is safe to stop it.
+fn exe_name(path: &str) -> Option<String> {
+    let target =
+        if path.to_ascii_lowercase().ends_with(".exe") { path.to_string() } else { crate::dock::lnk_target(path)? };
+    let name = target.rsplit(['\\', '/']).next()?.to_string();
+    let l = name.to_ascii_lowercase();
+    const KEEP_ALIVE: [&str; 9] = [
+        "explorer.exe",
+        "svchost.exe",
+        "winlogon.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "services.exe",
+        "lsass.exe",
+        "dwm.exe",
+        "taskkill.exe",
+    ];
+    let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()));
+    if !l.ends_with(".exe")
+        || name.len() > 100
+        || name.starts_with('-')
+        || KEEP_ALIVE.contains(&l.as_str())
+        || me.as_deref() == Some(l.as_str())
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Ask Windows to close every window of the program (or end it at once when `force`).
+fn taskkill(exe: &str, force: bool) -> bool {
+    let mut c = std::process::Command::new("taskkill");
+    if force {
+        c.args(["/F", "/T"]);
+    }
+    c.args(["/IM", exe]).creation_flags(0x0800_0000);
+    c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.status().is_ok_and(|s| s.success())
+}
+
+fn is_running(exe: &str) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH", "/FO", "CSV"])
+        .creation_flags(0x0800_0000)
+        .output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains(&exe.to_ascii_lowercase()))
+}
+
+/// Close the app politely, end it if it does not leave, then start it again. Runs in the background.
+fn restart_app(exe: String, path: String) {
+    std::thread::spawn(move || {
+        low_priority();
+        taskkill(&exe, false);
+        let mut forced = false;
+        for i in 0..32 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if !is_running(&exe) {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = std::process::Command::new("explorer.exe").arg(&path).spawn();
+                return;
+            }
+            if i == 12 && !forced {
+                forced = true;
+                taskkill(&exe, true);
+            }
+        }
+    });
+}
+
 fn run_as_admin(path: &str) {
     let _ = std::process::Command::new("powershell")
         .args([
@@ -2010,7 +2112,8 @@ mod logic {
 
     /// The answer when `src` is a sum like `12*(3+4)` or `sqrt(2)`; a lone number is not one.
     pub fn calc(src: &str) -> Option<String> {
-        let s = src.trim();
+        let times = times(src.trim());
+        let s = times.as_str();
         if s.len() > 120 || !s.bytes().any(|b| b.is_ascii_digit() || b == b'p' || b == b'P') {
             return None;
         }
@@ -2021,6 +2124,31 @@ mod logic {
             return None;
         }
         Some(num(v))
+    }
+
+    /// `6x7`, `6 x 7` and `6×7` mean 6*7 (and `÷` means `/`); the x of a word or of `0x1F` stays.
+    pub fn times(s: &str) -> String {
+        let c: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        for (i, &ch) in c.iter().enumerate() {
+            match ch {
+                '×' => out.push('*'),
+                '÷' => out.push('/'),
+                'x' | 'X' => {
+                    let prev = c[..i].iter().rev().find(|k| !k.is_whitespace());
+                    let next = c[i + 1..].iter().find(|k| !k.is_whitespace());
+                    let ok = matches!(prev, Some(k) if k.is_ascii_digit() || *k == ')' || *k == '.')
+                        && matches!(next, Some(k) if k.is_ascii_digit() || *k == '(' || *k == '.');
+                    let hex = i >= 1
+                        && c[i - 1] == '0'
+                        && (i < 2 || !(c[i - 2].is_ascii_digit() || c[i - 2] == '.'))
+                        && matches!(next, Some(k) if k.is_ascii_hexdigit());
+                    out.push(if ok && !hex { '*' } else { ch });
+                }
+                _ => out.push(ch),
+            }
+        }
+        out
     }
 
     pub fn num(v: f64) -> String {
@@ -2204,6 +2332,20 @@ mod logic {
             assert!(f("notes.txt", "xyz", true).is_none());
             assert!(f("a", "ab", true).is_none());
             assert_eq!(f("MyCoolApp", "cool", false).unwrap().1, vec![(2, 6)]);
+        }
+
+        #[test]
+        fn times_sign() {
+            assert_eq!(calc("6x7").as_deref(), Some("42"));
+            assert_eq!(calc("6 X 7").as_deref(), Some("42"));
+            assert_eq!(calc("6×7").as_deref(), Some("42"));
+            assert_eq!(calc("2x(3+4)").as_deref(), Some("14"));
+            assert_eq!(calc("(1+1)x3").as_deref(), Some("6"));
+            assert_eq!(calc("12÷4").as_deref(), Some("3"));
+            assert_eq!(calc("6*7").as_deref(), Some("42"));
+            assert_eq!(times("max(2,3)"), "max(2,3)");
+            assert_eq!(times("0x1F"), "0x1F");
+            assert_eq!(calc("xbox"), None);
         }
 
         #[test]
