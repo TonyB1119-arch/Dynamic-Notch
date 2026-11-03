@@ -1131,8 +1131,8 @@ impl Launcher {
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
             p.alpha = e;
-            // opening: grows from 94% and settles down from a little above; closing runs it backwards
-            let tr = Tr { s0: 0.94 + 0.06 * e, top: (1.0 - e) * -8.0 };
+            // opening: appears where it is, fading in while growing from 95% around its middle; closing runs it backwards
+            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0 };
             card_xf(&mut p, &tr);
             let card = Rect::new(0.0, 0.0, W, card_h);
             let dark = self.cfg.dark;
@@ -1216,14 +1216,14 @@ fn magnifier(p: &Painter, cx: f32, cy: f32, c: Color) {
     p.line(cx + 7.5, cy + 7.5, cx + 20.0, cy + 20.0, 4.5, c);
 }
 
-/// How the card sits at this moment (it grows and slides while opening and closing).
+/// How the card sits at this moment (it fades and grows a little while opening and closing).
 struct Tr {
     s0: f32,
     top: f32,
 }
 
 /// The point the card grows from.
-const ANCHOR: (f32, f32) = (W * 0.5, 30.0);
+const ANCHOR: (f32, f32) = (W * 0.5, FRAME_H * 0.5);
 
 fn card_xf(p: &mut Painter, t: &Tr) {
     p.set_local(t.s0, ANCHOR.0, ANCHOR.1, 0.0, t.top);
@@ -1284,9 +1284,14 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Op
         _ => match img {
             Some(i) => p.image(i, r, 0.0, 1.0),
             None => {
-                p.fill_rounded(r, r.w * 0.24, white(0.14));
-                let initial: String = h.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                p.text(&initial, r, &TextStyle::new(r.w * 0.46, white(0.9)).semibold().center());
+                // no icon yet: a glass tile with the same glyph the rest of the app uses
+                p.fill_rounded(r, r.w * 0.26, white(0.12));
+                let glyph = match h.kind {
+                    Kind::Folder => Icon::Folder,
+                    Kind::File => Icon::File,
+                    _ => Icon::Grid,
+                };
+                p.icon(glyph, r.inset(r.w * 0.22), white(0.85));
             }
         },
     }
