@@ -259,11 +259,9 @@ struct Ai {
     /// How far the answer is scrolled, and how far it can be (set while drawing).
     scroll: f32,
     max_scroll: f32,
-    /// The question's text size and top edge as drawn, where they are heading, and for which text.
-    sz: f32,
-    y: f32,
-    goal: (f32, f32),
-    fit_for: u64,
+    /// How the question (left box) and the answer (right box) are set: size and place glide.
+    q: Glide,
+    a: Glide,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Mutex<AiShared>>,
 }
@@ -276,10 +274,8 @@ impl Ai {
             text: String::new(),
             scroll: 0.0,
             max_scroll: 0.0,
-            sz: Q_BIG,
-            y: Q_Y0,
-            goal: (Q_BIG, Q_Y0),
-            fit_for: 0,
+            q: Glide::new(Q_SIZES[0]),
+            a: Glide::new(A_SIZES[0]),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shared: Arc::new(Mutex::new(AiShared { seq: 0, text: String::new(), done: false, err: None })),
         }
@@ -293,10 +289,36 @@ impl Ai {
         self.text = String::new();
         self.scroll = 0.0;
         self.max_scroll = 0.0;
+        self.a = Glide::new(A_SIZES[0]);
     }
 
-    /// The question's text eases toward its size and place.
+    /// The text eases toward its size and place.
     fn glide(&mut self, dt: f32, snap: bool) {
+        self.q.step(dt, snap);
+        self.a.step(dt, snap);
+    }
+
+    fn moving(&self) -> bool {
+        self.q.moving() || self.a.moving()
+    }
+}
+
+/// Where a piece of text sits in its box: the size and top edge as drawn, where they are heading, whether
+/// it is centred (short text) or left-aligned (long text), and which text that was worked out for.
+struct Glide {
+    sz: f32,
+    y: f32,
+    goal: (f32, f32),
+    center: bool,
+    fit_for: u64,
+}
+
+impl Glide {
+    fn new(sz: f32) -> Self {
+        Self { sz, y: GLIDE_Y0, goal: (sz, GLIDE_Y0), center: true, fit_for: 0 }
+    }
+
+    fn step(&mut self, dt: f32, snap: bool) {
         if snap {
             (self.sz, self.y) = self.goal;
         } else {
@@ -308,30 +330,53 @@ impl Ai {
     fn moving(&self) -> bool {
         (self.sz - self.goal.0).abs() > 0.05 || (self.y - self.goal.1).abs() > 0.05
     }
+
+    /// Take a new fit worked out by `fit_text` for the text with this hash.
+    fn set(&mut self, hash: u64, fit: (f32, f32, bool)) {
+        self.fit_for = hash;
+        self.goal = (fit.0, fit.1);
+        self.center = fit.2;
+    }
 }
 
-/// The question starts big in the middle of the box and gets smaller as it grows.
-const Q_BIG: f32 = 34.0;
-const Q_SIZES: [f32; 6] = [Q_BIG, 28.0, 23.0, 19.0, 16.0, 14.0];
-/// Where the top of a one-line question starts (the box is 144 high inside).
-const Q_Y0: f32 = 48.0;
+/// Text sizes to try, biggest first: the question, the answer and the clipboard text start big and
+/// centred, and get smaller as they grow.
+const Q_SIZES: [f32; 6] = [34.0, 28.0, 23.0, 19.0, 16.0, 14.0];
+const A_SIZES: [f32; 6] = [24.0, 20.0, 17.0, 15.0, 13.0, 12.0];
+const C_SIZES: [f32; 6] = [20.0, 17.0, 15.0, 13.0, 12.0, 11.0];
+/// Where the top of a one-line text starts (the boxes are 144 high inside).
+const GLIDE_Y0: f32 = 48.0;
 
-/// The biggest text size at which the question still fits the box, and where its top edge then goes:
-/// the middle while it fits, the top once it is too long (then the end stays in view).
-fn ai_fit(p: &mut Painter, q: &str, w: f32, h: f32) -> (f32, f32) {
-    if q.is_empty() {
-        return (Q_BIG, Q_Y0);
+fn text_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hs);
+    hs.finish() | 1
+}
+
+/// The biggest of `sizes` at which `text` still fits a `w` x `h` box: (that size, where its top edge
+/// goes, centred or not). It sits in the middle (and centred) while it fits, left-aligned from the top
+/// once it has grown; a question keeps its end in view when even the smallest size is too long.
+fn fit_text(
+    p: &mut Painter,
+    text: &str,
+    w: f32,
+    h: f32,
+    sizes: &[f32],
+    weight: u16,
+    keep_end: bool,
+) -> (f32, f32, bool) {
+    if text.is_empty() {
+        return (sizes[0], GLIDE_Y0, true);
     }
-    let mut size = Q_SIZES[Q_SIZES.len() - 1];
     let mut used = 0.0;
-    for &sz in &Q_SIZES {
-        used = p.measure_wrapped(q, &TextStyle::new(sz, white(0.9)).semibold().center().wrap(), w);
-        size = sz;
+    for (i, &sz) in sizes.iter().enumerate() {
+        used = p.measure_wrapped(text, &TextStyle::new(sz, white(0.9)).weight(weight).wrap(), w);
         if used <= h {
-            break;
+            return (sz, (h - used) * 0.5, i <= 2);
         }
     }
-    (size, if used <= h { (h - used) * 0.5 } else { h - used })
+    (sizes[sizes.len() - 1], if keep_end { h - used } else { 0.0 }, false)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -560,6 +605,7 @@ impl Launcher {
         self.high = None;
         self.mouse = (-1.0, -1.0);
         self.ai.clear();
+        self.ai.q = Glide::new(Q_SIZES[0]);
         // nothing typed yet: the apps used most are what the Down arrow lists (a combo shows its own thing)
         if let Some(h) = self.pinned.take() {
             self.hits.push(h);
@@ -1615,6 +1661,7 @@ impl Launcher {
             live_op,
         );
         let mut ai_goal = None;
+        let mut ai_agoal = None;
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(err) => {
@@ -1713,14 +1760,14 @@ impl Launcher {
             p.alpha = keep * (0.25 + 0.75 * sw);
             card_xf(&mut p, &ct);
             if self.mode == Mode::Ai {
-                let hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hs = std::collections::hash_map::DefaultHasher::new();
-                    self.query.hash(&mut hs);
-                    hs.finish() | 1
-                };
-                if hash != self.ai.fit_for || self.query.is_empty() {
-                    ai_goal = Some((hash, ai_fit(&mut p, &self.query, BOX - 28.0, BOX - 28.0)));
+                let qh = text_hash(&self.query);
+                if qh != self.ai.q.fit_for || self.query.is_empty() {
+                    ai_goal = Some((qh, fit_text(&mut p, &self.query, BOX - 28.0, BOX - 28.0, &Q_SIZES, 600, true)));
+                }
+                let ah = text_hash(&self.ai.text);
+                if ah != self.ai.a.fit_for || self.ai.text.is_empty() {
+                    ai_agoal =
+                        Some((ah, fit_text(&mut p, &self.ai.text, BOX - 36.0, BOX - 28.0, &A_SIZES, 500, false)));
                 }
                 let view = AiView {
                     query: &self.query,
@@ -1729,8 +1776,8 @@ impl Launcher {
                     scroll: self.ai.scroll,
                     pop_s: self.pop_s,
                     pop_a: self.pop_a,
-                    qsz: self.ai.sz,
-                    qy: self.ai.y,
+                    q: (self.ai.q.sz, self.ai.q.y, self.ai.q.center),
+                    a: (self.ai.a.sz, self.ai.a.y, self.ai.a.center),
                 };
                 ai_max = draw_ai(&mut p, sub, act, &view);
             } else {
@@ -1765,12 +1812,14 @@ impl Launcher {
         }
         self.res.end_frame();
         self.ai.max_scroll = ai_max;
-        if let Some((hash, goal)) = ai_goal {
-            self.ai.fit_for = hash;
-            self.ai.goal = goal;
-            if self.ai.moving() {
-                self.kick();
-            }
+        if let Some((hash, fit)) = ai_goal {
+            self.ai.q.set(hash, fit);
+        }
+        if let Some((hash, fit)) = ai_agoal {
+            self.ai.a.set(hash, fit);
+        }
+        if self.ai.moving() {
+            self.kick();
         }
         self.ai.scroll = self.ai.scroll.min(ai_max);
     }
@@ -2013,15 +2062,19 @@ fn draw_clip_preview(p: &mut Painter, r: Rect, h: &Hit, v: &Look) {
         }
         (2, None) => p.icon(Icon::Image, Rect::centered(r.cx(), r.y + 66.0, 52.0, 52.0), white(0.55)),
         _ => {
+            // big and centred while short, smaller and left-aligned from the top as it grows
             let text = clip_id(&h.path).and_then(crate::cliphist::preview).unwrap_or_else(|| h.name.clone());
-            let st = TextStyle::new(12.0, white(0.88));
-            for (i, line) in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(6).enumerate() {
-                p.text(
-                    &logic::mid(line, 24),
-                    Rect::new(r.x + 14.0, r.y + 14.0 + i as f32 * 20.0, r.w - 28.0, 20.0),
-                    &st,
-                );
+            let text: String = text.trim().chars().take(600).collect();
+            let view = Rect::new(r.x + 14.0, r.y + 14.0, r.w - 28.0, r.h - 50.0);
+            let (sz, y, centered) = fit_text(p, &text, view.w, view.h, &C_SIZES, 500, false);
+            let mut st = TextStyle::new(sz, white(0.90)).medium().top().wrap();
+            if centered {
+                st = st.center();
             }
+            let hh = p.measure_wrapped(&text, &st, view.w);
+            p.push_clip(view);
+            p.text(&text, Rect::new(view.x, view.y + y, view.w, hh), &st);
+            p.pop_clip();
         }
     }
     p.alpha = a0 * fade;
@@ -2041,9 +2094,9 @@ struct AiView<'a> {
     scroll: f32,
     pop_s: f32,
     pop_a: f32,
-    /// The question's text size and top edge (they glide).
-    qsz: f32,
-    qy: f32,
+    /// Size, top edge and centring of the question and of the answer (they glide).
+    q: (f32, f32, bool),
+    a: (f32, f32, bool),
 }
 
 /// Gemini mode: the question on the left, the answer on the right. Returns how far the answer can scroll.
@@ -2057,10 +2110,13 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
         p.text("Ask Gemini\u{2026}", Rect::new(sub.x + 10.0, sub.y + 118.0, sub.w - 20.0, 20.0), &centered);
     } else {
         let view = Rect::new(sub.x + 14.0, sub.y + 14.0, sub.w - 28.0, sub.h - 28.0);
-        let st = TextStyle::new(v.qsz, white(0.94)).semibold().center().top().wrap();
+        let mut st = TextStyle::new(v.q.0, white(0.94)).semibold().top().wrap();
+        if v.q.2 {
+            st = st.center();
+        }
         let h = p.measure_wrapped(v.query, &st, view.w);
         p.push_clip(view);
-        p.text(v.query, Rect::new(view.x, view.y + v.qy, view.w, h), &st);
+        p.text(v.query, Rect::new(view.x, view.y + v.q.1, view.w, h), &st);
         p.pop_clip();
     }
     // right: the answer
@@ -2075,13 +2131,16 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
         p.text(msg, Rect::new(act.x + 10.0, act.y + 118.0, act.w - 20.0, 20.0), &centered);
     } else {
         let view = Rect::new(act.x + 14.0, act.y + 14.0, act.w - 28.0, act.h - 28.0);
-        let st = TextStyle::new(12.5, white(0.92)).top().wrap();
+        let mut st = TextStyle::new(v.a.0, white(0.92)).medium().top().wrap();
+        if v.a.2 {
+            st = st.center();
+        }
         let text_w = view.w - 8.0;
         let h = p.measure_wrapped(v.text, &st, text_w);
         max = (h - view.h).max(0.0);
         let off = v.scroll.clamp(0.0, max);
         p.push_clip(view);
-        p.text(v.text, Rect::new(view.x, view.y - off, text_w, h), &st);
+        p.text(v.text, Rect::new(view.x, view.y + v.a.1 - off, text_w, h), &st);
         p.pop_clip();
         if max > 0.0 {
             // a thin bar shows there is more
