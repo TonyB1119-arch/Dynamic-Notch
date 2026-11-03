@@ -13,8 +13,11 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use std::os::windows::process::CommandExt;
+use std::sync::OnceLock;
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellLinkW, ShellLink, SIGDN_FILESYSPATH};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_EXCLUDED_FROM_PEEK,
     DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -116,6 +119,10 @@ impl Dock {
         let host = Host::new_shared(hwnd, gfx, 64, 64, compositor)?;
         let res = Res::new(gfx)?;
         let _ = std::fs::create_dir_all(icons_dir());
+        // ask Windows for the Store apps in the background so the picker opens instantly
+        std::thread::spawn(|| {
+            uwp_apps();
+        });
         Ok(Self {
             hwnd,
             host,
@@ -729,6 +736,12 @@ impl Dock {
         self.draw(gfx);
     }
 
+    /// A new icon file was chosen (or removed): load every icon again.
+    pub fn reload_icons(&mut self, gfx: &Gfx) {
+        self.icons.clear();
+        self.draw(gfx);
+    }
+
     /// The pinned list as the dock currently has it.
     pub fn items_cfg(&self) -> Vec<String> {
         self.cfg.items.clone()
@@ -1102,6 +1115,48 @@ fn resolve_lnk(path: &str) -> Option<String> {
     }
 }
 
+/// Store apps (Camera, Settings, Microsoft Store...) have no shortcut file: ask Windows for them.
+/// Returns (name, app id); asked only once per run.
+fn uwp_apps() -> &'static Vec<(String, String)> {
+    static APPS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    APPS.get_or_init(|| {
+        let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }";
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(0x0800_0000)
+            .output();
+        let mut v: Vec<(String, String)> = Vec::new();
+        if let Ok(o) = out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some((name, id)) = line.trim().rsplit_once('|') {
+                    // Store apps have an id like Package_family!App
+                    if id.contains('!') && !name.is_empty() {
+                        v.push((name.trim().to_string(), id.trim().to_string()));
+                    }
+                }
+            }
+        }
+        crate::log!("dock: {} store apps", v.len());
+        v
+    })
+}
+
+/// A file picker for an icon image.
+fn pick_image(owner: HWND) -> Option<String> {
+    unsafe {
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let spec = [COMDLG_FILTERSPEC { pszName: w!("Images"), pszSpec: w!("*.png;*.jpg;*.jpeg;*.bmp;*.ico") }];
+        let _ = dlg.SetFileTypes(&spec);
+        let _ = dlg.SetTitle(w!("Choose an icon"));
+        dlg.Show(Some(owner)).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let out = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        out
+    }
+}
+
 /// Every app shortcut in the Start menu, sorted by name.
 fn scan_start_menu() -> Vec<Item> {
     fn walk(dir: &Path, depth: u32, out: &mut Vec<(String, String)>) {
@@ -1131,6 +1186,9 @@ fn scan_start_menu() -> Vec<Item> {
             walk(&Path::new(&base).join(tail), 0, &mut found);
         }
     }
+    for (name, id) in uwp_apps() {
+        found.push((name.clone(), format!(r"shell:AppsFolder\{id}")));
+    }
     found.sort_by_key(|f| f.0.to_ascii_lowercase());
     found.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
     found
@@ -1150,6 +1208,10 @@ fn context_menu(hwnd: HWND, lp: LPARAM) {
         if let Some((label, _, pinned)) = &target {
             let t = wstr(&if *pinned { format!("Remove {label} from the dock") } else { format!("Keep {label} in the dock") });
             let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(t.as_ptr()));
+            let ci = wstr("Change icon…");
+            let di = wstr("Use the default icon");
+            let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(ci.as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, 4, PCWSTR(di.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let add = wstr("Add or remove apps…");
@@ -1171,6 +1233,19 @@ fn context_menu(hwnd: HWND, lp: LPARAM) {
                 items.push(format!("{}|{}", nice_name(&path), path));
             }
             save_items(&items);
+        }
+        (3, Some((label, _, _))) => {
+            if let Some(src) = pick_image(hwnd) {
+                let _ = std::fs::create_dir_all(icons_dir());
+                if std::fs::copy(&src, icons_dir().join(format!("{label}.png"))).is_ok() {
+                    crate::window::with_app(|a| a.dock_reload_icons());
+                }
+            }
+        }
+        (4, Some((label, _, _))) => {
+            let _ = std::fs::remove_file(icons_dir().join(format!("{label}.png")));
+            let _ = std::fs::remove_file(icons_dir().join(format!("{}.png", label.to_ascii_lowercase())));
+            crate::window::with_app(|a| a.dock_reload_icons());
         }
         (2, _) => {
             crate::window::with_app(|a| a.dock_open_picker());

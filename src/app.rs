@@ -3675,6 +3675,13 @@ impl App {
         }
     }
 
+    /// Load the dock's icons again (a new icon file was chosen).
+    pub fn dock_reload_icons(&mut self) {
+        if let Some(d) = self.dock.as_mut() {
+            d.reload_icons(&self.gfx);
+        }
+    }
+
     /// Open the pin picker panel above the dock.
     pub fn dock_open_picker(&mut self) {
         if let Some(d) = self.dock.as_mut() {
