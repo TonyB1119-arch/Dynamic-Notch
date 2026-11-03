@@ -4,7 +4,7 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, ShowWindow, SW_HIDE, SW_SHOWNA};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOWNA};
 
 use crate::util::app_dir;
 
@@ -27,6 +27,10 @@ pub fn recover_taskbar() {
 pub fn hide_taskbar() {
     unsafe {
         let p = marker_path();
+        // already hidden: nothing to do (this runs every few seconds)
+        if p.exists() && !taskbar_windows().iter().any(|b| IsWindowVisible(*b).as_bool()) {
+            return;
+        }
         let mut abd = APPBARDATA { cbSize: std::mem::size_of::<APPBARDATA>() as u32, ..Default::default() };
         if !p.exists() {
             let old = SHAppBarMessage(4, &mut abd); // ABM_GETSTATE

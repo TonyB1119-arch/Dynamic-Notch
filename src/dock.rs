@@ -181,26 +181,35 @@ impl Dock {
 
     /// New settings (or a first start): re-read the items and icons, then lay the bar out.
     pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32) {
-        self.cfg = cfg.clone();
-        if !cfg.auto_hide {
-            self.hide_t = 0.0;
-            self.hide_to = 0.0;
-        } else if self.hide_to == 0.0 && self.engage_to == 0.0 && self.hide_t == 0.0 {
-            self.hide_to = 1.0;
-            self.start_anim();
+        // Settings reload on every change (a slider drag sends many): only redo what actually changed.
+        let old = std::mem::replace(&mut self.cfg, cfg.clone());
+        if old.auto_hide != cfg.auto_hide {
+            self.region_full = None;
+            if cfg.auto_hide {
+                self.hide_to = 1.0;
+                self.start_anim();
+            } else {
+                self.hide_t = 0.0;
+                self.hide_to = 0.0;
+            }
         }
-        self.region_full = None;
-        if cfg.hide_taskbar {
-            crate::taskbar::hide_taskbar();
-        } else {
-            crate::taskbar::recover_taskbar();
+        if old.hide_taskbar != cfg.hide_taskbar {
+            if cfg.hide_taskbar {
+                crate::taskbar::hide_taskbar();
+            } else {
+                crate::taskbar::recover_taskbar();
+            }
         }
-        self.pinned = cfg.items.iter().filter(|s| !s.trim().is_empty()).map(|s| parse_item(s)).collect();
-        self.icons.clear();
+        let items_changed = old.items != cfg.items || old.show_running != cfg.show_running || old.hide_apps != cfg.hide_apps;
+        if items_changed || self.items.is_empty() {
+            self.pinned = cfg.items.iter().filter(|s| !s.trim().is_empty()).map(|s| parse_item(s)).collect();
+        }
         self.mon = mon;
         self.ui_scale = ui_scale;
-        self.refresh_items();
-        crate::log!("dock: {} items, monitor ok: {}", self.items.len(), !mon.is_invalid());
+        if items_changed || self.items.is_empty() {
+            self.refresh_items();
+            crate::log!("dock: {} items, monitor ok: {}", self.items.len(), !mon.is_invalid());
+        }
         self.place(gfx);
         unsafe {
             SetTimer(Some(self.hwnd), T_SCAN, 2500, None);
