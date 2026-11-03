@@ -224,6 +224,8 @@ pub struct Launcher {
     files_slot: Slot,
     files_started: bool,
     usage: HashMap<String, u32>,
+    /// What was chosen for what was typed: (typed text, path) -> times. It makes the same typing find the same thing first.
+    learn: HashMap<(String, String), u32>,
     icons: HashMap<String, Option<ImageData>>,
     // what the user is doing
     query: String,
@@ -281,6 +283,7 @@ impl Launcher {
             files_slot: Arc::new(Mutex::new(None)),
             files_started: false,
             usage: load_usage(),
+            learn: load_learn(),
             icons: HashMap::new(),
             query: String::new(),
             hits: Vec::new(),
@@ -600,10 +603,25 @@ impl Launcher {
         let na = self.apps.len();
         let mut pos = std::mem::take(&mut self.scratch);
         let mut best: Vec<(i32, u32)> = Vec::with_capacity(KEEP + 1);
+        // what was chosen before for this typing (or for a longer typing that starts like it) comes first
+        let mut learned: HashMap<&str, i32> = HashMap::new();
+        if ql.len() >= 2 {
+            for ((typed, path), &n) in &self.learn {
+                if typed.starts_with(&ql) {
+                    let n = n.min(4) as i32;
+                    let b = if typed.len() == ql.len() { 4_000 + 1_000 * n } else { 2_000 + 500 * n };
+                    let e = learned.entry(path.as_str()).or_insert(0);
+                    *e = (*e).max(b);
+                }
+            }
+        }
         for (k, e) in self.apps.iter().chain(self.files.iter()).enumerate() {
             let name = e.name();
-            let Some(s) = logic::fuzzy(name.as_bytes(), qb, k < na || qb.len() >= 3, &mut pos) else { continue };
+            let Some(s) = logic::matched(name.as_bytes(), qb, k < na || qb.len() >= 3, &mut pos) else { continue };
             let mut s = s - name.len().min(80) as i32;
+            if !learned.is_empty() {
+                s += learned.get(&*e.path).copied().unwrap_or(0);
+            }
             s += match e.kind {
                 Kind::App => 800,
                 Kind::Folder => 100,
@@ -621,7 +639,7 @@ impl Launcher {
         for &(_, k) in &best {
             let k = k as usize;
             let e = if k < na { &self.apps[k] } else { &self.files[k - na] };
-            let _ = logic::fuzzy(e.name().as_bytes(), qb, k < na || qb.len() >= 3, &mut pos);
+            let _ = logic::matched(e.name().as_bytes(), qb, k < na || qb.len() >= 3, &mut pos);
             let detail = match e.kind {
                 Kind::App if e.path.starts_with("shell:") => "Store app".to_string(),
                 Kind::App => "Application".to_string(),
@@ -764,6 +782,7 @@ impl Launcher {
         let acts = actions(&h);
         let a = acts[self.act.min(acts.len() - 1)];
         let hwnd = self.hwnd;
+        let typed = self.query.trim().to_ascii_lowercase();
         self.hide();
         match a {
             Act::Open | Act::OpenLink | Act::Search | Act::Forecast => sys::shell_open(&h.path),
@@ -788,7 +807,30 @@ impl Launcher {
         }
         if h.kind.has_icon() && matches!(a, Act::Open | Act::Admin) {
             self.bump(&h.path);
+            self.teach(&typed, &h.path);
         }
+    }
+
+    /// Remember what was chosen for what was typed: the same typing finds it first next time. Other
+    /// things chosen for the same typing before count a little less after this.
+    fn teach(&mut self, typed: &str, path: &str) {
+        if typed.len() < 2 || typed.len() > 40 {
+            return;
+        }
+        let typed = typed.to_string();
+        self.learn.retain(|(t, p), n| {
+            if *t == typed && p != path {
+                *n = n.saturating_sub(1);
+            }
+            *n > 0
+        });
+        *self.learn.entry((typed, path.to_string())).or_insert(0) += 1;
+        if self.learn.len() > 400 {
+            if let Some(low) = self.learn.iter().min_by_key(|(_, n)| **n).map(|(k, _)| k.clone()) {
+                self.learn.remove(&low);
+            }
+        }
+        save_learn(&self.learn);
     }
 
     /// Remember what was opened: it ranks higher next time.
@@ -1846,6 +1888,32 @@ fn load_usage() -> HashMap<String, u32> {
     m
 }
 
+fn learn_path() -> PathBuf {
+    app_dir().join("launcher-learn.txt")
+}
+
+fn load_learn() -> HashMap<(String, String), u32> {
+    let mut m = HashMap::new();
+    if let Ok(s) = std::fs::read_to_string(learn_path()) {
+        for line in s.lines() {
+            let mut it = line.splitn(3, '\t');
+            if let (Some(n), Some(typed), Some(path)) = (it.next(), it.next(), it.next()) {
+                if let Ok(n) = n.trim().parse::<u32>() {
+                    m.insert((typed.to_string(), path.to_string()), n);
+                }
+            }
+        }
+    }
+    m
+}
+
+fn save_learn(m: &HashMap<(String, String), u32>) {
+    let mut v: Vec<(&(String, String), &u32)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let text: String = v.into_iter().take(400).map(|((t, p), n)| format!("{n}\t{t}\t{p}\n")).collect();
+    let _ = std::fs::write(learn_path(), text);
+}
+
 fn save_usage(m: &HashMap<String, u32>) {
     let mut v: Vec<(&String, &u32)> = m.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -1863,6 +1931,77 @@ mod logic {
         }
         let (p, c) = (n[i - 1], n[i]);
         (p < 0x80 && !p.is_ascii_alphanumeric()) || (p.is_ascii_lowercase() && c.is_ascii_uppercase())
+    }
+
+    /// Like `fuzzy`, and when that finds nothing, a name with a slip in it ("chorme" for Chrome).
+    pub fn matched(name: &[u8], q: &[u8], loose: bool, pos: &mut Vec<usize>) -> Option<i32> {
+        fuzzy(name, q, loose, pos).or_else(|| if q.len() >= 4 { typo(name, q, pos) } else { None })
+    }
+
+    /// Letters wrong, missing, extra or swapped: the fewest changes to turn `a` into `b` (swapping two
+    /// neighbours counts once). Only for short words.
+    pub fn distance(a: &[u8], b: &[u8]) -> usize {
+        let (n, m) = (a.len(), b.len());
+        let mut d = vec![vec![0usize; m + 1]; n + 1];
+        for (i, row) in d.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for j in 0..=m {
+            d[0][j] = j;
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    v = v.min(d[i - 2][j - 2] + 1);
+                }
+                d[i][j] = v;
+            }
+        }
+        d[n][m]
+    }
+
+    /// The query is close to the start of one of the words of `name`: one slip for 4 - 5 letters,
+    /// two for longer ones. The word is left in `pos`.
+    pub fn typo(name: &[u8], q: &[u8], pos: &mut Vec<usize>) -> Option<i32> {
+        pos.clear();
+        let (n, m) = (name.len(), q.len());
+        if !(4..=40).contains(&m) || n < m - 1 {
+            return None;
+        }
+        let allowed = if m <= 5 { 1 } else { 2 };
+        let low = |i: usize| name[i].to_ascii_lowercase();
+        let mut best: Option<(usize, usize, usize)> = None; // (distance, start, length)
+        for st in 0..n {
+            if !is_word_start(name, st) || !name[st].is_ascii_alphanumeric() {
+                continue;
+            }
+            // a cheap look at the first letters, so most words are skipped
+            let swapped = st + 1 < n && m >= 2 && low(st) == q[1] && low(st + 1) == q[0];
+            if low(st) != q[0] && !swapped {
+                continue;
+            }
+            let mut end = st;
+            while end < n && name[end].is_ascii_alphanumeric() && (end == st || !is_word_start(name, end)) {
+                end += 1;
+            }
+            let word: Vec<u8> = name[st..end].iter().map(|c| c.to_ascii_lowercase()).collect();
+            if word.len() + allowed < m {
+                continue;
+            }
+            // the start of the word, about as long as the query
+            for len in m.saturating_sub(1)..=(m + 1) {
+                let len = len.min(word.len());
+                let d = distance(&word[..len], q);
+                if d <= allowed && best.map_or(true, |b| d < b.0) {
+                    best = Some((d, st, len));
+                }
+            }
+        }
+        let (d, st, len) = best?;
+        pos.extend(st..st + len);
+        Some(3_400 - 500 * d as i32 - st as i32)
     }
 
     /// How well `name` fits the lowercase query `q` (None = not at all). The matched byte positions
@@ -2341,6 +2480,25 @@ mod logic {
             assert!(f("notes.txt", "xyz", true).is_none());
             assert!(f("a", "ab", true).is_none());
             assert_eq!(f("MyCoolApp", "cool", false).unwrap().1, vec![(2, 6)]);
+        }
+
+        #[test]
+        fn slips_are_forgiven() {
+            let mut pos = Vec::new();
+            assert!(typo(b"Google Chrome", b"chorme", &mut pos).is_some());
+            assert_eq!(pos, (7..13).collect::<Vec<_>>());
+            assert!(typo(b"Notepad", b"nodepad", &mut pos).is_some());
+            assert!(typo(b"Visual Studio Code", b"vsiual", &mut pos).is_some());
+            assert!(typo(b"Firefox", b"chrome", &mut pos).is_none());
+            assert!(typo(b"Calculator", b"chrome", &mut pos).is_none());
+            assert!(typo(b"Chrome", b"chr", &mut pos).is_none());
+            assert!(matched(b"Google Chrome", b"chorme", true, &mut pos).is_some());
+            // a real match still wins over a slip
+            let real = fuzzy(b"Chrome", b"chrome", true, &mut pos).unwrap();
+            let slip = typo(b"Chrome", b"chorme", &mut pos).unwrap();
+            assert!(real > slip);
+            assert_eq!(distance(b"chrome", b"chorme"), 1);
+            assert_eq!(distance(b"abc", b"abcd"), 1);
         }
 
         #[test]
