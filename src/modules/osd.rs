@@ -21,7 +21,7 @@
 //! may still show its own brightness flyout next to ours.
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, Once};
 
@@ -67,6 +67,14 @@ const KEYS: [(i32, VIRTUAL_KEY); 3] = [(0x4F00, VK_VOLUME_UP), (0x4F01, VK_VOLUM
 /// (percent, -1 = none), for the control center sliders.
 static LEVEL_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xBF80_0000);
 static BRIGHT_PCT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// What the default output is: 0 = the built-in speakers (or anything else), 1 = headphones / a
+/// headset (AirPods and the like). Kept up to date by the worker; the media page shows it.
+static OUT_KIND: AtomicU8 = AtomicU8::new(0);
+
+/// True while the default output is a pair of headphones or a headset.
+pub fn output_is_headphones() -> bool {
+    OUT_KIND.load(Ordering::Relaxed) == 1
+}
 
 /// Output volume 0..1, when known.
 pub fn volume_now() -> Option<f32> {
@@ -287,6 +295,7 @@ impl Module for Osd {
                 LEVEL_BITS.store(level.to_bits(), Ordering::Relaxed);
             }
             OsdMsg::Device { name, level, muted } => {
+                cx.fx.redraw = true;
                 self.device = name;
                 self.level = level;
                 self.muted = muted;
@@ -311,6 +320,7 @@ impl Module for Osd {
                 }
             }
             OsdMsg::Switched { name, ok } => {
+                cx.fx.redraw = true;
                 self.switching = None;
                 let (title, sub) = if ok {
                     ("Output", short_device(&name))
@@ -515,10 +525,12 @@ unsafe fn bind(
     let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
     let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
     vol.RegisterControlChangeNotify(events).ok()?;
+    let name = device_name(&dev);
+    OUT_KIND.store(is_headphones(&dev, &name) as u8, Ordering::Relaxed);
     bus.to_module(
         ID,
         OsdMsg::Device {
-            name: device_name(&dev),
+            name,
             level: vol.GetMasterVolumeLevelScalar().unwrap_or(0.0),
             muted: vol.GetMute().is_ok_and(|m| m.as_bool()),
         },
@@ -548,12 +560,14 @@ unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
 
 /// Pick the playback device after the current default and make it the default.
 unsafe fn next_output(en: &IMMDeviceEnumerator, bus: &Bus) {
-    let mut devs: Vec<(String, String)> = Vec::new();
+    let mut devs: Vec<(String, String, bool)> = Vec::new();
     if let Ok(list) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
         for i in 0..list.GetCount().unwrap_or(0) {
             if let Ok(d) = list.Item(i) {
                 if let Some(id) = device_id(&d) {
-                    devs.push((id, device_name(&d)));
+                    let name = device_name(&d);
+                    let hp = is_headphones(&d, &name);
+                    devs.push((id, name, hp));
                 }
             }
         }
@@ -563,11 +577,15 @@ unsafe fn next_output(en: &IMMDeviceEnumerator, bus: &Bus) {
         return;
     }
     let cur = en.GetDefaultAudioEndpoint(eRender, eConsole).ok().and_then(|d| device_id(&d));
-    let pos = devs.iter().position(|(id, _)| Some(id) == cur.as_ref()).unwrap_or(devs.len() - 1);
-    let (id, name) = devs[(pos + 1) % devs.len()].clone();
+    let pos = devs.iter().position(|(id, _, _)| Some(id) == cur.as_ref()).unwrap_or(devs.len() - 1);
+    let (id, name, hp) = devs[(pos + 1) % devs.len()].clone();
+    let before = OUT_KIND.swap(hp as u8, Ordering::Relaxed);
     let bus = bus.clone();
     let _ = std::thread::Builder::new().name("osd-switch".into()).spawn(move || {
         let ok = set_default_output(&id);
+        if !ok {
+            OUT_KIND.store(before, Ordering::Relaxed);
+        }
         bus.to_module(ID, OsdMsg::Switched { name, ok });
     });
 }
@@ -606,8 +624,62 @@ public static class DnAudio {
 exit ([DnAudio]::Set($env:DN_AUDIO_ID))
 "#;
 
+/// The same COM object the Sound control panel uses (no public API exists for this).
+#[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+unsafe trait IPolicyConfig: windows::core::IUnknown {
+    unsafe fn GetMixFormat(&self, a: PCWSTR, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    unsafe fn GetDeviceFormat(&self, a: PCWSTR, b: i32, c: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    unsafe fn ResetDeviceFormat(&self, a: PCWSTR) -> windows::core::HRESULT;
+    unsafe fn SetDeviceFormat(
+        &self,
+        a: PCWSTR,
+        b: *mut std::ffi::c_void,
+        c: *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    unsafe fn GetProcessingPeriod(
+        &self,
+        a: PCWSTR,
+        b: i32,
+        c: *mut std::ffi::c_void,
+        d: *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    unsafe fn SetProcessingPeriod(&self, a: PCWSTR, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    unsafe fn GetShareMode(&self, a: PCWSTR, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    unsafe fn SetShareMode(&self, a: PCWSTR, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    unsafe fn GetPropertyValue(
+        &self,
+        a: PCWSTR,
+        b: i32,
+        c: *const PROPERTYKEY,
+        d: *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    unsafe fn SetPropertyValue(
+        &self,
+        a: PCWSTR,
+        b: i32,
+        c: *const PROPERTYKEY,
+        d: *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    unsafe fn SetDefaultEndpoint(&self, id: PCWSTR, role: ERole) -> windows::core::HRESULT;
+    unsafe fn SetEndpointVisibility(&self, a: PCWSTR, b: i32) -> windows::core::HRESULT;
+}
+
+/// Set the default output for every role directly: instant, with no process to start.
+fn set_default_native(id: &str) -> bool {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let clsid = windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+        let Ok(pc) = CoCreateInstance::<_, IPolicyConfig>(&clsid, None, CLSCTX_ALL) else { return false };
+        let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+        (0..3).all(|role| pc.SetDefaultEndpoint(PCWSTR(wide.as_ptr()), ERole(role)).is_ok())
+    }
+}
+
 fn set_default_output(id: &str) -> bool {
     use std::os::windows::process::CommandExt;
+    if set_default_native(id) {
+        return true;
+    }
     let path = std::env::temp_dir().join("dynamic-notch-audio-switch.ps1");
     if std::fs::write(&path, SWITCH_SCRIPT).is_err() {
         return false;
@@ -619,6 +691,28 @@ fn set_default_output(id: &str) -> bool {
         .creation_flags(0x0800_0000)
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// PKEY_AudioEndpoint_FormFactor: 3 = headphones, 5 = headset.
+const PKEY_FORM_FACTOR: PROPERTYKEY =
+    PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e), pid: 0 };
+
+/// Headphones or a headset: by what the device says it is, else by its name.
+unsafe fn is_headphones(dev: &IMMDevice, name: &str) -> bool {
+    if let Ok(store) = dev.OpenPropertyStore(STGM_READ) {
+        if let Ok(mut pv) = store.GetValue(&PKEY_FORM_FACTOR) {
+            let inner = &pv.Anonymous.Anonymous;
+            let ff = if inner.vt == VT_UI4 { Some(inner.Anonymous.ulVal) } else { None };
+            let _ = PropVariantClear(&mut pv);
+            if let Some(ff) = ff {
+                if ff == 3 || ff == 5 {
+                    return true;
+                }
+            }
+        }
+    }
+    let n = name.to_ascii_lowercase();
+    ["headphone", "headset", "airpods", "earbuds", "earphone", "buds"].iter().any(|w| n.contains(w))
 }
 
 unsafe fn device_name(dev: &IMMDevice) -> String {

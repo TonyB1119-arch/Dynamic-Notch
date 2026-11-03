@@ -93,6 +93,8 @@ pub struct Media {
     /// The line shown now and when it changed (for the scroll).
     ly_idx: usize,
     ly_at: Instant,
+    /// After a click on the output button: what it should show until the system confirms.
+    out_want: Option<(bool, Instant)>,
 }
 
 /// A lyrics answer from the worker thread.
@@ -149,6 +151,7 @@ impl Media {
             show_lyrics: true,
             ly_idx: 0,
             ly_at: Instant::now(),
+            out_want: None,
         }
     }
 
@@ -203,6 +206,44 @@ impl Media {
 
     fn accent(&self) -> Color {
         self.snap.art.as_ref().and_then(|a| a.accent).unwrap_or(Color::white(0.9))
+    }
+
+    /// Headphones (true) or the built-in speakers (false), as far as the system says; right after a
+    /// click the answer it is going to give.
+    fn out_headphones(&self) -> bool {
+        match self.out_want {
+            Some((hp, t)) if t.elapsed() < Duration::from_secs(3) => hp,
+            _ => super::osd::output_is_headphones(),
+        }
+    }
+
+    /// The button that moves the sound to the next output device. The icon (a laptop for the
+    /// built-in speakers, headphones for AirPods and the like) turns into the other one with a
+    /// short fade and turn.
+    fn output_button(&mut self, ui: &mut Ui, r: Rect, fg: Color) {
+        let hp = self.out_headphones();
+        let (h, p) = ui.touch(r, "output-button");
+        ui.p.fill_rounded(r.inset(r.w * 0.07 * p), r.h * 0.5, Color::white(0.08 * h));
+        let k = ui.glide(0x0A07_0001, if hp { 1.0 } else { 0.0 });
+        let size = r.w.min(r.h) * 0.5 * (1.0 - 0.14 * p) * (1.0 + 0.03 * h);
+        let (cx, cy) = (r.cx(), r.cy());
+        let old = ui.p.alpha;
+        // the laptop leaves downward as the headphones come up from below
+        if k < 0.995 {
+            let a = 1.0 - k;
+            ui.p.alpha = old * a;
+            draw_laptop(&mut ui.p, cx, cy + k * 5.0, size * (0.7 + 0.3 * a), fg);
+        }
+        if k > 0.005 {
+            ui.p.alpha = old * k;
+            let s = size * (0.7 + 0.3 * k);
+            ui.p.icon(Icon::Headphones, Rect::new(cx - s * 0.5, cy + (1.0 - k) * 5.0 - s * 0.5, s, s), fg);
+        }
+        ui.p.alpha = old;
+        if ui.clicked(r) {
+            self.out_want = Some((!hp, Instant::now()));
+            super::osd::request_next_output(ui.bus);
+        }
     }
 
     fn toggle(&mut self) {
@@ -539,6 +580,7 @@ impl Module for Media {
         if ui.icon_button(Rect::centered(cx + 76.0, cy, 44.0, 40.0), Icon::Next, side.fg(dim(self.snap.can_next))) {
             self.send(Cmd::Next);
         }
+        self.output_button(ui, Rect::centered(cx + 130.0, cy, 40.0, 40.0), Color::white(0.9));
     }
 
     fn card(&self) -> Option<CardSize> {
@@ -656,7 +698,17 @@ impl Module for Media {
         if ui.icon_button(next, Icon::Next, style.fg(dim(self.snap.can_next))) {
             self.send(Cmd::Next);
         }
+        let out = Rect::centered(next.cx() + small + 8.0, cy, small, small);
+        self.output_button(ui, out, palette::TEXT);
     }
+}
+
+/// A small laptop in the line style of the other icons: the screen, and the base under it.
+fn draw_laptop(p: &mut crate::gfx::Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let sw = (s * 0.085).max(1.3);
+    let screen = Rect::new(cx - s * 0.30, cy - s * 0.34, s * 0.60, s * 0.44);
+    p.stroke_rounded(screen.inset(sw * 0.5), s * 0.07, sw, c);
+    p.fill_rounded(Rect::new(cx - s * 0.46, cy + s * 0.17, s * 0.92, s * 0.11), s * 0.055, c);
 }
 
 // ---------------------------------------------------------------------------
