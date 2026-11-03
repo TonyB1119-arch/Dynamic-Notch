@@ -8,6 +8,7 @@ mod app;
 mod bloom;
 mod bus;
 mod claude;
+mod cliphist;
 mod config;
 mod dock;
 mod gfx;

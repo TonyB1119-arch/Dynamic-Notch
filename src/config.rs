@@ -176,6 +176,9 @@ pub struct Hotkeys {
     pub dictate: String,
     /// The quick launcher: apps, files, sums and web addresses.
     pub launcher: String,
+    /// The launcher as a history of what you copied (text, links, images, files). Caught by a
+    /// low-level hook, so Win+C works even though Windows wants it.
+    pub launcher_clip: String,
 }
 
 impl Default for Hotkeys {
@@ -188,6 +191,7 @@ impl Default for Hotkeys {
             play_pause: String::new(),
             dictate: "Ctrl+Alt+D".into(),
             launcher: "Alt+Space".into(),
+            launcher_clip: "Win+C".into(),
         }
     }
 }
@@ -1016,6 +1020,8 @@ play_pause = ""
 dictate = "Ctrl+Alt+D"
 # The quick launcher (apps, files, sums, web addresses). Leave empty to turn it off.
 launcher = "Alt+Space"
+# The launcher as a history of what you copied (text, links, images, files). Leave empty to turn it off.
+launcher_clip = "Win+C"
 
 [modules]
 media = true
@@ -1277,6 +1283,7 @@ mod tests {
         assert_eq!(c.timer.presets_min, d.timer.presets_min);
         assert_eq!(c.hotkeys.dictate, d.hotkeys.dictate);
         assert_eq!(c.hotkeys.launcher, d.hotkeys.launcher);
+        assert_eq!(c.hotkeys.launcher_clip, d.hotkeys.launcher_clip);
         assert_eq!(c.voice.model, d.voice.model);
         assert_eq!(c.voice.cleanup, d.voice.cleanup);
         assert_eq!(c.locks.caps, d.locks.caps);

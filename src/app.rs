@@ -1878,6 +1878,7 @@ impl App {
                 self.broadcast(SystemEvent::Command { verb: "dictate".into(), args: vec!["hotkey".into()] })
             }
             Action::Launcher => self.launcher_toggle(),
+            Action::LauncherClip => self.launcher_clip_toggle(),
             Action::Combo(i) => {
                 if let Some(item) = self.cfg.combos.items.get(i).cloned() {
                     let (_, target, label) = hotkeys::split_item(&item);
@@ -2022,7 +2023,8 @@ impl App {
 
     fn register_hotkeys(&mut self) {
         let (ok, mut errors) = hotkeys::register_all(self.hwnd, &self.cfg.hotkeys);
-        let (combos, combo_errors) = hotkeys::register_combos(self.hwnd, &self.cfg.combos.items);
+        let (combos, combo_errors) =
+            hotkeys::register_combos(self.hwnd, &self.cfg.combos.items, &self.cfg.hotkeys.launcher_clip);
         self.hotkeys = ok;
         self.hotkeys.extend(combos);
         errors.extend(combo_errors);
@@ -3692,6 +3694,24 @@ impl App {
             self.launcher = None;
         }
         r
+    }
+
+    /// The clipboard hotkey: the launcher as a history of what was copied, or put it away again.
+    fn launcher_clip_toggle(&mut self) {
+        if self.launcher.is_none() {
+            match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(l) => self.launcher = Some(l),
+                Err(e) => {
+                    log!("launcher failed to start: {e}");
+                    return;
+                }
+            }
+        }
+        let (cfg, scale) = (self.cfg.launcher.clone(), self.cfg.appearance.scale);
+        if let Some(l) = self.launcher.as_mut() {
+            l.configure(cfg);
+            l.toggle_clip(&self.gfx, scale);
+        }
     }
 
     /// A combo fired: the launcher shows the thing that is opening for 0.7 seconds, without taking the

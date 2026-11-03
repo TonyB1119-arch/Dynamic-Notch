@@ -84,6 +84,8 @@ enum Kind {
     Web,
     Weather,
     Day,
+    /// An item of the clipboard history (its `path` is `clip:<id>`).
+    Clip,
 }
 
 impl Kind {
@@ -97,6 +99,7 @@ impl Kind {
             Kind::Web => "Web search",
             Kind::Weather => "Weather",
             Kind::Day => "Forecast",
+            Kind::Clip => "Clipboard",
         }
     }
     fn has_icon(self) -> bool {
@@ -117,6 +120,9 @@ enum Act {
     Quit,
     Restart,
     ForceQuit,
+    Paste,
+    CopyClip,
+    DeleteClip,
 }
 
 impl Act {
@@ -133,6 +139,9 @@ impl Act {
             Act::Quit => "Quit",
             Act::Restart => "Restart",
             Act::ForceQuit => "Force quit",
+            Act::Paste => "Paste",
+            Act::CopyClip => "Copy",
+            Act::DeleteClip => "Remove from history",
         }
     }
     fn icon(self) -> Icon {
@@ -147,6 +156,9 @@ impl Act {
             Act::Quit => Icon::Close,
             Act::Restart => Icon::Refresh,
             Act::ForceQuit => Icon::Stop,
+            Act::Paste => Icon::Clipboard,
+            Act::CopyClip => Icon::Copy,
+            Act::DeleteClip => Icon::Trash,
         }
     }
 }
@@ -161,6 +173,7 @@ fn actions(h: &Hit) -> &'static [Act] {
         Kind::Url => &[Act::OpenLink, Act::CopyPath],
         Kind::Web => &[Act::Search],
         Kind::Weather | Kind::Day => &[Act::Forecast],
+        Kind::Clip => &[Act::Paste, Act::CopyClip, Act::DeleteClip],
     }
 }
 
@@ -196,6 +209,13 @@ struct Hit {
     idx: usize,
 }
 
+/// What the launcher is for: finding things, or going through what was copied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Search,
+    Clip,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Subject,
@@ -213,6 +233,7 @@ pub struct Launcher {
     open: bool,
     /// The window is on screen (also while it fades out).
     visible: bool,
+    mode: Mode,
     /// Shown for a moment by a combo (it puts itself away).
     flashing: bool,
     /// What to show instead of search results (a combo's target).
@@ -277,6 +298,7 @@ impl Launcher {
             cfg: LauncherCfg::default(),
             open: false,
             visible: false,
+            mode: Mode::Search,
             flashing: false,
             pinned: None,
             free_me: false,
@@ -334,9 +356,20 @@ impl Launcher {
     }
 
     pub fn toggle(&mut self, gfx: &Gfx, ui_scale: f32) {
-        if self.open {
+        if self.open && self.mode == Mode::Search {
             self.hide();
         } else {
+            self.mode = Mode::Search;
+            self.show(gfx, ui_scale, true);
+        }
+    }
+
+    /// The clipboard hotkey: the launcher as a history of what was copied.
+    pub fn toggle_clip(&mut self, gfx: &Gfx, ui_scale: f32) {
+        if self.open && self.mode == Mode::Clip {
+            self.hide();
+        } else {
+            self.mode = Mode::Clip;
             self.show(gfx, ui_scale, true);
         }
     }
@@ -368,6 +401,7 @@ impl Launcher {
             on_disk.file_stem().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty()).unwrap_or(expanded)
         };
         self.pinned = Some(Hit { name, detail: String::new(), path, kind, spans: Vec::new(), idx: 0 });
+        self.mode = Mode::Search;
         self.show(gfx, ui_scale, false);
         self.flashing = true;
         unsafe {
@@ -393,7 +427,9 @@ impl Launcher {
         } else {
             self.search();
         }
-        if self.cfg.files && !self.files_started {
+        // the clipboard history is a list: it is open from the start
+        self.list_open = self.mode == Mode::Clip && !self.hits.is_empty();
+        if self.cfg.files && !self.files_started && self.mode == Mode::Search {
             self.files_started = true;
             spawn_files(self.files_slot.clone(), SendHwnd::new(self.hwnd), self.cfg.folders.clone());
         }
@@ -588,6 +624,10 @@ impl Launcher {
     // -- search -----------------------------------------------------------------------------------------
 
     fn search(&mut self) {
+        if self.mode == Mode::Clip {
+            self.clip_search();
+            return;
+        }
         self.hits.clear();
         self.wx = None;
         let q = self.query.trim().to_string();
@@ -718,6 +758,27 @@ impl Launcher {
         });
     }
 
+    /// Clipboard mode: what was copied (the letters typed narrow it down).
+    fn clip_search(&mut self) {
+        self.hits.clear();
+        self.wx = None;
+        for r in crate::cliphist::rows(&self.query) {
+            let path = format!("clip:{}", r.id);
+            if let Some(img) = r.thumb {
+                self.icons.insert(path.clone(), Some(img));
+            }
+            let kind = ["Text", "Link", "Image", "Files"][usize::from(r.code).min(3)];
+            self.hits.push(Hit {
+                name: r.summary,
+                detail: format!("{kind} · {}", logic::ago(r.age_secs)),
+                path,
+                kind: Kind::Clip,
+                spans: Vec::new(),
+                idx: usize::from(r.code),
+            });
+        }
+    }
+
     /// Nothing typed yet: the apps used most.
     fn recent(&mut self) {
         let mut used: Vec<(&String, &u32)> = self.usage.iter().collect();
@@ -835,8 +896,29 @@ impl Launcher {
         let a = acts[self.act.min(acts.len() - 1)];
         let hwnd = self.hwnd;
         let typed = self.query.trim().to_ascii_lowercase();
+        if a == Act::DeleteClip {
+            // stays open: the item just leaves the list
+            if let Some(id) = clip_id(&h.path) {
+                crate::cliphist::remove(id);
+            }
+            let keep = self.sel;
+            self.focus = Focus::Subject;
+            self.act = 0;
+            self.search();
+            self.sel = keep.min(self.hits.len().saturating_sub(1));
+            self.kick();
+            return;
+        }
         self.hide();
         match a {
+            Act::Paste | Act::CopyClip => {
+                if let Some(id) = clip_id(&h.path) {
+                    if crate::cliphist::copy_back(hwnd, id) && a == Act::Paste {
+                        paste_soon();
+                    }
+                }
+            }
+            Act::DeleteClip => {}
             Act::Open | Act::OpenLink | Act::Search | Act::Forecast => sys::shell_open(&h.path),
             Act::Admin => run_as_admin(&h.path),
             Act::Reveal => sys::shell_reveal(&h.path),
@@ -904,7 +986,7 @@ impl Launcher {
         let has_rows = !self.hits.is_empty();
         match VIRTUAL_KEY(vk) {
             VK_ESCAPE => {
-                if self.list_open {
+                if self.list_open && self.mode == Mode::Search {
                     self.list_open = false;
                 } else {
                     self.hide();
@@ -953,7 +1035,7 @@ impl Launcher {
             }
             VK_UP => {
                 if self.list_open {
-                    if self.cursor() == 0 {
+                    if self.cursor() == 0 && self.mode == Mode::Search {
                         self.list_open = false;
                     } else {
                         self.step(-1);
@@ -992,6 +1074,15 @@ impl Launcher {
                     self.query.pop();
                 }
                 self.changed();
+            }
+            // clipboard mode: Delete takes the item out of the history
+            VK_DELETE if self.mode == Mode::Clip && has_rows => {
+                if let Some(id) = self.cur().and_then(|h| clip_id(&h.path)) {
+                    crate::cliphist::remove(id);
+                }
+                let keep = self.sel;
+                self.search();
+                self.sel = keep.min(self.hits.len().saturating_sub(1));
             }
             VK_DELETE => {
                 self.query.clear();
@@ -1318,6 +1409,7 @@ impl Launcher {
                 ul: self.ul,
                 tr: &tr,
                 ready: self.apps_ready,
+                clip: self.mode == Mode::Clip,
             };
             draw_subject(&mut p, sub, &subject);
             draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &tr);
@@ -1336,6 +1428,7 @@ impl Launcher {
                     sel_y: self.sel_y,
                     ul: self.ul,
                     wx: wx.as_deref(),
+                    clip: self.mode == Mode::Clip,
                 };
                 draw_list(&mut p, &view);
                 p.pop_clip();
@@ -1439,6 +1532,19 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Op
             p.text("=", r, &TextStyle::new(r.w * 0.55, white(0.92)).semibold().center());
         }
         Kind::Url | Kind::Web => p.icon(Icon::Globe, r.inset(r.w * 0.1), white(0.9)),
+        Kind::Clip => match img {
+            Some(i) => p.image(i, r, 5.0, 1.0),
+            None => {
+                p.fill_rounded(r, r.w * 0.26, white(0.12));
+                let glyph = match h.idx {
+                    1 => Icon::Link,
+                    2 => Icon::Image,
+                    3 => Icon::File,
+                    _ => Icon::Clipboard,
+                };
+                p.icon(glyph, r.inset(r.w * 0.22), white(0.85));
+            }
+        },
         Kind::Weather => match wx {
             Some(b) => b.draw_icon(p, r),
             None => p.icon(Icon::Cloud, r.inset(r.w * 0.1), white(0.9)),
@@ -1472,11 +1578,21 @@ struct Look<'a> {
     ul: f32,
     tr: &'a Tr,
     ready: bool,
+    clip: bool,
 }
 
 fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     let cx = r.cx();
     let Some(h) = v.cur else {
+        if v.clip {
+            p.icon(Icon::Clipboard, Rect::centered(cx, r.y + 68.0, 52.0, 52.0), white(0.55));
+            p.text(
+                "Nothing copied yet",
+                Rect::new(r.x + 10.0, r.y + 118.0, r.w - 20.0, 20.0),
+                &TextStyle::new(11.5, white(0.80)).semibold().center(),
+            );
+            return;
+        }
         type_glyph(p, cx, r.y + 68.0, white(0.62));
         let msg = if v.ready { "Type…" } else { "Getting ready…" };
         p.text(
@@ -1486,6 +1602,10 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
         );
         return;
     };
+    if h.kind == Kind::Clip {
+        draw_clip_preview(p, r, h, v);
+        return;
+    }
     let a0 = p.alpha;
     // a new match pops in: the picture swells from 80% with a little overshoot, the words fade up
     let fade = logic::ease_out((v.pop * 1.6).min(1.0));
@@ -1544,6 +1664,37 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     p.alpha = a0;
 }
 
+/// The left box in clipboard mode: the picture, or the first lines of the words.
+fn draw_clip_preview(p: &mut Painter, r: Rect, h: &Hit, v: &Look) {
+    let a0 = p.alpha;
+    let fade = logic::ease_out((v.pop * 1.6).min(1.0));
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    match (h.idx, v.icon) {
+        (2, Some(img)) => {
+            p.image_zoom(img, Rect::new(r.x + 14.0, r.y + 14.0, r.w - 28.0, r.h - 50.0), 10.0, 1.0, 0.0);
+        }
+        (2, None) => p.icon(Icon::Image, Rect::centered(r.cx(), r.y + 66.0, 52.0, 52.0), white(0.55)),
+        _ => {
+            let text = clip_id(&h.path).and_then(crate::cliphist::preview).unwrap_or_else(|| h.name.clone());
+            let st = TextStyle::new(12.0, white(0.88));
+            for (i, line) in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(6).enumerate() {
+                p.text(
+                    &logic::mid(line, 24),
+                    Rect::new(r.x + 14.0, r.y + 14.0 + i as f32 * 20.0, r.w - 28.0, 20.0),
+                    &st,
+                );
+            }
+        }
+    }
+    p.alpha = a0 * fade;
+    p.text(
+        &h.detail,
+        Rect::new(r.x + 10.0, r.bottom() - 32.0, r.w - 20.0, 18.0),
+        &TextStyle::new(10.5, white(0.55)).center(),
+    );
+    p.alpha = a0;
+}
+
 fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, _focused: bool, pop: f32, tr: &Tr) {
     let cx = r.cx();
     let Some(h) = cur else { return };
@@ -1583,6 +1734,7 @@ struct ListView<'a> {
     sel_y: f32,
     ul: f32,
     wx: Option<&'a Brief>,
+    clip: bool,
 }
 
 /// The list drops down: the card grows, each row fades and slides in as the edge passes it, and the
@@ -1599,6 +1751,15 @@ fn draw_list(p: &mut Painter, v: &ListView) {
             Some(h) => format!("Actions for “{}”", logic::mid(&h.name, 30)),
             None => return,
         },
+        Focus::Subject if v.clip => {
+            let n = v.hits.len();
+            let count = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+            if v.query.trim().is_empty() {
+                format!("Clipboard  ·  {count}")
+            } else {
+                format!("{count}  ·  “{}”", logic::mid(v.query.trim(), 24))
+            }
+        }
         Focus::Subject if v.query.trim().is_empty() => "Used most".to_string(),
         Focus::Subject => {
             let n = v.hits.iter().filter(|h| h.kind.has_icon()).count();
@@ -1804,6 +1965,23 @@ fn restart_app(exe: String, path: String) {
                 forced = true;
                 taskkill(&exe, true);
             }
+        }
+    });
+}
+
+/// The id of a clipboard history item (`clip:<id>`).
+fn clip_id(path: &str) -> Option<u64> {
+    path.strip_prefix("clip:")?.parse().ok()
+}
+
+/// Press Ctrl+V a moment from now, when the window that had the focus before has it back.
+fn paste_soon() {
+    let _ = std::thread::Builder::new().name("launcher-paste".into()).spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let v = VIRTUAL_KEY(0x56);
+        let keys = [key_input(VK_CONTROL, false), key_input(v, false), key_input(v, true), key_input(VK_CONTROL, true)];
+        unsafe {
+            SendInput(&keys, size_of::<INPUT>() as i32);
         }
     });
 }
@@ -2360,6 +2538,17 @@ mod logic {
         out
     }
 
+    /// "just now", "5m ago", "3h ago", "2d ago".
+    pub fn ago(secs: u64) -> String {
+        match secs {
+            0..=9 => "just now".to_string(),
+            10..=59 => format!("{secs}s ago"),
+            60..=3599 => format!("{}m ago", secs / 60),
+            3600..=86399 => format!("{}h ago", secs / 3600),
+            _ => format!("{}d ago", secs / 86400),
+        }
+    }
+
     pub fn num(v: f64) -> String {
         if v == v.trunc() && v.abs() < 1e15 {
             return format!("{}", v as i64);
@@ -2560,6 +2749,15 @@ mod logic {
             assert!(real > slip);
             assert_eq!(distance(b"chrome", b"chorme"), 1);
             assert_eq!(distance(b"abc", b"abcd"), 1);
+        }
+
+        #[test]
+        fn ages() {
+            assert_eq!(ago(3), "just now");
+            assert_eq!(ago(45), "45s ago");
+            assert_eq!(ago(300), "5m ago");
+            assert_eq!(ago(7300), "2h ago");
+            assert_eq!(ago(200_000), "2d ago");
         }
 
         #[test]

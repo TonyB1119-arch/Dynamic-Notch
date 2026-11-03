@@ -151,6 +151,13 @@ impl Module for Clipboard {
                 }
                 let Some(read) = read_clipboard(self.hwnd.hwnd()) else { return };
                 let (kind, dib) = read;
+                // the launcher's clipboard mode keeps its own, longer history
+                let hist = match &kind {
+                    Kind::Text(t) => crate::cliphist::Content::Text(t.clone()),
+                    Kind::Files(f) => crate::cliphist::Content::Files(f.clone()),
+                    Kind::Image { w, h } => crate::cliphist::Content::Image { w: *w, h: *h },
+                };
+                let hid = crate::cliphist::add(hist, dib.as_deref());
                 let id = self.push(kind);
                 if let Some(bytes) = dib {
                     let bus = cx.bus.clone();
@@ -162,6 +169,9 @@ impl Module for Clipboard {
                             );
                         }
                         let img = image::decode(&bytes, 160);
+                        if let Some(i) = &img {
+                            crate::cliphist::set_thumb(hid, i.clone());
+                        }
                         bus.to_module(ID, Thumb(id, img));
                     });
                 }
