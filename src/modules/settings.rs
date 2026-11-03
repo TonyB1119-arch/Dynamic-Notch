@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 11.0,
+        8 => 14.0,
         _ => 25.0,
     }
 }
@@ -1005,6 +1005,28 @@ impl Settings {
             "rim_bright",
         );
         toggle_row(ui, row_rect(body, 10), "Melt into the screen edge", d.melt, "dock", "melt");
+        let l = self.cfg.launcher.clone();
+        slider_row(
+            ui,
+            row_rect(body, 11),
+            "Launcher blur",
+            l.blur,
+            (0.0, 1.0),
+            format!("{:.0}%", l.blur * 100.0),
+            "launcher",
+            "blur",
+        );
+        slider_row(
+            ui,
+            row_rect(body, 12),
+            "Launcher darkness",
+            l.dark,
+            (0.2, 0.95),
+            format!("{:.0}%", l.dark * 100.0),
+            "launcher",
+            "dark",
+        );
+        toggle_row(ui, row_rect(body, 13), "Launcher animations", l.animate, "launcher", "animate");
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {

@@ -400,6 +400,11 @@ impl Res {
         self.halo_y = y;
     }
 
+    /// Drop one cached picture (its id is not used again).
+    pub fn forget(&mut self, id: u64) {
+        self.bitmaps.remove(&id);
+    }
+
     /// Drop cached bitmaps that are not used right now (they are re-uploaded on demand).
     pub fn trim_bitmaps(&mut self) {
         // after a while with nothing on screen, give back everything that can be rebuilt on demand
@@ -1197,6 +1202,36 @@ impl<'a> Painter<'a> {
             cb.brush.SetOpacity(opacity * self.alpha);
             let rad = radius.min(area.w * 0.5).min(area.h * 0.5);
             let rr = D2D1_ROUNDED_RECT { rect: rf(area), radiusX: rad, radiusY: rad };
+            self.dc.FillRoundedRectangle(&rr, &cb.brush);
+        }
+    }
+
+    /// A picture stretched over `dest`, showing only the rounded rectangle `clip` of it. The picture stays
+    /// where it is while `clip` changes size, so a growing card uncovers more of the same picture.
+    pub fn image_window(&mut self, img: &ImageData, dest: Rect, clip: Rect, radius: f32, opacity: f32) {
+        if dest.w <= 0.5 || dest.h <= 0.5 || clip.w <= 0.5 || clip.h <= 0.5 {
+            return;
+        }
+        let frame = self.res.frame;
+        if !self.res.bitmaps.contains_key(&img.id) {
+            let Some(cb) = self.create_bitmap(img) else { return };
+            self.res.bitmaps.insert(img.id, cb);
+        }
+        let cb = self.res.bitmaps.get_mut(&img.id).unwrap();
+        cb.last_used = frame;
+        let m = Matrix3x2 {
+            M11: dest.w / cb.w as f32,
+            M12: 0.0,
+            M21: 0.0,
+            M22: dest.h / cb.h as f32,
+            M31: dest.x,
+            M32: dest.y,
+        };
+        unsafe {
+            cb.brush.SetTransform(&m);
+            cb.brush.SetOpacity(opacity * self.alpha);
+            let rad = radius.min(clip.w * 0.5).min(clip.h * 0.5);
+            let rr = D2D1_ROUNDED_RECT { rect: rf(clip), radiusX: rad, radiusY: rad };
             self.dc.FillRoundedRectangle(&rr, &cb.brush);
         }
     }

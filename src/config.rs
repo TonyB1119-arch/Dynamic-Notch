@@ -412,25 +412,38 @@ pub struct LauncherCfg {
     pub files: bool,
     /// More folders to search for files.
     pub folders: Vec<String>,
-    /// How solid the glass is (0.1 = nearly clear, 1.0 = solid).
-    pub opacity: f32,
+    /// How much the picture behind the window is blurred (0 = not at all, 1 = a lot).
+    pub blur: f32,
+    /// How dark the glass is (higher = darker).
+    pub dark: f32,
+    /// Opening, closing, the list dropping down and the underline all move.
+    pub animate: bool,
     /// Where a web search goes; what you typed is added at the end.
     pub search_url: String,
 }
 
 impl Default for LauncherCfg {
     fn default() -> Self {
-        Self { files: true, folders: Vec::new(), opacity: 0.6, search_url: "https://www.google.com/search?q=".to_string() }
+        Self {
+            files: true,
+            folders: Vec::new(),
+            blur: 0.7,
+            dark: 0.55,
+            animate: true,
+            search_url: "https://www.google.com/search?q=".to_string(),
+        }
     }
 }
 
 impl LauncherCfg {
     fn clamped(&mut self) {
-        self.opacity = self.opacity.clamp(0.1, 1.0);
+        self.blur = self.blur.clamp(0.0, 1.0);
+        self.dark = self.dark.clamp(0.2, 0.95);
         self.folders.truncate(20);
         let u = self.search_url.trim().to_string();
         // only web addresses: what is typed in the launcher is handed to the browser
-        self.search_url = if u.starts_with("https://") || u.starts_with("http://") { u } else { Self::default().search_url };
+        self.search_url =
+            if u.starts_with("https://") || u.starts_with("http://") { u } else { Self::default().search_url };
     }
 }
 
@@ -1161,14 +1174,18 @@ glass = true
 items = ['Explorer|%WINDIR%\explorer.exe']
 
 [launcher]
-# A quick search (hotkey above): apps, files, sums like 12*(3+4), web addresses and web search.
-# Press Down to see the list of matches, Tab to pick what to do with the match.
+# A quick search (hotkey above): apps, files, sums like 12*(3+4), the weather ("cast"), web addresses
+# and web search. Press Down to see the list of matches, Tab to pick what to do with the match.
 # Also find files and folders in Desktop, Documents, Downloads, Pictures, Videos and Music
 files = true
 # More folders to search, for example folders = ['D:\Projects']
 folders = []
-# How solid the glass is (0.1 = nearly clear, 1.0 = solid)
-opacity = 0.6
+# How much the picture behind the window is blurred (0 = not at all, 1 = a lot)
+blur = 0.7
+# How dark the glass is (0.2 = light, 0.95 = almost black)
+dark = 0.55
+# Opening, closing, the list dropping down and the underline move
+animate = true
 # Where a web search goes; what you typed is added at the end
 search_url = "https://www.google.com/search?q="
 

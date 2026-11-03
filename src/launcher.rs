@@ -6,6 +6,11 @@
 //! Pictures, Videos, Music and the folders in `[launcher] folders`), answers sums like `12*(3+4)`,
 //! opens web addresses and falls back to a web search.
 //!
+//! Look: dark glass. The picture behind the window is copied when it opens, blurred once and drawn
+//! inside the card, so the blur works everywhere and moves with the card. Everything animates (the
+//! window opening and closing, the list dropping down, the highlight sliding, the underline growing);
+//! the animation timer runs only while something is moving.
+//!
 //! Cost: nothing exists until the hotkey is pressed for the first time. The window, its drawing
 //! surface and the lists are built then; 20 seconds after it closes the drawing memory is handed
 //! back, and after five minutes everything is gone again. While it is closed it uses no CPU.
@@ -36,6 +41,7 @@ use windows::UI::Composition::Compositor;
 use crate::config::LauncherCfg;
 use crate::gfx::{Gfx, Icon, ImageData, Painter, Res, TextStyle};
 use crate::host::Host;
+use crate::modules::weather::Brief;
 use crate::sys::{self, clip, dragdrop};
 use crate::util::{app_dir, Color, Rect, SendHwnd};
 
@@ -75,6 +81,8 @@ enum Kind {
     Calc,
     Url,
     Web,
+    Weather,
+    Day,
 }
 
 impl Kind {
@@ -86,6 +94,8 @@ impl Kind {
             Kind::Calc => "Calculator",
             Kind::Url => "Link",
             Kind::Web => "Web search",
+            Kind::Weather => "Weather",
+            Kind::Day => "Forecast",
         }
     }
     fn has_icon(self) -> bool {
@@ -102,6 +112,7 @@ enum Act {
     CopyResult,
     OpenLink,
     Search,
+    Forecast,
 }
 
 impl Act {
@@ -114,6 +125,7 @@ impl Act {
             Act::CopyResult => "Copy result",
             Act::OpenLink => "Open link",
             Act::Search => "Search the web",
+            Act::Forecast => "Open forecast",
         }
     }
     fn icon(self) -> Icon {
@@ -124,6 +136,7 @@ impl Act {
             Act::CopyPath | Act::CopyResult => Icon::Copy,
             Act::OpenLink => Icon::Link,
             Act::Search => Icon::Globe,
+            Act::Forecast => Icon::Cloud,
         }
     }
 }
@@ -137,6 +150,7 @@ fn actions(h: &Hit) -> &'static [Act] {
         Kind::Calc => &[Act::CopyResult],
         Kind::Url => &[Act::OpenLink, Act::CopyPath],
         Kind::Web => &[Act::Search],
+        Kind::Weather | Kind::Day => &[Act::Forecast],
     }
 }
 
@@ -168,6 +182,8 @@ struct Hit {
     kind: Kind,
     /// Matched letters, as byte ranges of `name`.
     spans: Vec<(usize, usize)>,
+    /// Which day of the forecast (Weather rows).
+    idx: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,7 +199,10 @@ pub struct Launcher {
     host: Host,
     res: Res,
     cfg: LauncherCfg,
+    /// Taking input (false while it fades out).
     open: bool,
+    /// The window is on screen (also while it fades out).
+    visible: bool,
     free_me: bool,
     scale: f32,
     win_px: (i32, i32, i32, i32),
@@ -207,8 +226,24 @@ pub struct Launcher {
     list_open: bool,
     high: Option<u16>,
     mouse: (f32, f32),
+    // animation: all of these move toward where they belong while the timer runs
+    timer_on: bool,
+    last_tick: Instant,
+    /// Window opening (1) and closing (0).
     anim: f32,
-    anim_at: Instant,
+    /// Height of the dropped-down list, in dips.
+    lh: f32,
+    /// Underline growing, the icon popping in (box 1 and box 2): 0 to 1.
+    ul: f32,
+    pop_s: f32,
+    pop_a: f32,
+    /// Which box has the focus (0 = left, 1 = right).
+    focus_t: f32,
+    /// The highlighted row, as a (moving) row number.
+    sel_y: f32,
+    /// The blurred picture of the screen behind the window.
+    blur_img: Option<ImageData>,
+    wx: Option<std::rc::Rc<crate::modules::weather::Brief>>,
     scratch: Vec<usize>,
 }
 
@@ -225,6 +260,7 @@ impl Launcher {
             res,
             cfg: LauncherCfg::default(),
             open: false,
+            visible: false,
             free_me: false,
             scale: 1.0,
             win_px: (0, 0, 0, 0),
@@ -246,8 +282,17 @@ impl Launcher {
             list_open: false,
             high: None,
             mouse: (-1.0, -1.0),
-            anim: 1.0,
-            anim_at: Instant::now(),
+            timer_on: false,
+            last_tick: Instant::now(),
+            anim: 0.0,
+            lh: 0.0,
+            ul: 1.0,
+            pop_s: 1.0,
+            pop_a: 1.0,
+            focus_t: 0.0,
+            sel_y: 0.0,
+            blur_img: None,
+            wx: None,
             scratch: Vec::new(),
         })
     }
@@ -278,6 +323,8 @@ impl Launcher {
     }
 
     fn show(&mut self, gfx: &Gfx, ui_scale: f32) {
+        // asked again while it was still fading out: the window is already there
+        let again = self.visible;
         self.query.clear();
         self.hits.clear();
         self.sel = 0;
@@ -293,16 +340,34 @@ impl Launcher {
             self.files_started = true;
             spawn_files(self.files_slot.clone(), SendHwnd::new(self.hwnd), self.cfg.folders.clone());
         }
-        if !self.place(ui_scale) {
-            return;
+        if !again {
+            if !self.place(ui_scale) {
+                return;
+            }
+            // the screen behind the window, copied before the window is shown
+            let (x, y, w, h) = self.win_px;
+            if let Some(old) = self.blur_img.take() {
+                self.res.forget(old.id);
+            }
+            self.blur_img = capture_blur(x, y, w, h, self.cfg.blur);
+            self.anim = 0.0;
+            self.lh = 0.0;
+            self.focus_t = 0.0;
+            self.sel_y = 0.0;
+            // our own blur is used: switch the system backdrop off
+            self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         }
         self.open = true;
-        self.anim = 0.0;
-        self.anim_at = Instant::now();
+        self.visible = true;
+        self.ul = 0.0;
+        self.pop_s = 0.0;
+        self.pop_a = 0.0;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_TRIM);
             let _ = KillTimer(Some(self.hwnd), T_FREE);
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            if !again {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
             if !SetForegroundWindow(self.hwnd).as_bool() || GetForegroundWindow() != self.hwnd {
                 // Windows only lets the window in front take the focus: a harmless key tap unlocks it
                 let inputs = [key_input(VK_MENU, false), key_input(VK_MENU, true)];
@@ -310,25 +375,102 @@ impl Launcher {
                 let _ = SetForegroundWindow(self.hwnd);
             }
             let _ = SetFocus(Some(self.hwnd));
-            SetTimer(Some(self.hwnd), T_ANIM, 15, None);
         }
         self.draw(gfx);
     }
 
+    /// Start closing: it fades out, then `finish_hide` puts the window away.
     pub fn hide(&mut self) {
         if !self.open {
             return;
         }
         self.open = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_ICON);
+        }
+        self.kick();
+    }
+
+    fn finish_hide(&mut self) {
+        self.visible = false;
         self.query.clear();
         self.hits.clear();
         self.list_open = false;
+        self.lh = 0.0;
+        self.wx = None;
+        if let Some(old) = self.blur_img.take() {
+            self.res.forget(old.id);
+        }
         unsafe {
-            let _ = KillTimer(Some(self.hwnd), T_ANIM);
-            let _ = KillTimer(Some(self.hwnd), T_ICON);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             SetTimer(Some(self.hwnd), T_TRIM, 20_000, None);
         }
+    }
+
+    // -- animation ---------------------------------------------------------------------------------------
+
+    /// Ask for animation frames: the timer runs while something is still moving and stops by itself.
+    fn kick(&mut self) {
+        if self.timer_on {
+            return;
+        }
+        self.timer_on = true;
+        self.last_tick = Instant::now();
+        unsafe {
+            SetTimer(Some(self.hwnd), T_ANIM, 15, None);
+        }
+    }
+
+    /// How tall the list wants to be.
+    fn list_target(&self) -> f32 {
+        let rows = self.rows_len();
+        if self.list_open && rows > 0 {
+            HEAD + rows.min(VIS) as f32 * ROW + 10.0
+        } else {
+            0.0
+        }
+    }
+
+    fn sel_target(&self) -> f32 {
+        self.cursor().saturating_sub(self.view_top()) as f32
+    }
+
+    fn needs_anim(&self) -> bool {
+        let open_to = if self.open { 1.0 } else { 0.0 };
+        let focus_to = if self.focus == Focus::Action { 1.0 } else { 0.0 };
+        self.anim != open_to
+            || (self.lh - self.list_target()).abs() > 0.3
+            || self.ul < 1.0
+            || self.pop_s < 1.0
+            || self.pop_a < 1.0
+            || (self.focus_t - focus_to).abs() > 0.01
+            || (self.sel_y - self.sel_target()).abs() > 0.01
+    }
+
+    /// Move everything a little closer to where it belongs. True while something is still moving.
+    fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
+        self.last_tick = now;
+        let snap = !self.cfg.animate;
+        let open_to = if self.open { 1.0 } else { 0.0 };
+        let dur = if self.open { 0.20 } else { 0.13 };
+        self.anim = if snap { open_to } else { logic::toward(self.anim, open_to, dt / dur) };
+        let lt = self.list_target();
+        self.lh = if snap { lt } else { logic::follow(self.lh, lt, dt, 15.0, 0.3) };
+        self.ul = if snap { 1.0 } else { logic::toward(self.ul, 1.0, dt / 0.32) };
+        self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.30) };
+        self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.30) };
+        let ft = if self.focus == Focus::Action { 1.0 } else { 0.0 };
+        self.focus_t = if snap { ft } else { logic::follow(self.focus_t, ft, dt, 18.0, 0.01) };
+        let st = self.sel_target();
+        // a list that is just opening, or a jump over many rows, does not slide
+        self.sel_y = if snap || self.lh < 1.0 || (st - self.sel_y).abs() > 7.0 {
+            st
+        } else {
+            logic::follow(self.sel_y, st, dt, 24.0, 0.01)
+        };
+        self.needs_anim()
     }
 
     /// The window goes in the upper part of the screen the pointer is on.
@@ -381,10 +523,47 @@ impl Launcher {
 
     fn search(&mut self) {
         self.hits.clear();
+        self.wx = None;
         let q = self.query.trim().to_string();
         if q.is_empty() {
             self.recent();
             return;
+        }
+        if logic::weather_query(&q) {
+            self.wx = crate::modules::weather::brief();
+            let search = self.cfg.search_url.clone();
+            match self.wx.clone() {
+                Some(b) => {
+                    let url = format!("{search}{}", logic::enc(&format!("weather {}", b.place)));
+                    self.hits.push(Hit {
+                        name: format!("{:.0}{}", b.temp, b.unit()),
+                        detail: format!("{} · {}", b.label, b.place),
+                        path: url.clone(),
+                        kind: Kind::Weather,
+                        spans: Vec::new(),
+                        idx: 0,
+                    });
+                    for (i, d) in b.days.iter().take(5).enumerate() {
+                        let rain = d.rain.map(|r| format!("  ·  rain {r:.0}%")).unwrap_or_default();
+                        self.hits.push(Hit {
+                            name: d.label.clone(),
+                            detail: format!("{:.0}° / {:.0}°{rain}", d.hi, d.lo),
+                            path: url.clone(),
+                            kind: Kind::Day,
+                            spans: Vec::new(),
+                            idx: i,
+                        });
+                    }
+                }
+                None => self.hits.push(Hit {
+                    name: "--".into(),
+                    detail: "No weather yet: set your city in Settings".into(),
+                    path: format!("{search}{}", logic::enc("weather")),
+                    kind: Kind::Weather,
+                    spans: Vec::new(),
+                    idx: 0,
+                }),
+            }
         }
         if let Some(r) = logic::calc(&q) {
             self.hits.push(Hit {
@@ -393,6 +572,7 @@ impl Launcher {
                 path: String::new(),
                 kind: Kind::Calc,
                 spans: Vec::new(),
+                idx: 0,
             });
         } else if let Some(u) = logic::as_url(&q) {
             self.hits.push(Hit {
@@ -401,6 +581,7 @@ impl Launcher {
                 path: u,
                 kind: Kind::Url,
                 spans: Vec::new(),
+                idx: 0,
             });
         }
         let ql = q.to_ascii_lowercase();
@@ -441,6 +622,7 @@ impl Launcher {
                 path: e.path.to_string(),
                 kind: e.kind,
                 spans: logic::spans(&pos),
+                idx: 0,
             });
         }
         self.scratch = pos;
@@ -451,6 +633,7 @@ impl Launcher {
             path: url,
             kind: Kind::Web,
             spans: Vec::new(),
+            idx: 0,
         });
     }
 
@@ -467,6 +650,7 @@ impl Launcher {
                     path: e.path.to_string(),
                     kind: Kind::App,
                     spans: Vec::new(),
+                    idx: 0,
                 });
             }
         }
@@ -474,11 +658,21 @@ impl Launcher {
 
     /// The text changed: start again from the best match.
     fn changed(&mut self) {
+        let before = self.cur().map(|h| (h.path.clone(), h.kind));
         self.focus = Focus::Subject;
         self.sel = 0;
         self.top = 0;
         self.act = 0;
         self.search();
+        if self.cur().map(|h| (h.path.clone(), h.kind)) != before {
+            // a different best match: everything about it comes in again
+            self.ul = 0.0;
+            self.pop_s = 0.0;
+            self.pop_a = 0.0;
+        } else {
+            // the same one with more letters underlined: only the underline grows
+            self.ul = self.ul.min(0.5);
+        }
         if self.hits.is_empty() {
             self.list_open = false;
         }
@@ -516,6 +710,9 @@ impl Launcher {
                 if i != self.sel {
                     self.sel = i;
                     self.act = 0;
+                    self.ul = 0.0;
+                    self.pop_s = 0.0;
+                    self.pop_a = 0.0;
                 }
                 if i < self.top {
                     self.top = i;
@@ -523,7 +720,12 @@ impl Launcher {
                     self.top = i + 1 - VIS;
                 }
             }
-            Focus::Action => self.act = i,
+            Focus::Action => {
+                if i != self.act {
+                    self.act = i;
+                    self.pop_a = 0.0;
+                }
+            }
         }
     }
 
@@ -553,7 +755,7 @@ impl Launcher {
         let hwnd = self.hwnd;
         self.hide();
         match a {
-            Act::Open | Act::OpenLink | Act::Search => sys::shell_open(&h.path),
+            Act::Open | Act::OpenLink | Act::Search | Act::Forecast => sys::shell_open(&h.path),
             Act::Admin => run_as_admin(&h.path),
             Act::Reveal => sys::shell_reveal(&h.path),
             Act::CopyPath => {
@@ -793,13 +995,18 @@ impl Launcher {
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == T_ANIM => {
-                self.anim = (self.anim_at.elapsed().as_secs_f32() / 0.12).min(1.0);
-                if self.anim >= 1.0 {
+                let more = self.tick();
+                if !more {
                     unsafe {
                         let _ = KillTimer(Some(self.hwnd), T_ANIM);
                     }
+                    self.timer_on = false;
                 }
-                self.draw(gfx);
+                if !self.open && self.anim <= 0.0 {
+                    self.finish_hide();
+                } else {
+                    self.draw(gfx);
+                }
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == T_ICON => {
@@ -824,7 +1031,7 @@ impl Launcher {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), T_FREE);
                 }
-                if !self.open {
+                if !self.open && !self.visible {
                     self.free_me = true;
                 }
                 Some(LRESULT(0))
@@ -892,8 +1099,11 @@ impl Launcher {
     }
 
     fn draw(&mut self, gfx: &Gfx) {
-        if !self.open || self.win_px.2 == 0 {
+        if !self.visible || self.win_px.2 == 0 {
             return;
+        }
+        if self.needs_anim() {
+            self.kick();
         }
         let missing = self.load_icons();
         if missing {
@@ -902,47 +1112,83 @@ impl Launcher {
             }
         }
         let sc = self.scale;
-        let a = self.anim.clamp(0.0, 1.0);
-        let t = 1.0 - (1.0 - a) * (1.0 - a) * (1.0 - a);
-        let rows = self.rows_len();
-        let list = self.list_open && rows > 0;
-        let shown = rows.min(VIS);
-        let card_h = if list { FRAME_H + HEAD + shown as f32 * ROW + 10.0 } else { FRAME_H };
-        self.set_region(card_h);
-        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, W * sc, card_h * sc), CARD_R * sc, self.cfg.opacity * t);
+        let e = logic::ease_out(self.anim);
+        let shown = self.rows_len().min(VIS);
+        let card_h = FRAME_H + self.lh.max(0.0);
+        // clicks land on the card only: the region is as tall as the card is (or is about to be)
+        self.set_region(FRAME_H + self.lh.max(self.list_target()));
         let cur = self.cur().cloned();
         let vtop = self.view_top();
+        let wx = self.wx.clone();
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
-            Err(e) => {
-                crate::log!("launcher: begin_draw failed: {e}");
+            Err(err) => {
+                crate::log!("launcher: begin_draw failed: {err}");
                 return;
             }
         };
         {
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
-            p.alpha = t;
+            p.alpha = e;
+            // opening: grows from 94% and settles down from a little above; closing runs it backwards
+            let tr = Tr { s0: 0.94 + 0.06 * e, top: (1.0 - e) * -8.0 };
+            card_xf(&mut p, &tr);
             let card = Rect::new(0.0, 0.0, W, card_h);
-            // a little dark tint keeps the text readable on any picture behind the glass
-            p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, 0.32));
-            p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, Color::white(0.22));
+            let dark = self.cfg.dark;
+            match &self.blur_img {
+                Some(img) => {
+                    let whole = Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc);
+                    p.image_window(img, whole, card, CARD_R, 1.0);
+                    p.fill_rounded(card, CARD_R, Color::rgba(0.03, 0.03, 0.05, dark));
+                }
+                // no picture of the screen: a solid dark card
+                None => p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, dark.max(0.9))),
+            }
+            p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, white(0.20));
             let sub = Rect::new(PAD, PAD, BOX, BOX);
             let act = Rect::new(PAD + BOX + GAP, PAD, BOX, BOX);
-            for (r, on) in [(sub, self.focus == Focus::Subject), (act, self.focus == Focus::Action)] {
-                p.fill_rounded(r, BOX_R, Color::white(if on { 0.17 } else { 0.09 }));
-                let w = if on { 1.6 } else { 1.0 };
-                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(if on { 0.55 } else { 0.15 }));
+            // the focus glides from one box to the other
+            let ft = self.focus_t;
+            for (r, on) in [(sub, 1.0 - ft), (act, ft)] {
+                p.fill_rounded(r, BOX_R, white(0.09 + 0.08 * on));
+                let w = 1.0 + 0.6 * on;
+                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, white(0.15 + 0.40 * on));
             }
             let icon = cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
-            draw_subject(&mut p, sub, cur.as_ref(), icon, self.apps_ready);
-            draw_action(&mut p, act, cur.as_ref(), self.act, self.focus == Focus::Action);
-            if list {
-                draw_list(&mut p, &self.hits, &self.icons, &self.query, self.focus, self.sel, vtop, self.act, shown);
+            let subject = Look {
+                cur: cur.as_ref(),
+                icon,
+                wx: wx.as_deref(),
+                pop: self.pop_s,
+                ul: self.ul,
+                tr: &tr,
+                ready: self.apps_ready,
+            };
+            draw_subject(&mut p, sub, &subject);
+            draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &tr);
+            if self.lh > 1.0 {
+                p.push_clip(card);
+                let view = ListView {
+                    hits: &self.hits,
+                    icons: &self.icons,
+                    query: &self.query,
+                    focus: self.focus,
+                    sel: self.sel,
+                    top: vtop,
+                    act: self.act,
+                    shown,
+                    lh: self.lh,
+                    sel_y: self.sel_y,
+                    ul: self.ul,
+                    wx: wx.as_deref(),
+                };
+                draw_list(&mut p, &view);
+                p.pop_clip();
             }
         }
-        if let Err(e) = self.host.end_draw() {
-            crate::log!("launcher: end_draw failed: {e}");
+        if let Err(err) = self.host.end_draw() {
+            crate::log!("launcher: end_draw failed: {err}");
         }
         self.res.end_frame();
     }
@@ -970,9 +1216,29 @@ fn magnifier(p: &Painter, cx: f32, cy: f32, c: Color) {
     p.line(cx + 7.5, cy + 7.5, cx + 20.0, cy + 20.0, 4.5, c);
 }
 
-/// A thin line under the letters that matched what was typed.
-fn underline(p: &mut Painter, text: &str, spans: &[(usize, usize)], r: Rect, st: &TextStyle, center: bool) {
-    if spans.is_empty() {
+/// How the card sits at this moment (it grows and slides while opening and closing).
+struct Tr {
+    s0: f32,
+    top: f32,
+}
+
+/// The point the card grows from.
+const ANCHOR: (f32, f32) = (W * 0.5, 30.0);
+
+fn card_xf(p: &mut Painter, t: &Tr) {
+    p.set_local(t.s0, ANCHOR.0, ANCHOR.1, 0.0, t.top);
+}
+
+/// Scale one thing by `k` around (cx, cy), on top of the card's own transform.
+fn pop_xf(p: &mut Painter, t: &Tr, k: f32, cx: f32, cy: f32) {
+    let dx = ANCHOR.0 + t.s0 * (cx - k * cx - ANCHOR.0);
+    let dy = ANCHOR.1 + t.s0 * (cy - k * cy - ANCHOR.1) + t.top;
+    p.set_local(t.s0 * k, 0.0, 0.0, dx, dy);
+}
+
+/// A thin line under the letters that matched what was typed. It grows from left to right.
+fn underline(p: &mut Painter, text: &str, spans: &[(usize, usize)], r: Rect, st: &TextStyle, center: bool, grow: f32) {
+    if spans.is_empty() || grow <= 0.01 {
         return;
     }
     let (tw, th) = p.measure(text, st);
@@ -982,22 +1248,39 @@ fn underline(p: &mut Painter, text: &str, spans: &[(usize, usize)], r: Rect, st:
     }
     let x0 = if center { r.x + (r.w - tw) * 0.5 } else { r.x };
     let y = r.cy() + th * 0.38;
+    let mut parts: Vec<(f32, f32)> = Vec::with_capacity(spans.len());
     for &(a, b) in spans {
         let (a, b) = logic::snap(text, a, b);
         let xa = if a == 0 { 0.0 } else { p.measure(&text[..a], st).0 };
-        let xb = p.measure(&text[..b], st).0;
-        p.fill_rect(Rect::new(x0 + xa, y, (xb - xa).max(1.0), 1.3), white(0.95));
+        parts.push((xa, p.measure(&text[..b], st).0));
+    }
+    let total: f32 = parts.iter().map(|(a, b)| b - a).sum();
+    let mut left = total * logic::ease_out(grow);
+    for (xa, xb) in parts {
+        let w = (xb - xa).max(1.0).min(left.max(0.0));
+        left -= xb - xa;
+        if w > 0.5 {
+            p.fill_rect(Rect::new(x0 + xa, y, w, 1.3), white(0.95));
+        }
     }
 }
 
 /// The picture of a match: its icon, or a stand-in while the icon loads.
-fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>) {
+fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Option<&Brief>) {
     match h.kind {
         Kind::Calc => {
             p.fill_rounded(r, r.w * 0.26, white(0.14));
             p.text("=", r, &TextStyle::new(r.w * 0.55, white(0.92)).semibold().center());
         }
         Kind::Url | Kind::Web => p.icon(Icon::Globe, r.inset(r.w * 0.1), white(0.9)),
+        Kind::Weather => match wx {
+            Some(b) => b.draw_icon(p, r),
+            None => p.icon(Icon::Cloud, r.inset(r.w * 0.1), white(0.9)),
+        },
+        Kind::Day => match wx {
+            Some(b) => b.day_icon(h.idx, p, r),
+            None => p.icon(Icon::Cloud, r.inset(r.w * 0.1), white(0.9)),
+        },
         _ => match img {
             Some(i) => p.image(i, r, 0.0, 1.0),
             None => {
@@ -1009,11 +1292,22 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>) {
     }
 }
 
-fn draw_subject(p: &mut Painter, r: Rect, cur: Option<&Hit>, icon: Option<&ImageData>, ready: bool) {
+/// What the left box shows right now.
+struct Look<'a> {
+    cur: Option<&'a Hit>,
+    icon: Option<&'a ImageData>,
+    wx: Option<&'a Brief>,
+    pop: f32,
+    ul: f32,
+    tr: &'a Tr,
+    ready: bool,
+}
+
+fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     let cx = r.cx();
-    let Some(h) = cur else {
+    let Some(h) = v.cur else {
         magnifier(p, cx, r.y + 64.0, white(0.78));
-        let msg = if ready { "Type to search" } else { "Getting ready…" };
+        let msg = if v.ready { "Type to search" } else { "Getting ready…" };
         p.text(
             msg,
             Rect::new(r.x + 10.0, r.y + 106.0, r.w - 20.0, 22.0),
@@ -1026,30 +1320,65 @@ fn draw_subject(p: &mut Painter, r: Rect, cur: Option<&Hit>, icon: Option<&Image
         );
         return;
     };
+    let a0 = p.alpha;
+    // a new match pops in: the picture swells from 80% with a little overshoot, the words fade up
+    let fade = logic::ease_out((v.pop * 1.6).min(1.0));
+    let k = 0.80 + 0.20 * logic::ease_back(v.pop);
+    let slide = (1.0 - fade) * 5.0;
+    if h.kind == Kind::Weather {
+        let icon = Rect::centered(cx, r.y + 44.0, 60.0, 60.0);
+        pop_xf(p, v.tr, k, cx, icon.cy());
+        p.alpha = a0 * (0.3 + 0.7 * fade);
+        draw_thumb(p, icon, h, None, v.wx);
+        card_xf(p, v.tr);
+        p.alpha = a0 * fade;
+        p.text(
+            &h.name,
+            Rect::new(r.x + 8.0, r.y + 72.0 + slide, r.w - 16.0, 44.0),
+            &TextStyle::new(36.0, white(0.96)).semibold().center(),
+        );
+        p.text(
+            &h.detail,
+            Rect::new(r.x + 10.0, r.y + 116.0 + slide, r.w - 20.0, 20.0),
+            &TextStyle::new(12.0, white(0.78)).semibold().center(),
+        );
+        p.text(
+            "Weather",
+            Rect::new(r.x + 10.0, r.y + 138.0, r.w - 20.0, 18.0),
+            &TextStyle::new(10.5, white(0.5)).center(),
+        );
+        p.alpha = a0;
+        return;
+    }
     let shown = if h.kind == Kind::Calc { h.detail.as_str() } else { h.name.as_str() };
     if h.kind == Kind::Calc {
+        p.alpha = a0 * fade;
         p.text(
             &h.name,
             Rect::new(r.x + 8.0, r.y + 28.0, r.w - 16.0, 66.0),
             &TextStyle::new(36.0, white(0.96)).semibold().center(),
         );
     } else {
-        draw_thumb(p, Rect::centered(cx, r.y + 62.0, 72.0, 72.0), h, icon);
+        let ir = Rect::centered(cx, r.y + 62.0, 72.0, 72.0);
+        pop_xf(p, v.tr, k, cx, ir.cy());
+        p.alpha = a0 * (0.3 + 0.7 * fade);
+        draw_thumb(p, ir, h, v.icon, v.wx);
+        card_xf(p, v.tr);
     }
-    let name_r = Rect::new(r.x + 10.0, r.y + 104.0, r.w - 20.0, 24.0);
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    let name_r = Rect::new(r.x + 10.0, r.y + 104.0 + slide, r.w - 20.0, 24.0);
     let st = TextStyle::new(14.0, white(0.96)).semibold().center();
     p.text(shown, name_r, &st);
     if h.kind.has_icon() {
-        underline(p, shown, &h.spans, name_r, &st, true);
+        underline(p, shown, &h.spans, name_r, &st, true, v.ul);
     }
-    p.text(
-        h.kind.label(),
-        Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0),
-        &TextStyle::new(10.5, white(0.5)).center(),
-    );
+    p.alpha = a0 * fade;
+    let caption = if h.kind == Kind::Day { h.detail.as_str() } else { h.kind.label() };
+    p.text(caption, Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0), &TextStyle::new(10.5, white(0.5)).center());
+    p.alpha = a0;
 }
 
-fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused: bool) {
+fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused: bool, pop: f32, tr: &Tr) {
     let cx = r.cx();
     let Some(h) = cur else {
         p.text(
@@ -1061,10 +1390,19 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused:
     };
     let acts = actions(h);
     let a = acts[act.min(acts.len() - 1)];
-    p.icon(a.icon(), Rect::centered(cx, r.y + 62.0, 46.0, 46.0), white(0.92));
+    let a0 = p.alpha;
+    let fade = logic::ease_out((pop * 1.6).min(1.0));
+    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    let ir = Rect::centered(cx, r.y + 62.0, 46.0, 46.0);
+    pop_xf(p, tr, k, cx, ir.cy());
+    p.alpha = a0 * (0.3 + 0.7 * fade);
+    p.icon(a.icon(), ir, white(0.92));
+    card_xf(p, tr);
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    let slide = (1.0 - fade) * 5.0;
     p.text(
         a.label(),
-        Rect::new(r.x + 10.0, r.y + 104.0, r.w - 20.0, 24.0),
+        Rect::new(r.x + 10.0, r.y + 104.0 + slide, r.w - 20.0, 24.0),
         &TextStyle::new(14.0, white(0.96)).semibold().center(),
     );
     let hint = if acts.len() < 2 {
@@ -1074,71 +1412,102 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused:
     } else {
         "Tab to change"
     };
+    p.alpha = a0 * fade;
     p.text(hint, Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0), &TextStyle::new(10.5, white(0.5)).center());
+    p.alpha = a0;
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_list(
-    p: &mut Painter,
-    hits: &[Hit],
-    icons: &HashMap<String, Option<ImageData>>,
-    query: &str,
+/// Everything the dropped-down list needs.
+struct ListView<'a> {
+    hits: &'a [Hit],
+    icons: &'a HashMap<String, Option<ImageData>>,
+    query: &'a str,
     focus: Focus,
     sel: usize,
     top: usize,
     act: usize,
     shown: usize,
-) {
+    /// How far the list has dropped (dips).
+    lh: f32,
+    /// The highlighted row (moves between rows).
+    sel_y: f32,
+    ul: f32,
+    wx: Option<&'a Brief>,
+}
+
+/// The list drops down: the card grows, each row fades and slides in as the edge passes it, and the
+/// highlight glides from row to row.
+fn draw_list(p: &mut Painter, v: &ListView) {
+    let base = p.alpha;
     let dim = TextStyle::new(11.5, white(0.55));
     let head = Rect::new(PAD + 8.0, FRAME_H, W - 2.0 * (PAD + 8.0), HEAD);
     let y0 = FRAME_H + HEAD;
     let name_st = TextStyle::new(13.5, white(0.95)).semibold();
     let sub_st = TextStyle::new(10.5, white(0.5));
-    match focus {
+    let title = match v.focus {
+        Focus::Action => match v.hits.get(v.sel) {
+            Some(h) => format!("Actions for “{}”", logic::mid(&h.name, 30)),
+            None => return,
+        },
+        Focus::Subject if v.query.trim().is_empty() => "Used most".to_string(),
+        Focus::Subject => {
+            let n = v.hits.iter().filter(|h| h.kind.has_icon()).count();
+            let count = if n >= KEEP {
+                format!("{KEEP}+ results")
+            } else if n == 1 {
+                "1 result".to_string()
+            } else {
+                format!("{n} results")
+            };
+            format!("{count}  ·  “{}”", logic::mid(v.query.trim(), 24))
+        }
+    };
+    p.alpha = base * (v.lh / HEAD).clamp(0.0, 1.0);
+    p.text(&title, head, &dim);
+    // the highlight
+    let ha = ((v.lh - HEAD) / ROW).clamp(0.0, 1.0);
+    if ha > 0.0 {
+        p.alpha = base * ha;
+        p.fill_rounded(Rect::new(10.0, y0 + v.sel_y * ROW, W - 20.0, ROW - 2.0), 14.0, white(0.16));
+    }
+    let reveal = |i: usize| ((v.lh - HEAD - i as f32 * ROW) / ROW).clamp(0.0, 1.0);
+    match v.focus {
         Focus::Action => {
-            let Some(h) = hits.get(sel) else { return };
-            p.text(&format!("Actions for “{}”", logic::mid(&h.name, 30)), head, &dim);
-            for (i, a) in actions(h).iter().enumerate().take(shown) {
-                let row = Rect::new(10.0, y0 + i as f32 * ROW, W - 20.0, ROW - 2.0);
-                if i == act {
-                    p.fill_rounded(row, 14.0, white(0.16));
+            let Some(h) = v.hits.get(v.sel) else { return };
+            for (i, a) in actions(h).iter().enumerate().take(v.shown) {
+                let ra = reveal(i);
+                if ra <= 0.01 {
+                    continue;
                 }
+                p.alpha = base * ra;
+                let row = Rect::new(10.0, y0 + i as f32 * ROW + (1.0 - ra) * 8.0, W - 20.0, ROW - 2.0);
                 p.icon(a.icon(), Rect::centered(row.x + 26.0, row.cy(), 22.0, 22.0), white(0.92));
                 p.text(a.label(), Rect::new(row.x + 52.0, row.y, row.w - 62.0, row.h), &name_st);
             }
         }
         Focus::Subject => {
-            let title = if query.trim().is_empty() {
-                "Used most".to_string()
-            } else {
-                let n = hits.iter().filter(|h| h.kind.has_icon()).count();
-                let count = if n >= KEEP {
-                    format!("{KEEP}+ results")
-                } else if n == 1 {
-                    "1 result".to_string()
-                } else {
-                    format!("{n} results")
-                };
-                format!("{count}  ·  “{}”", logic::mid(query.trim(), 24))
-            };
-            p.text(&title, head, &dim);
-            for (i, h) in hits.iter().enumerate().skip(top).take(shown) {
-                let row = Rect::new(10.0, y0 + (i - top) as f32 * ROW, W - 20.0, ROW - 2.0);
-                if i == sel {
-                    p.fill_rounded(row, 14.0, white(0.16));
+            for (i, h) in v.hits.iter().enumerate().skip(v.top).take(v.shown) {
+                let ra = reveal(i - v.top);
+                if ra <= 0.01 {
+                    continue;
                 }
+                p.alpha = base * ra;
+                let row = Rect::new(10.0, y0 + (i - v.top) as f32 * ROW + (1.0 - ra) * 8.0, W - 20.0, ROW - 2.0);
                 let ir = Rect::new(row.x + 10.0, row.y + (row.h - 28.0) * 0.5, 28.0, 28.0);
-                draw_thumb(p, ir, h, icons.get(&h.path).and_then(|o| o.as_ref()));
+                draw_thumb(p, ir, h, v.icons.get(&h.path).and_then(|o| o.as_ref()), v.wx);
                 let name_r = Rect::new(row.x + 50.0, row.y + 4.0, row.w - 60.0, 20.0);
                 p.text(&h.name, name_r, &name_st);
-                if h.kind.has_icon() {
-                    underline(p, &h.name, &h.spans, name_r, &name_st, false);
+                if h.kind.has_icon() && i == v.sel {
+                    underline(p, &h.name, &h.spans, name_r, &name_st, false, v.ul);
+                } else if h.kind.has_icon() {
+                    underline(p, &h.name, &h.spans, name_r, &name_st, false, 1.0);
                 }
                 let detail = logic::mid(&h.detail, 54);
                 p.text(&detail, Rect::new(row.x + 50.0, row.y + 24.0, row.w - 60.0, 16.0), &sub_st);
             }
         }
     }
+    p.alpha = base;
 }
 
 // -- window and background work --------------------------------------------------------------------------
@@ -1211,6 +1580,15 @@ fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
 
 /// Start something with administrator rights. Windows asks for confirmation in its own window; this
 /// goes through a helper process so the notch is not held up while that question is open.
+/// The screen behind the window (`w` x `h` pixels at `x`, `y`), blurred as much as `blur` (0 - 1) says.
+fn capture_blur(x: i32, y: i32, w: i32, h: i32, blur: f32) -> Option<ImageData> {
+    let shot = crate::refract::grab(x, y, w, h)?;
+    // shrunk 4 times first: the blur works on a sixteenth of the pixels and still looks the same
+    let (k, r) = if blur < 0.02 { (1, 0) } else { (4, (1.0 + blur * 7.0).round() as usize) };
+    let (px, w2, h2) = logic::shrink_blur(&shot.px, shot.w, shot.h, k, r);
+    Some(ImageData::from_pbgra(w2 as u32, h2 as u32, px))
+}
+
 fn run_as_admin(path: &str) {
     let _ = std::process::Command::new("powershell")
         .args([
@@ -1690,6 +2068,113 @@ mod logic {
         out
     }
 
+    // -- weather words ---------------------------------------------------------------------------------
+
+    /// "wea", "weather", "cast", "forecast", "temp", "temperature" ...: the user wants the weather.
+    pub fn weather_query(q: &str) -> bool {
+        let l = q.trim().to_ascii_lowercase();
+        let n = l.len();
+        (n >= 3 && "weather".starts_with(l.as_str()))
+            || (n >= 4 && "forecast".contains(l.as_str()))
+            || (n >= 4 && "temperature".starts_with(l.as_str()))
+    }
+
+    // -- easing ----------------------------------------------------------------------------------------
+
+    /// Fast start, soft landing.
+    pub fn ease_out(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+    }
+
+    /// Like `ease_out`, but swings a little past 1 before settling.
+    pub fn ease_back(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0) - 1.0;
+        1.0 + 2.70158 * t * t * t + 1.70158 * t * t
+    }
+
+    /// `v` a step closer to `to`, without passing it.
+    pub fn toward(v: f32, to: f32, step: f32) -> f32 {
+        if (to - v).abs() <= step {
+            to
+        } else if to > v {
+            v + step
+        } else {
+            v - step
+        }
+    }
+
+    /// `v` moves a fraction of the way to `to` that grows with the time passed (smooth, never overshoots).
+    pub fn follow(v: f32, to: f32, dt: f32, rate: f32, eps: f32) -> f32 {
+        let d = to - v;
+        if d.abs() <= eps {
+            to
+        } else {
+            v + d * (1.0 - (-rate * dt).exp())
+        }
+    }
+
+    // -- the blurred picture behind the window ----------------------------------------------------------
+
+    /// One pass of a box blur along a row or a column of an interleaved BGRA picture (the first three
+    /// channels; the edge pixels repeat).
+    fn blur_line(src: &[u8], dst: &mut [u8], start: usize, step: usize, len: usize, r: usize) {
+        let n = (2 * r + 1) as u32;
+        let last = len as isize - 1;
+        for c in 0..3 {
+            let at = |i: isize| -> u32 { src[start + i.clamp(0, last) as usize * step + c] as u32 };
+            let mut sum = 0u32;
+            for i in -(r as isize)..=(r as isize) {
+                sum += at(i);
+            }
+            for i in 0..len {
+                dst[start + i * step + c] = ((sum + n / 2) / n) as u8;
+                sum = sum + at(i as isize + r as isize + 1) - at(i as isize - r as isize);
+            }
+        }
+    }
+
+    /// A screen copy (`w` x `h`, BGRA, no alpha) shrunk `k` times by averaging and blurred with three box
+    /// passes of radius `r`. Returns premultiplied BGRA bytes (opaque) and the new size.
+    pub fn shrink_blur(src: &[u32], w: usize, h: usize, k: usize, r: usize) -> (Vec<u8>, usize, usize) {
+        let k = k.max(1);
+        let (w2, h2) = (w.div_ceil(k).max(1), h.div_ceil(k).max(1));
+        let mut a = vec![255u8; w2 * h2 * 4];
+        if src.len() >= w * h {
+            for y in 0..h2 {
+                for x in 0..w2 {
+                    let (mut b, mut g, mut rr, mut cnt) = (0u32, 0u32, 0u32, 0u32);
+                    for yy in (y * k)..((y + 1) * k).min(h) {
+                        for xx in (x * k)..((x + 1) * k).min(w) {
+                            let p = src[yy * w + xx];
+                            b += p & 255;
+                            g += (p >> 8) & 255;
+                            rr += (p >> 16) & 255;
+                            cnt += 1;
+                        }
+                    }
+                    let cnt = cnt.max(1);
+                    let o = (y * w2 + x) * 4;
+                    a[o] = (b / cnt) as u8;
+                    a[o + 1] = (g / cnt) as u8;
+                    a[o + 2] = (rr / cnt) as u8;
+                }
+            }
+        }
+        if r > 0 {
+            let mut b = a.clone();
+            for _ in 0..3 {
+                for y in 0..h2 {
+                    blur_line(&a, &mut b, y * w2 * 4, 4, w2, r);
+                }
+                for x in 0..w2 {
+                    blur_line(&b, &mut a, x * 4, w2 * 4, h2, r);
+                }
+            }
+        }
+        (a, w2, h2)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1763,6 +2248,48 @@ mod logic {
             let m = mid(r"C:\Users\someone\Documents\Projects\notes\todo.txt", 30);
             assert_eq!(m.chars().count(), 30);
             assert!(m.starts_with(r"C:\Users\s") && m.ends_with("todo.txt"));
+        }
+        #[test]
+        fn weather_words() {
+            for q in ["cast", "wea", "weather", "Forecast", "temp", "temperature", "fore"] {
+                assert!(weather_query(q), "{q}");
+            }
+            for q in ["ca", "we", "weathers", "fort", "tem", "chrome", ""] {
+                assert!(!weather_query(q), "{q}");
+            }
+        }
+
+        #[test]
+        fn easing_and_moving() {
+            assert_eq!(ease_out(0.0), 0.0);
+            assert_eq!(ease_out(1.0), 1.0);
+            assert!(ease_out(0.5) > 0.8);
+            assert!((ease_back(1.0) - 1.0).abs() < 1e-6);
+            assert!(ease_back(0.8) > 1.0, "swings past 1");
+            assert_eq!(toward(0.0, 1.0, 0.3), 0.3);
+            assert_eq!(toward(0.9, 1.0, 0.3), 1.0);
+            assert_eq!(toward(1.0, 0.0, 0.25), 0.75);
+            assert_eq!(follow(0.0, 10.0, 1.0, 1e9, 0.1), 10.0);
+            assert_eq!(follow(9.95, 10.0, 0.01, 5.0, 0.1), 10.0);
+            let v = follow(0.0, 10.0, 0.016, 16.0, 0.01);
+            assert!(v > 0.0 && v < 10.0);
+        }
+
+        #[test]
+        fn blur_keeps_flat_pictures_and_spreads_points() {
+            let flat = vec![0x00_40_80_C0u32; 20 * 12];
+            let (px, w, h) = shrink_blur(&flat, 20, 12, 4, 2);
+            assert_eq!((w, h), (5, 3));
+            assert!(px.chunks(4).all(|c| c == [0xC0, 0x80, 0x40, 255]), "a flat picture stays flat");
+            let mut one = vec![0u32; 16 * 16];
+            one[8 * 16 + 8] = 0x00_FF_FF_FF;
+            let (sharp, ..) = shrink_blur(&one, 16, 16, 1, 0);
+            let (soft, ..) = shrink_blur(&one, 16, 16, 1, 2);
+            assert_eq!(sharp[(8 * 16 + 8) * 4], 255);
+            assert!(soft[(8 * 16 + 8) * 4] < 60 && soft[(8 * 16 + 9) * 4] > 0, "the point spreads out");
+            assert!(soft.chunks(4).all(|c| c[3] == 255));
+            let (odd, w, h) = shrink_blur(&flat[..7 * 5], 7, 5, 4, 1);
+            assert_eq!((w, h, odd.len()), (2, 2, 16));
         }
     }
 }

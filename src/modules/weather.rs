@@ -103,13 +103,42 @@ pub struct Brief {
     pub temp: f32,
     pub place: String,
     pub label: &'static str,
+    pub imperial: bool,
+    /// The coming days (the first is today).
+    pub days: Vec<BriefDay>,
     cond: Cond,
     night: bool,
+}
+
+/// One day of the forecast, in short form.
+#[derive(Clone)]
+pub struct BriefDay {
+    pub label: String,
+    pub hi: f32,
+    pub lo: f32,
+    pub rain: Option<f32>,
+    cond: Cond,
 }
 
 impl Brief {
     pub fn draw_icon(&self, p: &mut Painter, r: Rect) {
         draw_condition(p, self.cond, r, self.night);
+    }
+
+    /// The icon of day `i` of the forecast.
+    pub fn day_icon(&self, i: usize, p: &mut Painter, r: Rect) {
+        if let Some(d) = self.days.get(i) {
+            draw_condition(p, d.cond, r, false);
+        }
+    }
+
+    /// "°C" or "°F".
+    pub fn unit(&self) -> &'static str {
+        if self.imperial {
+            "°F"
+        } else {
+            "°C"
+        }
     }
 }
 
@@ -195,8 +224,20 @@ impl Module for Weather {
         self.loading = false;
         match *m {
             WMsg::Data(d) => {
-                let brief =
-                    Brief { temp: d.temp, place: d.place.clone(), label: d.cond.label(), cond: d.cond, night: d.night };
+                let days = d
+                    .days
+                    .iter()
+                    .map(|x| BriefDay { label: x.label.clone(), hi: x.hi, lo: x.lo, rain: x.rain, cond: x.cond })
+                    .collect();
+                let brief = Brief {
+                    temp: d.temp,
+                    place: d.place.clone(),
+                    label: d.cond.label(),
+                    imperial: d.imperial,
+                    days,
+                    cond: d.cond,
+                    night: d.night,
+                };
                 BRIEF.with(|b| *b.borrow_mut() = Some(std::rc::Rc::new(brief)));
                 self.data = Some(std::sync::Arc::new(d));
                 self.error = None;
