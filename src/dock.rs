@@ -1109,6 +1109,11 @@ fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
 // -- open windows -------------------------------------------------------------------------------------
 
 /// The apps with a normal window right now: (exe path, one of its windows), topmost first.
+thread_local! {
+    /// pid -> exe path, kept between scans so each pass doesn't reopen every process.
+    static EXE_CACHE: std::cell::RefCell<HashMap<u32, String>> = std::cell::RefCell::new(HashMap::new());
+}
+
 fn running_apps(hide: &[String]) -> Vec<(String, isize)> {
     unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
         let out = &mut *(lp.0 as *mut Vec<(isize, u32)>);
@@ -1124,7 +1129,8 @@ fn running_apps(hide: &[String]) -> Vec<(String, isize)> {
         let _ = EnumWindows(Some(cb), LPARAM(&mut wins as *mut _ as isize));
     }
     let me = std::process::id();
-    let mut paths: HashMap<u32, String> = HashMap::new();
+    let mut paths: HashMap<u32, String> = EXE_CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    paths.retain(|pid, p| !p.is_empty() && wins.iter().any(|w| w.1 == *pid));
     let mut out: Vec<(String, isize)> = Vec::new();
     for (h, pid) in wins {
         if pid == me {
@@ -1140,6 +1146,7 @@ fn running_apps(hide: &[String]) -> Vec<(String, isize)> {
         }
         out.push((path, h));
     }
+    EXE_CACHE.with(|c| *c.borrow_mut() = paths);
     out
 }
 
