@@ -442,7 +442,7 @@ pub struct LauncherCfg {
     pub search_url: String,
     /// Liquid glass: the edge bends what is behind it and catches the light (off = a plain solid card).
     pub glass: bool,
-    /// The blur behind the launcher is live (the system's own), so it shows a playing video behind it.
+    /// The blur behind the launcher is renewed while it is open, so a video behind it keeps moving.
     pub live: bool,
     /// Handed over by the app, not stored here: the Gemini settings, whether media is playing, and
     /// the dock's rim (the launcher's rim follows it).
@@ -1238,7 +1238,8 @@ animate = true
 light = false
 # Liquid glass: the edge bends what is behind it and catches the light (false = a plain solid card)
 glass = true
-# Live blur: the glass shows what moves behind the launcher, a playing video for example (false = one frozen picture)
+# Live blur: the picture behind the glass is renewed while the launcher is open, so a playing video keeps moving
+# behind it (false = one picture from when it opened). The launcher then cannot be seen in screenshots.
 live = true
 # How big the launcher is (0.5 = half, 1.0 = the original size)
 size = 0.8

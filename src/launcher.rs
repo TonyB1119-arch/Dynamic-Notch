@@ -54,6 +54,8 @@ const T_ICON: usize = 2;
 const T_TRIM: usize = 3;
 const T_FREE: usize = 4;
 const T_FLASH: usize = 5;
+/// Live blur: the screen behind is looked at again.
+const T_LIVE: usize = 6;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
 /// Gemini has sent more of the answer.
@@ -449,7 +451,8 @@ pub struct Launcher {
     /// The contents sliding in after Tab: 0 to 1, and the way they come from (1 or -1).
     sw: f32,
     sw_dir: f32,
-    /// This time the glass shows the live screen behind it (media is playing) instead of one picture.
+    /// The picture behind the glass is renewed ten times a second while the launcher is open (a video
+    /// behind it keeps moving). The window is hidden from screen copies for that.
     live: bool,
 }
 
@@ -628,10 +631,12 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // live blur: the system's own blur keeps showing what moves behind the window (a video,
-            // say). A screen copy cannot see video, so it is only used when live blur is turned off
-            self.live = self.cfg.glass && self.cfg.live;
-            self.blur_img = if self.live || !self.cfg.glass { None } else { capture_blur(x, y, w, h, self.cfg.blur) };
+            // live blur: the window is hidden from screen copies, so the picture behind it can be renewed
+            // while it is open; when that is not possible the picture stays as it was when it opened
+            self.live = self.cfg.glass
+                && self.cfg.live
+                && unsafe { SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
+            self.blur_img = if self.cfg.glass { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
             self.lh = 0.0;
             self.focus_t = 0.0;
@@ -647,6 +652,9 @@ impl Launcher {
             let _ = KillTimer(Some(self.hwnd), T_FREE);
             let _ = KillTimer(Some(self.hwnd), T_FLASH);
             self.flashing = false;
+            if self.live {
+                SetTimer(Some(self.hwnd), T_LIVE, 100, None);
+            }
             if !again {
                 // a combo's flash must not take the focus from the thing that is opening
                 let _ = ShowWindow(self.hwnd, if focus { SW_SHOW } else { SW_SHOWNOACTIVATE });
@@ -680,6 +688,13 @@ impl Launcher {
 
     fn finish_hide(&mut self) {
         self.visible = false;
+        if self.live {
+            self.live = false;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_LIVE);
+                let _ = SetWindowDisplayAffinity(self.hwnd, WDA_NONE);
+            }
+        }
         self.sw = 1.0;
         self.query.clear();
         self.hits.clear();
@@ -1532,6 +1547,18 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_TIMER if wp.0 == T_LIVE => {
+                if self.visible && self.live {
+                    let (x, y, w, h) = self.win_px;
+                    if let Some(img) = capture_blur(x, y, w, h, self.cfg.blur) {
+                        if let Some(old) = self.blur_img.replace(img) {
+                            self.res.forget(old.id);
+                        }
+                        self.draw(gfx);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_TIMER if wp.0 == T_ICON => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), T_ICON);
@@ -1652,15 +1679,8 @@ impl Launcher {
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
-        // live glass: the system blur behind the card, following the card as it grows
-        let s0 = 0.95 + 0.05 * e;
-        // the system blur at full strength is nearly solid: like the dock, only part of it is used (the blur slider sets how much)
-        let live_op = if self.live && self.cfg.glass { e * (0.12 + 0.45 * self.cfg.blur) } else { 0.0 };
-        self.host.set_backdrop_rounded(
-            Rect::new(ANCHOR.0 * sc * (1.0 - s0), ANCHOR.1 * sc * (1.0 - s0), W * s0 * sc, card_h * s0 * sc),
-            CARD_R * s0 * sc,
-            live_op,
-        );
+        // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
+        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         let mut ai_goal = None;
         let mut ai_agoal = None;
         let (dc, _) = match self.host.begin_draw() {
@@ -1697,15 +1717,6 @@ impl Launcher {
                         Color::rgba(0.95, 0.97, 1.0, 0.35 + 0.5 * dark)
                     } else {
                         Color::rgba(0.03, 0.03, 0.05, dark)
-                    };
-                    p.fill_rounded(card, CARD_R, tint);
-                }
-                // live blur: the system's blur is behind the card, only the tint is drawn
-                None if glass && self.live => {
-                    let tint = if light {
-                        Color::rgba(0.95, 0.97, 1.0, 0.15 + 0.3 * dark)
-                    } else {
-                        Color::rgba(0.03, 0.03, 0.05, dark * 0.5)
                     };
                     p.fill_rounded(card, CARD_R, tint);
                 }
@@ -1827,7 +1838,7 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE] {
+            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE] {
                 let _ = KillTimer(Some(self.hwnd), t);
             }
             let _ = DestroyWindow(self.hwnd);
