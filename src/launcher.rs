@@ -231,14 +231,6 @@ impl Mode {
             (Mode::Ai, false) | (Mode::Clip, true) => Mode::Search,
         }
     }
-
-    fn index(self) -> usize {
-        match self {
-            Mode::Search => 0,
-            Mode::Clip => 1,
-            Mode::Ai => 2,
-        }
-    }
 }
 
 /// How far the Gemini question has got.
@@ -267,6 +259,11 @@ struct Ai {
     /// How far the answer is scrolled, and how far it can be (set while drawing).
     scroll: f32,
     max_scroll: f32,
+    /// The question's text size and top edge as drawn, where they are heading, and for which text.
+    sz: f32,
+    y: f32,
+    goal: (f32, f32),
+    fit_for: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Mutex<AiShared>>,
 }
@@ -279,6 +276,10 @@ impl Ai {
             text: String::new(),
             scroll: 0.0,
             max_scroll: 0.0,
+            sz: Q_BIG,
+            y: Q_Y0,
+            goal: (Q_BIG, Q_Y0),
+            fit_for: 0,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shared: Arc::new(Mutex::new(AiShared { seq: 0, text: String::new(), done: false, err: None })),
         }
@@ -293,6 +294,44 @@ impl Ai {
         self.scroll = 0.0;
         self.max_scroll = 0.0;
     }
+
+    /// The question's text eases toward its size and place.
+    fn glide(&mut self, dt: f32, snap: bool) {
+        if snap {
+            (self.sz, self.y) = self.goal;
+        } else {
+            self.sz = logic::follow(self.sz, self.goal.0, dt, 14.0, 0.05);
+            self.y = logic::follow(self.y, self.goal.1, dt, 14.0, 0.05);
+        }
+    }
+
+    fn moving(&self) -> bool {
+        (self.sz - self.goal.0).abs() > 0.05 || (self.y - self.goal.1).abs() > 0.05
+    }
+}
+
+/// The question starts big in the middle of the box and gets smaller as it grows.
+const Q_BIG: f32 = 34.0;
+const Q_SIZES: [f32; 6] = [Q_BIG, 28.0, 23.0, 19.0, 16.0, 14.0];
+/// Where the top of a one-line question starts (the box is 144 high inside).
+const Q_Y0: f32 = 48.0;
+
+/// The biggest text size at which the question still fits the box, and where its top edge then goes:
+/// the middle while it fits, the top once it is too long (then the end stays in view).
+fn ai_fit(p: &mut Painter, q: &str, w: f32, h: f32) -> (f32, f32) {
+    if q.is_empty() {
+        return (Q_BIG, Q_Y0);
+    }
+    let mut size = Q_SIZES[Q_SIZES.len() - 1];
+    let mut used = 0.0;
+    for &sz in &Q_SIZES {
+        used = p.measure_wrapped(q, &TextStyle::new(sz, white(0.9)).semibold().center().wrap(), w);
+        size = sz;
+        if used <= h {
+            break;
+        }
+    }
+    (size, if used <= h { (h - used) * 0.5 } else { h - used })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -362,6 +401,9 @@ pub struct Launcher {
     wx: Option<std::rc::Rc<crate::modules::weather::Brief>>,
     scratch: Vec<usize>,
     ai: Ai,
+    /// The contents sliding in after Tab: 0 to 1, and the way they come from (1 or -1).
+    sw: f32,
+    sw_dir: f32,
 }
 
 impl Launcher {
@@ -416,6 +458,8 @@ impl Launcher {
             wx: None,
             scratch: Vec::new(),
             ai: Ai::new(),
+            sw: 1.0,
+            sw_dir: 1.0,
         })
     }
 
@@ -586,6 +630,7 @@ impl Launcher {
 
     fn finish_hide(&mut self) {
         self.visible = false;
+        self.sw = 1.0;
         self.query.clear();
         self.hits.clear();
         self.ai.clear();
@@ -637,6 +682,8 @@ impl Launcher {
             || self.ul < 1.0
             || self.pop_s < 1.0
             || self.pop_a < 1.0
+            || self.sw < 1.0
+            || (self.mode == Mode::Ai && self.ai.moving())
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
     }
@@ -655,6 +702,8 @@ impl Launcher {
         self.ul = if snap { 1.0 } else { logic::toward(self.ul, 1.0, dt / 0.32) };
         self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.30) };
         self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.30) };
+        self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.28) };
+        self.ai.glide(dt, snap);
         let ft = if self.focus == Focus::Action { 1.0 } else { 0.0 };
         self.focus_t = if snap { ft } else { logic::follow(self.focus_t, ft, dt, 18.0, 0.01) };
         let st = self.sel_target();
@@ -1166,6 +1215,8 @@ impl Launcher {
         if VIRTUAL_KEY(vk) == VK_TAB {
             // Search -> clipboard -> Gemini (Shift+Tab goes back); Left and Right move between the two boxes
             self.mode = self.mode.cycle(shift);
+            self.sw = if self.cfg.animate { 0.0 } else { 1.0 };
+            self.sw_dir = if shift { -1.0 } else { 1.0 };
             self.show(gfx, 1.0, true);
             return;
         }
@@ -1551,6 +1602,7 @@ impl Launcher {
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
+        let mut ai_goal = None;
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(err) => {
@@ -1563,7 +1615,10 @@ impl Launcher {
             p.clear();
             p.alpha = e;
             // opening: appears where it is, fading in while growing from 95% around its middle; closing runs it backwards
-            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0 };
+            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0, dx: 0.0 };
+            // changing the mode: the contents slide in from the side they came from
+            let sw = logic::ease_out(self.sw);
+            let ct = Tr { dx: self.sw_dir * (1.0 - sw) * 30.0, ..tr };
             card_xf(&mut p, &tr);
             let card = Rect::new(0.0, 0.0, W, card_h);
             let dark = self.cfg.dark;
@@ -1607,11 +1662,24 @@ impl Launcher {
                 wx: wx.as_deref(),
                 pop: self.pop_s,
                 ul: self.ul,
-                tr: &tr,
+                tr: &ct,
                 ready: self.apps_ready,
                 clip: self.mode == Mode::Clip,
             };
+            // the contents of both boxes slide and fade in when the mode changes
+            let keep = p.alpha;
+            p.alpha = keep * (0.25 + 0.75 * sw);
+            card_xf(&mut p, &ct);
             if self.mode == Mode::Ai {
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hs = std::collections::hash_map::DefaultHasher::new();
+                    self.query.hash(&mut hs);
+                    hs.finish() | 1
+                };
+                if hash != self.ai.fit_for || self.query.is_empty() {
+                    ai_goal = Some((hash, ai_fit(&mut p, &self.query, BOX - 28.0, BOX - 28.0)));
+                }
                 let view = AiView {
                     query: &self.query,
                     state: self.ai.state,
@@ -1619,20 +1687,16 @@ impl Launcher {
                     scroll: self.ai.scroll,
                     pop_s: self.pop_s,
                     pop_a: self.pop_a,
+                    qsz: self.ai.sz,
+                    qy: self.ai.y,
                 };
                 ai_max = draw_ai(&mut p, sub, act, &view);
             } else {
                 draw_subject(&mut p, sub, &subject);
-                draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &tr);
+                draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &ct);
             }
-            if !self.flashing {
-                // which of the three modes this is
-                let on = self.mode.index();
-                for i in 0..3 {
-                    let (a, r) = if i == on { (0.85, 2.6) } else { (0.30, 2.2) };
-                    p.fill_circle(W * 0.5 + (i as f32 - 1.0) * 10.0, FRAME_H - 7.0, r, white(a));
-                }
-            }
+            p.alpha = keep;
+            card_xf(&mut p, &tr);
             if self.lh > 1.0 {
                 p.push_clip(card);
                 let view = ListView {
@@ -1659,6 +1723,13 @@ impl Launcher {
         }
         self.res.end_frame();
         self.ai.max_scroll = ai_max;
+        if let Some((hash, goal)) = ai_goal {
+            self.ai.fit_for = hash;
+            self.ai.goal = goal;
+            if self.ai.moving() {
+                self.kick();
+            }
+        }
         self.ai.scroll = self.ai.scroll.min(ai_max);
     }
 }
@@ -1702,18 +1773,20 @@ fn type_glyph(p: &mut Painter, cx: f32, cy: f32, c: Color) {
 struct Tr {
     s0: f32,
     top: f32,
+    /// Sideways shift (the contents sliding in when the mode changes).
+    dx: f32,
 }
 
 /// The point the card grows from.
 const ANCHOR: (f32, f32) = (W * 0.5, FRAME_H * 0.5);
 
 fn card_xf(p: &mut Painter, t: &Tr) {
-    p.set_local(t.s0, ANCHOR.0, ANCHOR.1, 0.0, t.top);
+    p.set_local(t.s0, ANCHOR.0, ANCHOR.1, t.dx, t.top);
 }
 
 /// Scale one thing by `k` around (cx, cy), on top of the card's own transform.
 fn pop_xf(p: &mut Painter, t: &Tr, k: f32, cx: f32, cy: f32) {
-    let dx = ANCHOR.0 + t.s0 * (cx - k * cx - ANCHOR.0);
+    let dx = ANCHOR.0 + t.s0 * (cx - k * cx - ANCHOR.0) + t.dx;
     let dy = ANCHOR.1 + t.s0 * (cy - k * cy - ANCHOR.1) + t.top;
     p.set_local(t.s0 * k, 0.0, 0.0, dx, dy);
 }
@@ -1926,6 +1999,9 @@ struct AiView<'a> {
     scroll: f32,
     pop_s: f32,
     pop_a: f32,
+    /// The question's text size and top edge (they glide).
+    qsz: f32,
+    qy: f32,
 }
 
 /// Gemini mode: the question on the left, the answer on the right. Returns how far the answer can scroll.
@@ -1939,11 +2015,10 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
         p.text("Ask Gemini\u{2026}", Rect::new(sub.x + 10.0, sub.y + 118.0, sub.w - 20.0, 20.0), &centered);
     } else {
         let view = Rect::new(sub.x + 14.0, sub.y + 14.0, sub.w - 28.0, sub.h - 28.0);
-        let st = TextStyle::new(15.0, white(0.94)).semibold().top().wrap();
+        let st = TextStyle::new(v.qsz, white(0.94)).semibold().center().top().wrap();
         let h = p.measure_wrapped(v.query, &st, view.w);
-        let y = if h > view.h { view.bottom() - h } else { view.y };
         p.push_clip(view);
-        p.text(v.query, Rect::new(view.x, y, view.w, h.max(view.h)), &st);
+        p.text(v.query, Rect::new(view.x, view.y + v.qy, view.w, h), &st);
         p.pop_clip();
     }
     // right: the answer
