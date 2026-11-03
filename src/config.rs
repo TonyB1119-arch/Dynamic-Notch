@@ -420,6 +420,8 @@ pub struct LauncherCfg {
     pub animate: bool,
     /// Light frosted glass with dark writing (false = dark glass with white writing).
     pub light: bool,
+    /// How big the launcher is (1.0 = the original size).
+    pub size: f32,
     /// Where a web search goes; what you typed is added at the end.
     pub search_url: String,
 }
@@ -433,6 +435,7 @@ impl Default for LauncherCfg {
             dark: 0.55,
             animate: true,
             light: true,
+            size: 0.8,
             search_url: "https://www.google.com/search?q=".to_string(),
         }
     }
@@ -442,6 +445,7 @@ impl LauncherCfg {
     fn clamped(&mut self) {
         self.blur = self.blur.clamp(0.0, 1.0);
         self.dark = self.dark.clamp(0.2, 0.95);
+        self.size = self.size.clamp(0.5, 1.5);
         self.folders.truncate(20);
         let u = self.search_url.trim().to_string();
         // only web addresses: what is typed in the launcher is handed to the browser
@@ -1191,6 +1195,8 @@ dark = 0.55
 animate = true
 # Light frosted glass with dark writing (false = dark glass with white writing)
 light = true
+# How big the launcher is (0.5 = half, 1.0 = the original size)
+size = 0.8
 # Where a web search goes; what you typed is added at the end
 search_url = "https://www.google.com/search?q="
 

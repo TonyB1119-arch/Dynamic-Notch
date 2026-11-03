@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 15.0,
+        8 => 16.0,
         _ => 25.0,
     }
 }
@@ -1027,7 +1027,17 @@ impl Settings {
             "dark",
         );
         toggle_row(ui, row_rect(body, 13), "Launcher animations", l.animate, "launcher", "animate");
-        toggle_row(ui, row_rect(body, 14), "Launcher light look", l.light, "launcher", "light");
+        toggle_row(ui, row_rect(body, 14), "Launcher light look (off = dark)", l.light, "launcher", "light");
+        slider_row(
+            ui,
+            row_rect(body, 15),
+            "Launcher size",
+            l.size,
+            (0.5, 1.5),
+            format!("{:.0}%", l.size * 100.0),
+            "launcher",
+            "size",
+        );
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {

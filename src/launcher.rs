@@ -350,7 +350,7 @@ impl Launcher {
             spawn_files(self.files_slot.clone(), SendHwnd::new(self.hwnd), self.cfg.folders.clone());
         }
         if !again {
-            if !self.place(ui_scale) {
+            if !self.place(ui_scale * self.cfg.size) {
                 return;
             }
             // the screen behind the window, copied before the window is shown
