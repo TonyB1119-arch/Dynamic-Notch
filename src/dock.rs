@@ -30,6 +30,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::Instant;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::UI::Composition::Compositor;
 
 use crate::config::DockCfg;
@@ -44,6 +47,16 @@ const MOUSELEAVE: u32 = 0x02A3;
 const T_ANIM: usize = 1;
 const T_SCAN: usize = 2;
 const T_HIDE: usize = 3;
+/// Posted when another window came to the front: put the dock back on top.
+const WM_RAISE: u32 = WM_APP + 7;
+static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn on_foreground(_h: HWINEVENTHOOK, _e: u32, _w: HWND, _o: i32, _c: i32, _t: u32, _ms: u32) {
+    let h = DOCK_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        let _ = PostMessageW(Some(HWND(h as *mut _)), WM_RAISE, WPARAM(0), LPARAM(0));
+    }
+}
 /// Windows that are not apps in the dock's sense.
 const SKIP_EXE: [&str; 8] = [
     "applicationframehost.exe",
@@ -90,6 +103,9 @@ pub struct Dock {
     icons: HashMap<String, Option<ImageData>>,
     run_order: Vec<String>,
     /// The pin picker: installed apps (Start menu), first visible row, open or not.
+    anim_on: bool,
+    last_tick: Instant,
+    hook: Option<HWINEVENTHOOK>,
     picker: bool,
     apps: Vec<Item>,
     scroll: usize,
@@ -123,6 +139,10 @@ impl Dock {
         std::thread::spawn(|| {
             uwp_apps();
         });
+        DOCK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        let hook = unsafe {
+            SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT)
+        };
         Ok(Self {
             hwnd,
             host,
@@ -133,6 +153,9 @@ impl Dock {
             cells: Vec::new(),
             icons: HashMap::new(),
             run_order: Vec::new(),
+            anim_on: false,
+            last_tick: Instant::now(),
+            hook: Some(hook),
             picker: false,
             apps: Vec::new(),
             scroll: 0,
@@ -262,6 +285,13 @@ impl Dock {
             }
         }
         self.set_region(self.engage_to > 0.0);
+    }
+
+    /// Back to the front of the always-on-top windows, without taking focus.
+    fn raise(&self) {
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 
     fn hidden(&self) -> bool {
@@ -523,6 +553,12 @@ impl Dock {
 
     pub fn handle(&mut self, gfx: &Gfx, fs_hidden: bool, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         match msg {
+            WM_RAISE => {
+                if self.shown {
+                    self.raise();
+                }
+                Some(LRESULT(0))
+            }
             WM_MOUSEWHEEL if self.picker => {
                 let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
                 let max = self.apps.len().saturating_sub(self.visible_rows()) as i32;
@@ -616,6 +652,9 @@ impl Dock {
             }
             WM_TIMER if wp.0 == T_SCAN => {
                 let changed = self.refresh_items();
+                if self.shown {
+                    self.raise();
+                }
                 if self.cfg.hide_taskbar {
                     crate::taskbar::hide_taskbar();
                     self.place(gfx);
@@ -758,17 +797,27 @@ impl Dock {
     }
 
     fn start_anim(&mut self) {
-        unsafe {
-            SetTimer(Some(self.hwnd), T_ANIM, 16, None);
+        // Only start the timer once: restarting it on every mouse move would keep it from ever firing.
+        if !self.anim_on {
+            self.anim_on = true;
+            self.last_tick = Instant::now();
+            unsafe {
+                SetTimer(Some(self.hwnd), T_ANIM, 10, None);
+            }
         }
     }
 
     /// One animation tick: the pointer and the grow factor ease toward where they should be.
     fn step(&mut self, gfx: &Gfx) {
-        self.mx += (self.mx_to - self.mx) * 0.32;
-        self.engage += (self.engage_to - self.engage) * 0.22;
+        // ease by elapsed time so the speed is the same whatever the timer's rhythm
+        let now = Instant::now();
+        let f = (now.duration_since(self.last_tick).as_secs_f32() * 60.0).clamp(0.5, 4.0);
+        self.last_tick = now;
+        let ease = |k: f32| 1.0 - (1.0 - k).powf(f);
+        self.mx += (self.mx_to - self.mx) * ease(0.32);
+        self.engage += (self.engage_to - self.engage) * ease(0.22);
         if self.hide_t != self.hide_to {
-            let k = if self.hide_to > self.hide_t { 0.2 } else { 0.3 };
+            let k = ease(if self.hide_to > self.hide_t { 0.2 } else { 0.3 });
             self.hide_t += (self.hide_to - self.hide_t) * k;
             if (self.hide_t - self.hide_to).abs() < 0.01 {
                 self.hide_t = self.hide_to;
@@ -784,6 +833,7 @@ impl Dock {
         }
         self.draw(gfx);
         if self.mx == self.mx_to && self.engage == self.engage_to && self.hide_t == self.hide_to {
+            self.anim_on = false;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_ANIM);
             }
@@ -813,6 +863,10 @@ impl Drop for Dock {
             let _ = KillTimer(Some(self.hwnd), T_ANIM);
             let _ = KillTimer(Some(self.hwnd), T_SCAN);
             let _ = KillTimer(Some(self.hwnd), T_HIDE);
+            if let Some(h) = self.hook.take() {
+                let _ = UnhookWinEvent(h);
+            }
+            DOCK_HWND.store(0, Ordering::Relaxed);
             if self.cfg.hide_taskbar {
                 crate::taskbar::recover_taskbar();
             }
