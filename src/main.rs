@@ -14,6 +14,7 @@ mod gfx;
 mod host;
 mod hotkeys;
 mod ipc;
+mod launcher;
 mod modules;
 mod pacer;
 mod refract;

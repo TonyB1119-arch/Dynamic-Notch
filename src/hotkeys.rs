@@ -13,6 +13,7 @@ pub enum Action {
     Clipboard,
     PlayPause,
     Dictate,
+    Launcher,
 }
 
 const BASE_ID: i32 = 0x4E00;
@@ -102,6 +103,7 @@ pub fn register_all(hwnd: HWND, cfg: &HotkeyCfg) -> (Vec<Registered>, Vec<String
         (Action::Clipboard, &cfg.clipboard),
         (Action::PlayPause, &cfg.play_pause),
         (Action::Dictate, &cfg.dictate),
+        (Action::Launcher, &cfg.launcher),
     ];
     for (i, (action, s)) in list.iter().enumerate() {
         if s.trim().is_empty() {

@@ -1405,6 +1405,11 @@ fn scan_start_menu() -> Vec<Item> {
         .collect()
 }
 
+/// Name and launch path of every installed app (Start menu shortcuts and Store apps), for the launcher.
+pub fn installed_apps() -> Vec<(String, String)> {
+    scan_start_menu().into_iter().map(|i| (i.label, i.path)).collect()
+}
+
 /// The right-click menu: keep / remove the app under the pointer, or add any app. Runs outside the
 /// app borrow because the menu and the picker wait for the user.
 fn context_menu(hwnd: HWND, lp: LPARAM) {

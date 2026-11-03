@@ -530,6 +530,7 @@ pub struct App {
     /// When to release GPU caches (set when a frame burst ends).
     trim_at: Option<Instant>,
     dock: Option<crate::dock::Dock>,
+    launcher: Option<crate::launcher::Launcher>,
     /// No spring is moving: the backdrop blur may be shown.
     settled: bool,
     region: Option<(i32, i32, i32, i32)>,
@@ -657,6 +658,7 @@ impl App {
             dirty: true,
             trim_at: None,
             dock: None,
+            launcher: None,
             settled: true,
             region: None,
             region_anim: None,
@@ -1875,6 +1877,7 @@ impl App {
             Action::Dictate => {
                 self.broadcast(SystemEvent::Command { verb: "dictate".into(), args: vec!["hotkey".into()] })
             }
+            Action::Launcher => self.launcher_toggle(),
         }
     }
 
@@ -3669,6 +3672,35 @@ impl App {
         fx
     }
 
+    /// Messages for the launcher's own window. When it has been idle for a long time it is dropped
+    /// (the window, its drawing memory and its lists); the next hotkey press builds it again.
+    pub fn launcher_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let l = self.launcher.as_mut()?;
+        let r = l.handle(&self.gfx, msg, wp, lp);
+        if l.wants_free() {
+            self.launcher = None;
+        }
+        r
+    }
+
+    /// The launcher hotkey: open the launcher, or put it away again.
+    fn launcher_toggle(&mut self) {
+        if self.launcher.is_none() {
+            match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(l) => self.launcher = Some(l),
+                Err(e) => {
+                    log!("launcher failed to start: {e}");
+                    return;
+                }
+            }
+        }
+        let (cfg, scale) = (self.cfg.launcher.clone(), self.cfg.appearance.scale);
+        if let Some(l) = self.launcher.as_mut() {
+            l.configure(cfg);
+            l.toggle(&self.gfx, scale);
+        }
+    }
+
     /// Messages for the dock's own window.
     pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hidden = self.fs_hidden;
@@ -3743,6 +3775,9 @@ impl App {
             let _ = self.host.set_rendering_device(&self.gfx);
             if let Some(d) = self.dock.as_mut() {
                 d.recover(&self.gfx);
+            }
+            if let Some(l) = self.launcher.as_mut() {
+                l.recover(&self.gfx);
             }
             self.snap_all = None;
             self.snap_pages = None;

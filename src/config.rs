@@ -38,6 +38,7 @@ pub struct Config {
     pub tabs: TabsCfg,
     pub glass: GlassCfg,
     pub dock: DockCfg,
+    pub launcher: LauncherCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -172,6 +173,8 @@ pub struct Hotkeys {
     pub play_pause: String,
     /// Voice dictation: tap to start/stop, or hold to talk and release to finish.
     pub dictate: String,
+    /// The quick launcher: apps, files, sums and web addresses.
+    pub launcher: String,
 }
 
 impl Default for Hotkeys {
@@ -183,6 +186,7 @@ impl Default for Hotkeys {
             clipboard: "Ctrl+Alt+V".into(),
             play_pause: String::new(),
             dictate: "Ctrl+Alt+D".into(),
+            launcher: "Alt+Space".into(),
         }
     }
 }
@@ -397,6 +401,36 @@ pub struct ShelfCfg {
 impl Default for ShelfCfg {
     fn default() -> Self {
         Self { remember: true }
+    }
+}
+
+/// The quick launcher (hotkey: `[hotkeys] launcher`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherCfg {
+    /// Also find files and folders (Desktop, Documents, Downloads, Pictures, Videos, Music).
+    pub files: bool,
+    /// More folders to search for files.
+    pub folders: Vec<String>,
+    /// How solid the glass is (0.1 = nearly clear, 1.0 = solid).
+    pub opacity: f32,
+    /// Where a web search goes; what you typed is added at the end.
+    pub search_url: String,
+}
+
+impl Default for LauncherCfg {
+    fn default() -> Self {
+        Self { files: true, folders: Vec::new(), opacity: 0.6, search_url: "https://www.google.com/search?q=".to_string() }
+    }
+}
+
+impl LauncherCfg {
+    fn clamped(&mut self) {
+        self.opacity = self.opacity.clamp(0.1, 1.0);
+        self.folders.truncate(20);
+        let u = self.search_url.trim().to_string();
+        // only web addresses: what is typed in the launcher is handed to the browser
+        self.search_url = if u.starts_with("https://") || u.starts_with("http://") { u } else { Self::default().search_url };
     }
 }
 
@@ -867,6 +901,7 @@ impl Config {
         self.weather.refresh_minutes = self.weather.refresh_minutes.clamp(5, 360);
         self.glass.clamped();
         self.dock.clamped();
+        self.launcher.clamped();
         self.home.widgets.truncate(4);
         self.notch.widgets.truncate(3);
         self
@@ -949,6 +984,8 @@ clipboard = "Ctrl+Alt+V"
 play_pause = ""
 # Voice dictation: tap to start/stop, or hold to talk and release to finish.
 dictate = "Ctrl+Alt+D"
+# The quick launcher (apps, files, sums, web addresses). Leave empty to turn it off.
+launcher = "Alt+Space"
 
 [modules]
 media = true
@@ -1123,6 +1160,18 @@ glass = true
 # Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.
 items = ['Explorer|%WINDIR%\explorer.exe']
 
+[launcher]
+# A quick search (hotkey above): apps, files, sums like 12*(3+4), web addresses and web search.
+# Press Down to see the list of matches, Tab to pick what to do with the match.
+# Also find files and folders in Desktop, Documents, Downloads, Pictures, Videos and Music
+files = true
+# More folders to search, for example folders = ['D:\Projects']
+folders = []
+# How solid the glass is (0.1 = nearly clear, 1.0 = solid)
+opacity = 0.6
+# Where a web search goes; what you typed is added at the end
+search_url = "https://www.google.com/search?q="
+
 [glass]
 # The Alcove glass edge (Settings → Glass). Sizes are in logical pixels; delete a line to get its default.
 edge_width = 76.0
@@ -1183,6 +1232,7 @@ mod tests {
         assert_eq!(c.ai.model, d.ai.model);
         assert_eq!(c.timer.presets_min, d.timer.presets_min);
         assert_eq!(c.hotkeys.dictate, d.hotkeys.dictate);
+        assert_eq!(c.hotkeys.launcher, d.hotkeys.launcher);
         assert_eq!(c.voice.model, d.voice.model);
         assert_eq!(c.voice.cleanup, d.voice.cleanup);
         assert_eq!(c.locks.caps, d.locks.caps);
