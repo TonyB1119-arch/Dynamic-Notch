@@ -1735,6 +1735,20 @@ impl App {
         z
     }
 
+    /// A right-click on a tray icon of the Wi-Fi & Bluetooth page: true when it was taken.
+    pub fn tray_right_click(&mut self, lp: LPARAM) -> bool {
+        if self.mode != Mode::Expanded || self.page != "control" {
+            return false;
+        }
+        let (x, y) = self.lp_to_logical(lp);
+        if !crate::modules::traylist::over_tile(x, y) {
+            return false;
+        }
+        self.input.right_click = Some((x, y));
+        self.request_frame();
+        true
+    }
+
     fn on_mouse_move(&mut self, x: f32, y: f32) {
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT {

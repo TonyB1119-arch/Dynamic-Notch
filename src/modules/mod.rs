@@ -17,6 +17,7 @@ pub mod bluetooth;
 pub mod calendar;
 pub mod clipboard;
 pub mod control;
+pub mod traylist;
 pub mod devices;
 pub mod downloads;
 pub mod gemini;

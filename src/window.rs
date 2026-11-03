@@ -91,6 +91,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 }
 
 fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // A right-click on a tray icon (Tray tab) goes to that icon's app, not to the notch's own menu.
+    if msg == WM_RBUTTONUP && with_app(|a| a.tray_right_click(lp)) == Some(true) {
+        return LRESULT(0);
+    }
     // Context menus run a modal loop, so they must be shown *outside* the
     // app borrow; otherwise frames/timers arriving meanwhile would be lost.
     let menu_request = match msg {

@@ -12,6 +12,7 @@ use std::any::Any;
 use std::time::Instant;
 
 use super::bluetooth::Bluetooth;
+use super::traylist::TrayList;
 use super::wifi::Wifi;
 use super::{CardSize, Cx, Key, Module, ModuleId, SystemEvent};
 use crate::gfx::{Icon, TextStyle};
@@ -28,8 +29,11 @@ const BAR_GAP: f32 = 12.0;
 pub struct ControlCenter {
     wifi: Wifi,
     bt: Bluetooth,
-    /// 0 = Wi-Fi, 1 = Bluetooth.
+    tray: TrayList,
+    /// 0 = Wi-Fi, 1 = Bluetooth, 2 = Tray.
     tab: usize,
+    /// The tab drawn last time (to notice when Tray is opened).
+    shown: usize,
     /// Animated position between the tabs (0.0 .. 1.0).
     pos: f32,
     last: Instant,
@@ -37,7 +41,7 @@ pub struct ControlCenter {
 
 impl ControlCenter {
     pub fn new() -> Self {
-        Self { wifi: Wifi::new(), bt: Bluetooth::new(), tab: 0, pos: 0.0, last: Instant::now() }
+        Self { wifi: Wifi::new(), bt: Bluetooth::new(), tray: TrayList::new(), tab: 0, shown: 0, pos: 0.0, last: Instant::now() }
     }
 }
 
@@ -60,6 +64,7 @@ impl Module for ControlCenter {
     fn stop(&mut self) {
         self.wifi.stop();
         self.bt.stop();
+        self.tray.stop();
     }
 
     fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
@@ -73,6 +78,16 @@ impl Module for ControlCenter {
     fn on_system(&mut self, ev: &SystemEvent, cx: &mut Cx) {
         self.wifi.on_system(ev, cx);
         self.bt.on_system(ev, cx);
+    }
+
+    fn next_tick(&self) -> Option<Instant> {
+        self.tray.deadline()
+    }
+
+    fn on_tick(&mut self, cx: &mut Cx) {
+        if self.tray.finish(Instant::now()) {
+            cx.fx.redraw = true;
+        }
     }
 
     fn glance(&self) -> Option<(Icon, String)> {
@@ -131,10 +146,10 @@ impl Module for ControlCenter {
     }
 
     fn page_height(&self, w: f32) -> f32 {
-        let a = self.wifi.page_height(w);
-        let b = self.bt.page_height(w);
-        let t = self.pos.clamp(0.0, 1.0);
-        BAR_H + BAR_GAP + a + (b - a) * t
+        let h = [self.wifi.page_height(w), self.bt.page_height(w), self.tray.page_height(w)];
+        let t = self.pos.clamp(0.0, 2.0);
+        let i = (t.floor() as usize).min(1);
+        BAR_H + BAR_GAP + h[i] + (h[i + 1] - h[i]) * (t - i as f32)
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
@@ -145,7 +160,7 @@ impl Module for ControlCenter {
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
         let want = WANT_TAB.swap(-1, std::sync::atomic::Ordering::Relaxed);
-        if want == 0 || want == 1 {
+        if (0..=2).contains(&want) {
             self.tab = want as usize;
         }
         // glide toward the selected tab
@@ -166,7 +181,7 @@ impl Module for ControlCenter {
         if crate::ui::look_alcove() {
             // two capsules; the open one is white
             let mut x = bar.x;
-            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
+            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth"), (Icon::Grid, "Tray")].iter().enumerate() {
                 let w = crate::alcove::chip_w(ui, label, Some(*icon)) + 10.0;
                 let b = Rect::new(x, bar.y + 4.0, w, 30.0);
                 if crate::alcove::tab_chip(ui, b, label, Some(*icon), self.tab == i) {
@@ -176,11 +191,11 @@ impl Module for ControlCenter {
             }
         } else {
             // minimal: two quiet labels over a hairline, with one blue beam gliding under the open one
-            let half = bar.w * 0.5;
+            let half = bar.w / 3.0;
             ui.p.fill_rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), Color::white(0.07));
             let bx = bar.x + self.pos * half + half * 0.5;
             ui.p.fill_rounded(Rect::new(bx - 22.0, bar.bottom() - 2.5, 44.0, 2.5), 1.25, palette::BLUE);
-            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth")].iter().enumerate() {
+            for (i, (icon, label)) in [(Icon::Wifi, "Wi-Fi"), (Icon::Bluetooth, "Bluetooth"), (Icon::Grid, "Tray")].iter().enumerate() {
                 let b = Rect::new(bar.x + i as f32 * half, bar.y, half, bar.h);
                 if ui.hovered(b) {
                     ui.hot = true;
@@ -200,16 +215,20 @@ impl Module for ControlCenter {
         // wheel over the buttons: down = next, up = previous
         let wheel = ui.wheel(bar);
         if wheel < 0.0 {
-            self.tab = 1;
+            self.tab = (self.tab + 1).min(2);
         } else if wheel > 0.0 {
-            self.tab = 0;
+            self.tab = self.tab.saturating_sub(1);
         }
+        if self.tab == 2 && self.shown != 2 {
+            self.tray.enter();
+        }
+        self.shown = self.tab;
 
         // --- the two lists, sliding ------------------------------------------------
         let area = Rect::new(r.x, bar.bottom() + BAR_GAP, r.w, (r.h - BAR_H - BAR_GAP).max(0.0));
         let step = area.w + 28.0;
         ui.p.push_clip(area);
-        for i in 0..2usize {
+        for i in 0..3usize {
             let d = i as f32 - self.pos;
             let al = crate::ui::look_alcove();
             // Alcove: the lists move up and down and fade, like the pages do
@@ -225,14 +244,17 @@ impl Module for ControlCenter {
             // only the visible, settled list reacts to the mouse
             ui.interactive = was && settled && i == self.tab;
             let sub = Rect::new(area.x + off, area.y + off_y, area.w, area.h);
-            if i == 0 {
-                self.wifi.draw_page(ui, sub);
-            } else {
-                self.bt.draw_page(ui, sub);
+            match i {
+                0 => self.wifi.draw_page(ui, sub),
+                1 => self.bt.draw_page(ui, sub),
+                _ => self.tray.draw_page(ui, sub),
             }
             ui.interactive = was;
             ui.p.alpha = alpha;
         }
         ui.p.pop_clip();
+        if self.tab != 2 {
+            super::traylist::clear_tiles();
+        }
     }
 }
