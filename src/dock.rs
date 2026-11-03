@@ -28,7 +28,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Instant;
@@ -126,6 +126,10 @@ pub struct Dock {
     engage_to: f32,
     tracking: bool,
     pressed: Option<usize>,
+    /// Dragging a pinned icon to a new place: its index, where the press began and where the pointer is.
+    drag: Option<usize>,
+    press_x: f32,
+    drag_x: f32,
     shown: bool,
 }
 
@@ -175,6 +179,9 @@ impl Dock {
             engage_to: 0.0,
             tracking: false,
             pressed: None,
+            drag: None,
+            press_x: 0.0,
+            drag_x: 0.0,
             shown: false,
         })
     }
@@ -183,6 +190,7 @@ impl Dock {
     pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32) {
         // Settings reload on every change (a slider drag sends many): only redo what actually changed.
         let old = std::mem::replace(&mut self.cfg, cfg.clone());
+        self.cfg.items.retain(|s| !s.trim().is_empty());
         if old.auto_hide != cfg.auto_hide {
             self.region_full = None;
             if cfg.auto_hide {
@@ -440,7 +448,8 @@ impl Dock {
         }
         let (base, mag, gap, pad) = self.sizes();
         let (divider, _) = self.divider_flags();
-        let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, self.engage);
+        let engage = if self.drag.is_some() { 0.0 } else { self.engage };
+        let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, engage);
         let bar = self.bar_rect(&lay);
         let radius = bar.h * 0.36;
         let sc = self.scale;
@@ -452,7 +461,7 @@ impl Dock {
             if self.hide_t > 0.98 { 0.0 } else { op },
         );
         let hover =
-            if self.engage_to > 0.5 && self.hide_t < 0.3 { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
+            if self.engage_to > 0.5 && self.hide_t < 0.3 && self.drag.is_none() { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(e) => {
@@ -481,9 +490,14 @@ impl Dock {
                 };
                 let it = &self.items[i];
                 // a press squeezes the icon a little
-                let sq = if self.pressed == Some(i) { 0.9 } else { 1.0 };
+                let dragged = self.drag == Some(i);
+                let sq = if dragged { 1.06 } else if self.pressed == Some(i) { 0.9 } else { 1.0 };
                 let s = wd * sq;
-                let r = Rect::new(x + (wd - s) * 0.5, icon_bottom - s, s, s);
+                let mut r = Rect::new(x + (wd - s) * 0.5, icon_bottom - s, s, s);
+                if dragged {
+                    // follows the pointer, a little lifted
+                    r = Rect::new(self.drag_x - s * 0.5, icon_bottom - s - 8.0, s, s);
+                }
                 match self.icons.get(&it.key).and_then(|o| o.as_ref()) {
                     Some(img) => p.image(img, r, 0.0, 1.0),
                     None => {
@@ -602,6 +616,23 @@ impl Dock {
                 }
                 self.my = y;
                 self.mx_to = x;
+                if let (Some(i), None) = (self.pressed, self.drag) {
+                    if (x - self.press_x).abs() > 6.0 && i < self.pinned.len() {
+                        self.drag = Some(i);
+                        unsafe {
+                            let _ = SetCapture(self.hwnd);
+                        }
+                    }
+                }
+                if let Some(i) = self.drag {
+                    self.drag_x = x;
+                    let to = self.drop_slot(i, x);
+                    if to != i {
+                        self.move_pinned(i, to);
+                        self.drag = Some(to);
+                        self.pressed = Some(to);
+                    }
+                }
                 if self.cfg.auto_hide {
                     unsafe {
                         let _ = KillTimer(Some(self.hwnd), T_HIDE);
@@ -644,12 +675,27 @@ impl Dock {
             WM_LBUTTONDOWN => {
                 let (x, y) = self.point(lp);
                 self.pressed = self.item_at(x, y);
+                self.press_x = x;
                 self.draw(gfx);
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
                 let (x, y) = self.point(lp);
                 let was = self.pressed.take();
+                if self.drag.take().is_some() {
+                    // dropped: keep the new order
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    crate::config::set_value("dock", "items", &items_value(&self.cfg.items));
+                    if x < 0.0 || y < 0.0 || x > self.win_w || y > self.win_h {
+                        self.tracking = false;
+                        self.engage_to = 0.0;
+                        self.start_anim();
+                    }
+                    self.draw(gfx);
+                    return Some(LRESULT(0));
+                }
                 if let (Some(a), Some(b)) = (was, self.item_at(x, y)) {
                     if a == b {
                         self.activate(a);
@@ -703,6 +749,40 @@ impl Dock {
         let (x, y) = self.point(lp);
         let it = self.items.get(self.item_at(x, y)?)?;
         Some((it.label.clone(), it.path.clone(), it.pinned))
+    }
+
+    // -- dragging pinned icons --------------------------------------------------------------------
+
+    /// Where the dragged pinned icon `i` belongs for a pointer at `x`: its place among the pinned
+    /// icons, counted by how many of the others lie to its left (read from the resting layout).
+    fn drop_slot(&self, i: usize, x: f32) -> usize {
+        let (base, mag, gap, _) = self.sizes();
+        let (divider, _) = self.divider_flags();
+        let lay = layout(&divider, self.win_w, base, mag, gap, 0.0, 0.0);
+        let np = self.pinned.len();
+        let mut to = 0;
+        for (k, c) in self.cells.iter().enumerate() {
+            if let Some(j) = *c {
+                if j < np && j != i && lay[k].0 + lay[k].1 * 0.5 < x {
+                    to += 1;
+                }
+            }
+        }
+        to
+    }
+
+    /// Move pinned icon `from` to place `to`, in the shown list and in the saved list.
+    fn move_pinned(&mut self, from: usize, to: usize) {
+        let n = self.pinned.len();
+        if from >= n || to >= n || self.cfg.items.len() != n || self.items.len() < n {
+            return;
+        }
+        let it = self.pinned.remove(from);
+        self.pinned.insert(to, it);
+        let raw = self.cfg.items.remove(from);
+        self.cfg.items.insert(to, raw);
+        let shown = self.items.remove(from);
+        self.items.insert(to, shown);
     }
 
     // -- the pin picker -----------------------------------------------------------------------------
