@@ -404,6 +404,8 @@ pub struct Launcher {
     /// The contents sliding in after Tab: 0 to 1, and the way they come from (1 or -1).
     sw: f32,
     sw_dir: f32,
+    /// This time the glass shows the live screen behind it (media is playing) instead of one picture.
+    live: bool,
 }
 
 impl Launcher {
@@ -460,6 +462,7 @@ impl Launcher {
             ai: Ai::new(),
             sw: 1.0,
             sw_dir: 1.0,
+            live: false,
         })
     }
 
@@ -579,13 +582,14 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            self.blur_img = capture_blur(x, y, w, h, self.cfg.blur);
+            // media is playing: the system's own blur keeps showing what moves behind the window;
+            // otherwise the screen is copied once and blurred
+            self.live = self.cfg.glass && self.cfg.live && self.cfg.media_playing;
+            self.blur_img = if self.live || !self.cfg.glass { None } else { capture_blur(x, y, w, h, self.cfg.blur) };
             self.anim = 0.0;
             self.lh = 0.0;
             self.focus_t = 0.0;
             self.sel_y = 0.0;
-            // our own blur is used: switch the system backdrop off
-            self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         }
         self.open = true;
         self.visible = true;
@@ -1602,6 +1606,14 @@ impl Launcher {
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
+        // live glass: the system blur behind the card, following the card as it grows
+        let s0 = 0.95 + 0.05 * e;
+        let live_op = if self.live && self.cfg.glass { e } else { 0.0 };
+        self.host.set_backdrop_rounded(
+            Rect::new(ANCHOR.0 * sc * (1.0 - s0), ANCHOR.1 * sc * (1.0 - s0), W * s0 * sc, card_h * s0 * sc),
+            CARD_R * s0 * sc,
+            live_op,
+        );
         let mut ai_goal = None;
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
@@ -1622,10 +1634,17 @@ impl Launcher {
             card_xf(&mut p, &tr);
             let card = Rect::new(0.0, 0.0, W, card_h);
             let dark = self.cfg.dark;
+            let glass = self.cfg.glass;
             match &self.blur_img {
-                Some(img) => {
+                Some(img) if glass => {
                     let whole = Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc);
-                    p.image_window(img, whole, card, CARD_R, 1.0);
+                    // liquid glass: toward the edge the picture looks magnified, like thick glass, in a few soft steps
+                    let (cx, cy) = (card.cx(), card.cy());
+                    for (k, inset) in [(1.07, 0.0), (1.045, 5.0), (1.022, 9.0), (1.0, 13.0)] {
+                        let dest =
+                            Rect::new(cx + (whole.x - cx) * k, cy + (whole.y - cy) * k, whole.w * k, whole.h * k);
+                        p.image_window(img, dest, card.inset(inset), (CARD_R - inset).max(8.0), 1.0);
+                    }
                     let tint = if light {
                         Color::rgba(0.95, 0.97, 1.0, 0.35 + 0.5 * dark)
                     } else {
@@ -1633,12 +1652,35 @@ impl Launcher {
                     };
                     p.fill_rounded(card, CARD_R, tint);
                 }
-                // no picture of the screen: a solid card
-                None if light => p.fill_rounded(card, CARD_R, Color::rgba(0.93, 0.95, 0.98, 0.96)),
-                None => p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, dark.max(0.9))),
+                // media is playing: the system's blur is behind the card, only the tint is drawn
+                None if glass && self.live => {
+                    let tint = if light {
+                        Color::rgba(0.95, 0.97, 1.0, 0.25 + 0.4 * dark)
+                    } else {
+                        Color::rgba(0.03, 0.03, 0.05, dark * 0.75)
+                    };
+                    p.fill_rounded(card, CARD_R, tint);
+                }
+                // glass off, or no picture of the screen: a solid card
+                _ if light => p.fill_rounded(card, CARD_R, Color::rgba(0.93, 0.95, 0.98, 0.96)),
+                _ => p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, dark.max(0.9))),
             }
-            let rim = if light { Color::white(0.75) } else { Color::white(0.20) };
-            p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, rim);
+            if glass {
+                // the rim is the dock's (its thickness and brightness come from the dock settings)
+                let (rw, rb) = (self.cfg.rim_width, if light { 0.75 } else { self.cfg.rim_bright });
+                if rw > 0.05 && rb > 0.005 {
+                    p.stroke_rounded(card.inset(rw * 0.5), (CARD_R - rw * 0.5).max(0.0), rw, Color::white(rb));
+                }
+                // light catching the inside of the edge, and along the top
+                let inner = rw + 1.5;
+                p.stroke_rounded(card.inset(inner), (CARD_R - inner).max(0.0), 1.0, Color::white(0.09));
+                for (a, x0, x1) in [(0.28, 0.30, 0.70), (0.18, 0.18, 0.82), (0.12, 0.08, 0.92)] {
+                    p.line(W * x0, rw + 0.6, W * x1, rw + 0.6, 1.2, Color::white(a));
+                }
+            } else {
+                let rim = if light { Color::white(0.6) } else { Color::white(0.12) };
+                p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, rim);
+            }
             let sub = Rect::new(PAD, PAD, BOX, BOX);
             let act = Rect::new(PAD + BOX + GAP, PAD, BOX, BOX);
             // the focus glides from one box to the other

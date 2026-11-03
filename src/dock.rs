@@ -473,7 +473,7 @@ impl Dock {
         self.host.set_backdrop_rounded(
             Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, (bar.h + if self.cfg.melt { radius } else { 0.0 }) * sc),
             radius * sc,
-            if self.hide_t > 0.98 { 0.0 } else { op },
+            if self.hide_t > 0.98 || !self.cfg.glass { 0.0 } else { op },
         );
         let hover =
             if self.engage_to > 0.5 && self.hide_t < 0.3 && self.drag.is_none() { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
@@ -490,11 +490,15 @@ impl Dock {
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
             p.set_local(1.0, 0.0, 0.0, 0.0, dy);
+            if !self.cfg.glass {
+                // liquid glass off: a plain solid bar
+                p.fill_rounded(bar, radius, Color::rgba(0.06, 0.06, 0.08, 0.94));
+            }
             // plain blur: the blurred screen behind it plus one flat tint (the slider sets its strength)
             // no tint: the clear blur behind it is the whole background, `op` sets how strong it is
             // the white rim: thickness and brightness come from the settings
             let rw = self.cfg.rim_width;
-            if rw > 0.05 && self.cfg.rim_bright > 0.005 {
+            if self.cfg.glass && rw > 0.05 && self.cfg.rim_bright > 0.005 {
                 if self.cfg.melt {
                     if let Some(g) = melt_ring(&p, bar, radius, ear, rw) {
                         p.fill_geometry(&g, Color::white(self.cfg.rim_bright));

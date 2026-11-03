@@ -440,9 +440,20 @@ pub struct LauncherCfg {
     pub size: f32,
     /// Where a web search goes; what you typed is added at the end.
     pub search_url: String,
-    /// Handed over by the app (the Gemini mode asks with these settings); not stored here.
+    /// Liquid glass: the edge bends what is behind it and catches the light (off = a plain solid card).
+    pub glass: bool,
+    /// While media is playing the blur behind the launcher is live, so it shows what is playing.
+    pub live: bool,
+    /// Handed over by the app, not stored here: the Gemini settings, whether media is playing, and
+    /// the dock's rim (the launcher's rim follows it).
     #[serde(skip)]
     pub gemini: GeminiCfg,
+    #[serde(skip)]
+    pub media_playing: bool,
+    #[serde(skip)]
+    pub rim_width: f32,
+    #[serde(skip)]
+    pub rim_bright: f32,
 }
 
 impl Default for LauncherCfg {
@@ -453,10 +464,15 @@ impl Default for LauncherCfg {
             blur: 0.7,
             dark: 0.55,
             animate: true,
-            light: true,
+            light: false,
             size: 0.8,
+            glass: true,
+            live: true,
             search_url: "https://www.google.com/search?q=".to_string(),
             gemini: GeminiCfg::default(),
+            media_playing: false,
+            rim_width: 1.2,
+            rim_bright: 0.35,
         }
     }
 }
@@ -1219,7 +1235,11 @@ dark = 0.55
 # Opening, closing, the list dropping down and the underline move
 animate = true
 # Light frosted glass with dark writing (false = dark glass with white writing)
-light = true
+light = false
+# Liquid glass: the edge bends what is behind it and catches the light (false = a plain solid card)
+glass = true
+# While media is playing, the blur behind the launcher is live and shows what is playing
+live = true
 # How big the launcher is (0.5 = half, 1.0 = the original size)
 size = 0.8
 # Where a web search goes; what you typed is added at the end

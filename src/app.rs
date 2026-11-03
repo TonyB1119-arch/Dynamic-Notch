@@ -3702,9 +3702,12 @@ impl App {
     }
 
     /// The launcher's settings, with the Gemini settings it asks with.
-    fn launcher_cfg(&self) -> crate::config::LauncherCfg {
+    fn launcher_cfg(&mut self) -> crate::config::LauncherCfg {
         let mut cfg = self.cfg.launcher.clone();
         cfg.gemini = self.cfg.gemini.clone();
+        cfg.media_playing = self.module_index("media").is_some_and(|i| self.started[i] && self.modules[i].is_playing());
+        cfg.rim_width = self.cfg.dock.rim_width;
+        cfg.rim_bright = self.cfg.dock.rim_bright;
         cfg
     }
 

@@ -814,7 +814,7 @@ impl Settings {
         toggle_row(
             ui,
             row_rect(body, 13),
-            "Glass edge (bends what is behind)",
+            "Liquid glass: notch edge (bends what is behind)",
             a.glass_look,
             "appearance",
             "glass_look",
@@ -1098,6 +1098,9 @@ impl Settings {
             "launcher",
             "size",
         );
+        toggle_row(ui, row_rect(body, 16), "Liquid glass: dock", d.glass, "dock", "glass");
+        toggle_row(ui, row_rect(body, 17), "Liquid glass: launcher", l.glass, "launcher", "glass");
+        toggle_row(ui, row_rect(body, 18), "Launcher: live blur while media plays", l.live, "launcher", "live");
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
