@@ -74,8 +74,12 @@ const HEAD: f32 = 30.0;
 const ROW: f32 = 46.0;
 /// Rows of the list that show at once.
 const VIS: usize = 6;
-const FULL_H: f32 = FRAME_H + HEAD + VIS as f32 * ROW + 10.0;
+/// The list floats as its own glass panel this far below the two boxes.
+const LIST_GAP: f32 = 10.0;
+const LIST_Y: f32 = FRAME_H + LIST_GAP;
+const FULL_H: f32 = LIST_Y + HEAD + VIS as f32 * ROW + 10.0;
 const CARD_R: f32 = 34.0;
+const LIST_R: f32 = 28.0;
 const BOX_R: f32 = 24.0;
 
 /// Matches kept per search.
@@ -867,10 +871,12 @@ impl Launcher {
         true
     }
 
-    /// Only the glass card takes clicks; the rest of the window is empty.
-    fn set_region(&mut self, card_h: f32) {
+    /// Only the glass takes clicks (the boxes and, while it shows, the list below them); the rest of the
+    /// window is empty. `list_h` is how tall the floating list is (0 = none).
+    fn set_region(&mut self, list_h: f32) {
         let (_, _, wpx, hpx) = self.win_px;
-        let h = ((card_h * self.scale).ceil() as i32).min(hpx);
+        let bottom = if list_h > 0.5 { LIST_Y + list_h } else { FRAME_H };
+        let h = ((bottom * self.scale).ceil() as i32).min(hpx);
         if h == self.region_h || wpx == 0 {
             return;
         }
@@ -1688,7 +1694,7 @@ impl Launcher {
 
     fn row_at(&self, x: f32, y: f32) -> Option<usize> {
         let list = self.list_open && self.rows_len() > 0;
-        let y0 = FRAME_H + HEAD;
+        let y0 = LIST_Y + HEAD;
         if !list || x < 10.0 || x > W - 10.0 || y < y0 {
             return None;
         }
@@ -1958,9 +1964,8 @@ impl Launcher {
         let sc = self.scale;
         let e = logic::ease_out(self.anim);
         let shown = self.rows_len().min(VIS);
-        let card_h = FRAME_H + self.lh.max(0.0);
-        // clicks land on the card only: the region is as tall as the card is (or is about to be)
-        self.set_region(FRAME_H + self.lh.max(self.list_target()));
+        // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
+        self.set_region(self.lh.max(self.list_target()));
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
@@ -1986,42 +1991,23 @@ impl Launcher {
             let sw = logic::ease_out(self.sw);
             let ct = Tr { dx: self.sw_dir * (1.0 - sw) * 30.0, ..tr };
             card_xf(&mut p, &tr);
-            let card = Rect::new(0.0, 0.0, W, card_h);
+            let card = Rect::new(0.0, 0.0, W, FRAME_H);
+            // the list is a second piece of glass that floats below the boxes
+            let panel = Rect::new(0.0, LIST_Y, W, self.lh.max(0.0));
             let dark = self.cfg.dark;
             let glass = self.cfg.glass;
-            match &self.blur_img {
-                Some(img) if glass => {
-                    let whole = Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc);
-                    // liquid glass: toward the edge the picture looks magnified, like thick glass, in a few soft steps
-                    let (cx, cy) = (card.cx(), card.cy());
-                    for (k, inset) in [(1.07, 0.0), (1.045, 5.0), (1.022, 9.0), (1.0, 13.0)] {
-                        let dest =
-                            Rect::new(cx + (whole.x - cx) * k, cy + (whole.y - cy) * k, whole.w * k, whole.h * k);
-                        p.image_window(img, dest, card.inset(inset), (CARD_R - inset).max(8.0), 1.0);
-                    }
-                    let tint = if light {
-                        Color::rgba(0.95, 0.97, 1.0, 0.35 + 0.5 * dark)
-                    } else {
-                        Color::rgba(0.03, 0.03, 0.05, dark)
-                    };
-                    p.fill_rounded(card, CARD_R, tint);
-                }
-                // glass off, or no picture of the screen: a solid card
-                _ if light => p.fill_rounded(card, CARD_R, Color::rgba(0.93, 0.95, 0.98, 0.96)),
-                _ => p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, dark.max(0.9))),
-            }
-            if glass {
+            let gl = Glass {
+                img: self.blur_img.as_ref().filter(|_| glass),
+                whole: Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc),
+                light,
+                dark,
+                glass,
                 // the rim is the dock's (its thickness and brightness come from the dock settings)
-                let (rw, rb) = (self.cfg.rim_width, if light { 0.75 } else { self.cfg.rim_bright });
-                if rw > 0.05 && rb > 0.005 {
-                    p.stroke_rounded(card.inset(rw * 0.5), (CARD_R - rw * 0.5).max(0.0), rw, Color::white(rb));
-                }
-                // light catching the inside of the edge
-                let inner = rw + 1.5;
-                p.stroke_rounded(card.inset(inner), (CARD_R - inner).max(0.0), 1.0, Color::white(0.09));
-            } else {
-                let rim = if light { Color::white(0.6) } else { Color::white(0.12) };
-                p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, rim);
+                rim: (self.cfg.rim_width, if light { 0.75 } else { self.cfg.rim_bright }),
+            };
+            draw_glass(&mut p, &gl, card, CARD_R);
+            if panel.h > 8.0 {
+                draw_glass(&mut p, &gl, panel, LIST_R.min(panel.h * 0.5));
             }
             let sub = Rect::new(PAD, PAD, BOX, BOX);
             let act = Rect::new(PAD + BOX + GAP, PAD, BOX, BOX);
@@ -2029,15 +2015,18 @@ impl Launcher {
             let ft = self.focus_t;
             for (r, on) in [(sub, 1.0 - ft), (act, ft)] {
                 let w = 1.0 + 0.6 * on;
-                if light {
-                    // frosted white glass; the box with the focus turns soft blue
-                    let fill = Color::white(0.40).lerp(Color::rgba(0.62, 0.78, 0.97, 0.85), on);
-                    p.fill_rounded(r, BOX_R, fill);
-                    p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(0.55 + 0.30 * on));
+                // the boxes are more solid than the clearer glass around them; the focus turns them blue
+                let (calm, calm_rim) = if light {
+                    (Color::white(0.42), Color::white(0.55))
                 } else {
-                    p.fill_rounded(r, BOX_R, Color::white(0.09 + 0.08 * on));
-                    p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(0.15 + 0.40 * on));
+                    (Color::rgba(0.03, 0.04, 0.07, 0.28 + 0.30 * dark), Color::white(0.15))
+                };
+                p.fill_rounded(r, BOX_R, calm.lerp(sel_fill(light, 1.0), on));
+                if !light {
+                    // a faint sheen on the calm box
+                    p.fill_rounded(r, BOX_R, Color::white(0.06 * (1.0 - on)));
                 }
+                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, calm_rim.lerp(sel_rim(light), on));
             }
             // choosing a target: the left box keeps the thing the action is for
             let subj = self.pending.as_ref().map(|(_, h)| h).or(cur.as_ref());
@@ -2110,7 +2099,7 @@ impl Launcher {
             p.alpha = keep;
             card_xf(&mut p, &tr);
             if self.lh > 1.0 {
-                p.push_clip(card);
+                p.push_clip(panel);
                 let view = ListView {
                     hits: &self.hits,
                     icons: &self.icons,
@@ -2171,6 +2160,73 @@ fn white(a: f32) -> Color {
         Color::rgba(0.10, 0.12, 0.18, a)
     } else {
         Color::white(a)
+    }
+}
+
+/// The blue of whatever is selected; it is translucent, so the glass shows through. `k` scales how strong.
+fn sel_fill(light: bool, k: f32) -> Color {
+    if light {
+        Color::rgba(0.36, 0.64, 1.0, 0.50 * k)
+    } else {
+        Color::rgba(0.14, 0.40, 0.95, 0.50 * k)
+    }
+}
+
+/// The edge of something selected.
+fn sel_rim(light: bool) -> Color {
+    if light {
+        Color::rgba(0.55, 0.78, 1.0, 0.90)
+    } else {
+        Color::rgba(0.50, 0.72, 1.0, 0.70)
+    }
+}
+
+/// What the glass pieces (the box card and the floating list) have in common.
+struct Glass<'a> {
+    /// The blurred screen copy; none = a plain solid piece.
+    img: Option<&'a ImageData>,
+    /// Where that copy sits (the whole window).
+    whole: Rect,
+    light: bool,
+    dark: f32,
+    glass: bool,
+    /// Rim thickness and brightness.
+    rim: (f32, f32),
+}
+
+/// One piece of liquid glass: the blurred screen, magnified toward the edge like thick glass, a light
+/// tint (clearer than the boxes that sit on it), the rim and the light along the inside of the edge.
+fn draw_glass(p: &mut Painter, g: &Glass, r: Rect, radius: f32) {
+    match g.img {
+        Some(img) => {
+            let (cx, cy) = (r.cx(), r.cy());
+            for (k, inset) in [(1.07, 0.0), (1.045, 5.0), (1.022, 9.0), (1.0, 13.0)] {
+                let dest =
+                    Rect::new(cx + (g.whole.x - cx) * k, cy + (g.whole.y - cy) * k, g.whole.w * k, g.whole.h * k);
+                p.image_window(img, dest, r.inset(inset), (radius - inset).max(8.0), 1.0);
+            }
+            let tint = if g.light {
+                Color::rgba(0.95, 0.97, 1.0, 0.12 + 0.40 * g.dark)
+            } else {
+                Color::rgba(0.03, 0.03, 0.05, 0.62 * g.dark)
+            };
+            p.fill_rounded(r, radius, tint);
+        }
+        // glass off, or no picture of the screen: a solid piece
+        None if g.light => p.fill_rounded(r, radius, Color::rgba(0.93, 0.95, 0.98, 0.96)),
+        None => p.fill_rounded(r, radius, Color::rgba(0.05, 0.05, 0.07, g.dark.max(0.9))),
+    }
+    if g.glass {
+        let (rw, rb) = g.rim;
+        if rw > 0.05 && rb > 0.005 {
+            p.stroke_rounded(r.inset(rw * 0.5), (radius - rw * 0.5).max(0.0), rw, Color::white(rb));
+        }
+        // light catching the inside of the edge
+        let inner = rw + 1.5;
+        p.stroke_rounded(r.inset(inner), (radius - inner).max(0.0), 1.0, Color::white(0.09));
+    } else {
+        let rim = if g.light { Color::white(0.6) } else { Color::white(0.12) };
+        p.stroke_rounded(r.inset(0.5), radius - 0.5, 1.0, rim);
     }
 }
 
@@ -2624,8 +2680,8 @@ struct ListView<'a> {
 fn draw_list(p: &mut Painter, v: &ListView) {
     let base = p.alpha;
     let dim = TextStyle::new(11.5, white(0.55));
-    let head = Rect::new(PAD + 8.0, FRAME_H, W - 2.0 * (PAD + 8.0), HEAD);
-    let y0 = FRAME_H + HEAD;
+    let head = Rect::new(PAD + 8.0, LIST_Y, W - 2.0 * (PAD + 8.0), HEAD);
+    let y0 = LIST_Y + HEAD;
     let name_st = TextStyle::new(13.5, white(0.95)).semibold();
     let sub_st = TextStyle::new(10.5, white(0.5));
     let title = match v.focus {
@@ -2662,7 +2718,10 @@ fn draw_list(p: &mut Painter, v: &ListView) {
     let ha = ((v.lh - HEAD) / ROW).clamp(0.0, 1.0);
     if ha > 0.0 {
         p.alpha = base * ha;
-        p.fill_rounded(Rect::new(10.0, y0 + v.sel_y * ROW, W - 20.0, ROW - 2.0), 14.0, white(0.16));
+        let hl = Rect::new(10.0, y0 + v.sel_y * ROW, W - 20.0, ROW - 2.0);
+        let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        p.fill_rounded(hl, 14.0, sel_fill(light, 0.8));
+        p.stroke_rounded(hl.inset(0.5), 13.5, 1.0, sel_rim(light).lerp(Color::rgba(0.0, 0.0, 0.0, 0.0), 0.6));
     }
     let reveal = |i: usize| ((v.lh - HEAD - i as f32 * ROW) / ROW).clamp(0.0, 1.0);
     match v.focus {
