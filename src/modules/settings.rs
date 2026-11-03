@@ -18,7 +18,8 @@ use crate::updater;
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 10] = ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass"];
+const TABS: [&str; 11] =
+    ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass", "Combos"];
 const ROW_H: f32 = 36.0;
 const ROW_GAP: f32 = 4.0;
 const TAB_H: f32 = 32.0;
@@ -102,6 +103,8 @@ enum Focus {
     Name,
     Key,
     Model,
+    ComboKeys,
+    ComboTarget,
 }
 
 /// Where the "Check for updates" button stands.
@@ -122,6 +125,8 @@ pub struct Settings {
     name: TextField,
     key: TextField,
     model: TextField,
+    combo_keys: TextField,
+    combo_target: TextField,
     focus: Focus,
     /// How far the current tab is scrolled (a whole number of rows) when it is taller than the page.
     scroll: f32,
@@ -140,6 +145,8 @@ impl Settings {
             name: TextField::new(24),
             key: TextField::new(200).masked(),
             model: TextField::new(80),
+            combo_keys: TextField::new(40),
+            combo_target: TextField::new(260),
             focus: Focus::None,
             scroll: 0.0,
             has_key: false,
@@ -259,6 +266,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 16.0,
+        10 => 14.0,
         _ => 25.0,
     }
 }
@@ -365,8 +373,25 @@ impl Module for Settings {
             Focus::Name => self.name.key(key, self.hwnd),
             Focus::Key => self.key.key(key, self.hwnd),
             Focus::Model => self.model.key(key, self.hwnd),
+            Focus::ComboKeys => self.combo_keys.key(key, self.hwnd),
+            Focus::ComboTarget => self.combo_target.key(key, self.hwnd),
             Focus::None => false,
         };
+        if enter && self.focus == Focus::ComboKeys {
+            // Enter in the keys box moves on to the box for what to open
+            self.focus = Focus::ComboTarget;
+            cx.fx.layout_changed = true;
+            return;
+        }
+        if enter && self.focus == Focus::ComboTarget {
+            if let Some(list) = self.add_combo() {
+                cx.fx.save_config.push(("combos".into(), "items".into(), list_value(&list)));
+            }
+            cx.fx.keyboard_focus = Some(false);
+            self.focus = Focus::None;
+            cx.fx.layout_changed = true;
+            return;
+        }
         if enter {
             match self.focus {
                 Focus::City => {
@@ -387,7 +412,7 @@ impl Module for Settings {
                         self.say("Model saved", true);
                     }
                 }
-                Focus::None => {}
+                Focus::None | Focus::ComboKeys | Focus::ComboTarget => {}
             }
             cx.fx.keyboard_focus = Some(false);
             self.focus = Focus::None;
@@ -448,7 +473,8 @@ impl Module for Settings {
             6 => self.notch(ui, body),
             7 => self.tabs(ui, body),
             8 => self.dock(ui, body),
-            _ => self.glass(ui, body),
+            9 => self.glass(ui, body),
+            _ => self.combos(ui, body),
         }
         if long {
             ui.p.pop_clip();
@@ -1134,6 +1160,93 @@ impl Settings {
             Rect::new(body.x + 182.0, by, body.w - 182.0, 30.0),
             &TextStyle::new(11.5, palette::TEXT_FAINT),
         );
+    }
+
+    /// Check the two boxes and add the combo; returns the new list to save.
+    fn add_combo(&mut self) -> Option<Vec<String>> {
+        let keys = self.combo_keys.text().trim().to_string();
+        let target = self.combo_target.text().trim().replace('|', " ");
+        if let Err(e) = crate::hotkeys::check_combo(&keys) {
+            self.say(e, false);
+            return None;
+        }
+        if target.is_empty() {
+            self.say("Say what it should open: an app, file, folder, link or browser", false);
+            return None;
+        }
+        let mut items = self.cfg.combos.items.clone();
+        // the same keys again replace the old combo
+        items.retain(|s| !s.split_once('|').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(&keys)));
+        if items.len() >= 12 {
+            self.say("That is the most combos (12)", false);
+            return None;
+        }
+        items.push(format!("{keys}|{target}"));
+        self.combo_keys.clear();
+        self.combo_target.clear();
+        self.say("Combo added", true);
+        Some(items)
+    }
+
+    fn combos(&mut self, ui: &mut Ui, body: Rect) {
+        let accent = ui.accent;
+        let row = row_rect(body, 0);
+        ui.p.text(
+            "Your own hotkeys. Example: Win+B opens your default browser (type browser).",
+            Rect::new(row.x + 2.0, row.y, row.w, row.h),
+            &TextStyle::new(11.5, palette::TEXT_DIM),
+        );
+        let row = row_rect(body, 1);
+        let add = Rect::new(row.right() - 74.0, row.y + 2.0, 74.0, row.h - 4.0);
+        let kf = Rect::new(row.x, row.y + 2.0, 150.0, row.h - 4.0);
+        let tf = Rect::new(kf.right() + 8.0, row.y + 2.0, add.x - 8.0 - (kf.right() + 8.0), row.h - 4.0);
+        if self.combo_keys.draw(ui, kf, "Win+B", accent, self.focus == Focus::ComboKeys) {
+            self.focus = Focus::ComboKeys;
+            ui.fx.keyboard_focus = Some(true);
+        }
+        if self.combo_target.draw(
+            ui,
+            tf,
+            "browser, an app, a folder or a link",
+            accent,
+            self.focus == Focus::ComboTarget,
+        ) {
+            self.focus = Focus::ComboTarget;
+            ui.fx.keyboard_focus = Some(true);
+        }
+        if ui.pill_button(add, "Add", None, ButtonStyle::inverted()) {
+            if let Some(list) = self.add_combo() {
+                put(ui, "combos", "items", list_value(&list));
+            }
+            self.focus = Focus::None;
+            ui.fx.keyboard_focus = Some(false);
+        }
+        let items = self.cfg.combos.items.clone();
+        if items.is_empty() {
+            let row = row_rect(body, 2);
+            ui.p.text(
+                "No combos yet. Type keys like Ctrl+Alt+G, then what to open, then press Add.",
+                Rect::new(row.x + 2.0, row.y, row.w, row.h),
+                &TextStyle::new(11.5, palette::TEXT_FAINT),
+            );
+        }
+        for (i, item) in items.iter().enumerate().take(12) {
+            let row = row_rect(body, 2 + i);
+            let (keys, target) = item.split_once('|').unwrap_or((item.as_str(), ""));
+            label(ui, row, keys.trim());
+            let x = row.x + 160.0;
+            ui.p.text(
+                &crate::util::one_line(target.trim()),
+                Rect::new(x, row.y, row.right() - x - 48.0, row.h),
+                &TextStyle::new(12.0, palette::TEXT_DIM),
+            );
+            let rm = Rect::new(row.right() - 36.0, row.y + 4.0, 28.0, row.h - 8.0);
+            if ui.icon_button(rm, Icon::Close, ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)) {
+                let mut next = items.clone();
+                next.remove(i);
+                put(ui, "combos", "items", list_value(&next));
+            }
+        }
     }
 
     fn gemini(&mut self, ui: &mut Ui, body: Rect) {

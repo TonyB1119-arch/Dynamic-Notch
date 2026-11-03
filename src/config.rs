@@ -39,6 +39,7 @@ pub struct Config {
     pub glass: GlassCfg,
     pub dock: DockCfg,
     pub launcher: LauncherCfg,
+    pub combos: CombosCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -402,6 +403,14 @@ impl Default for ShelfCfg {
     fn default() -> Self {
         Self { remember: true }
     }
+}
+
+/// Combos: your own hotkeys that open things.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CombosCfg {
+    /// "Win+B|browser": the keys, a bar, and what to open (an app, file, folder, link or `browser`).
+    pub items: Vec<String>,
 }
 
 /// The quick launcher (hotkey: `[hotkeys] launcher`).
@@ -922,6 +931,7 @@ impl Config {
         self.glass.clamped();
         self.dock.clamped();
         self.launcher.clamped();
+        self.combos.items.truncate(24);
         self.home.widgets.truncate(4);
         self.notch.widgets.truncate(3);
         self
@@ -1199,6 +1209,12 @@ light = true
 size = 0.8
 # Where a web search goes; what you typed is added at the end
 search_url = "https://www.google.com/search?q="
+
+[combos]
+# Your own hotkeys that open things, easiest to change in Settings (Combos tab).
+# Each one is 'keys|what to open'. "browser" means your default browser.
+# For example: items = ['Win+B|browser', 'Ctrl+Alt+N|notepad.exe']
+items = []
 
 [glass]
 # The Alcove glass edge (Settings → Glass). Sizes are in logical pixels; delete a line to get its default.

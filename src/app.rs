@@ -1878,6 +1878,11 @@ impl App {
                 self.broadcast(SystemEvent::Command { verb: "dictate".into(), args: vec!["hotkey".into()] })
             }
             Action::Launcher => self.launcher_toggle(),
+            Action::Combo(i) => {
+                if let Some((_, target)) = self.cfg.combos.items.get(i).and_then(|s| s.split_once('|')) {
+                    hotkeys::open_target(target, &self.cfg.launcher.search_url);
+                }
+            }
         }
     }
 
@@ -2013,8 +2018,11 @@ impl App {
     }
 
     fn register_hotkeys(&mut self) {
-        let (ok, errors) = hotkeys::register_all(self.hwnd, &self.cfg.hotkeys);
+        let (ok, mut errors) = hotkeys::register_all(self.hwnd, &self.cfg.hotkeys);
+        let (combos, combo_errors) = hotkeys::register_combos(self.hwnd, &self.cfg.combos.items);
         self.hotkeys = ok;
+        self.hotkeys.extend(combos);
+        errors.extend(combo_errors);
         self.dictate_vk = hotkeys::parse(&self.cfg.hotkeys.dictate).map_or(0, |(_, vk)| vk as u16);
         if !errors.is_empty() {
             log!("hotkey problems: {errors:?}");

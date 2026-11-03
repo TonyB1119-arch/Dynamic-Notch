@@ -14,6 +14,8 @@ pub enum Action {
     PlayPause,
     Dictate,
     Launcher,
+    /// One of the user's combos (its place in `[combos] items`).
+    Combo(usize),
 }
 
 const BASE_ID: i32 = 0x4E00;
@@ -130,6 +132,75 @@ pub fn unregister_all(hwnd: HWND) {
             let _ = UnregisterHotKey(Some(hwnd), BASE_ID + i);
         }
     }
+    for i in 0..MAX_COMBOS {
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), COMBO_BASE + i as i32);
+        }
+    }
+}
+
+const COMBO_BASE: i32 = BASE_ID + 32;
+const MAX_COMBOS: usize = 24;
+
+/// Is this a key combination a combo may use? It needs Ctrl, Alt, Shift or Win (or be an F key), so a
+/// combo can't take over a plain letter.
+pub fn check_combo(keys: &str) -> Result<(), &'static str> {
+    let Some((mods, vk)) = parse(keys) else {
+        return Err("Can't read that key combination (try Win+B or Ctrl+Alt+G)");
+    };
+    let has_mod = mods.0 & (MOD_CONTROL.0 | MOD_ALT.0 | MOD_SHIFT.0 | MOD_WIN.0) != 0;
+    let f_key = (VK_F1.0 as u32..=VK_F24.0 as u32).contains(&vk);
+    if has_mod || f_key {
+        Ok(())
+    } else {
+        Err("Add Ctrl, Alt, Shift or Win to the keys")
+    }
+}
+
+/// Register the user's combos ("keys|what to open"). Returns what worked and what did not.
+pub fn register_combos(hwnd: HWND, items: &[String]) -> (Vec<Registered>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut errors = Vec::new();
+    for (i, item) in items.iter().take(MAX_COMBOS).enumerate() {
+        let Some((keys, _)) = item.split_once('|') else {
+            errors.push(format!("combo \"{item}\" has no |"));
+            continue;
+        };
+        let keys = keys.trim();
+        if let Err(e) = check_combo(keys) {
+            errors.push(format!("{keys}: {e}"));
+            continue;
+        }
+        let (mods, vk) = parse(keys).unwrap_or((MOD_NOREPEAT, 0));
+        let id = COMBO_BASE + i as i32;
+        if unsafe { RegisterHotKey(Some(hwnd), id, mods, vk) }.is_ok() {
+            ok.push(Registered { id, action: Action::Combo(i) });
+        } else {
+            errors.push(format!("{keys} is already in use"));
+        }
+    }
+    (ok, errors)
+}
+
+/// Open what a combo points at: `browser` is the default browser, anything else is opened as typed
+/// (an app, file, folder or link; %VARIABLES% work).
+pub fn open_target(target: &str, search_url: &str) {
+    let t = target.trim();
+    if t.is_empty() {
+        return;
+    }
+    if t.eq_ignore_ascii_case("browser") || t.eq_ignore_ascii_case("default browser") {
+        // the start page of the search engine opens the default browser
+        let site = search_url
+            .strip_prefix("https://")
+            .or_else(|| search_url.strip_prefix("http://"))
+            .and_then(|r| r.split('/').next())
+            .filter(|h| !h.is_empty())
+            .map_or("https://www.google.com".to_string(), |h| format!("https://{h}"));
+        crate::sys::shell_open(&site);
+    } else {
+        crate::sys::shell_open(&crate::dock::expand_env(t));
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +216,14 @@ mod tests {
         assert_eq!(parse("Alt+F12").unwrap().1, VK_F12.0 as u32);
         assert!(parse("Ctrl+Nope").is_none());
         assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn combos_need_a_modifier() {
+        assert!(check_combo("Win+B").is_ok());
+        assert!(check_combo("Ctrl+Alt+G").is_ok());
+        assert!(check_combo("F9").is_ok());
+        assert!(check_combo("B").is_err());
+        assert!(check_combo("Win+Nope").is_err());
     }
 }

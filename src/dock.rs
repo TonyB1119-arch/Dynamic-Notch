@@ -1063,7 +1063,7 @@ fn with_key(mut it: Item) -> Item {
     it
 }
 
-fn expand_env(s: &str) -> String {
+pub fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(a) = rest.find('%') {
