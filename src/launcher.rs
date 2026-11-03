@@ -1144,6 +1144,8 @@ impl Launcher {
                 SetTimer(Some(self.hwnd), T_ICON, 6, None);
             }
         }
+        LIGHT.store(self.cfg.light, std::sync::atomic::Ordering::Relaxed);
+        let light = self.cfg.light;
         let sc = self.scale;
         let e = logic::ease_out(self.anim);
         let shown = self.rows_len().min(VIS);
@@ -1173,20 +1175,34 @@ impl Launcher {
                 Some(img) => {
                     let whole = Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc);
                     p.image_window(img, whole, card, CARD_R, 1.0);
-                    p.fill_rounded(card, CARD_R, Color::rgba(0.03, 0.03, 0.05, dark));
+                    let tint = if light {
+                        Color::rgba(0.95, 0.97, 1.0, 0.35 + 0.5 * dark)
+                    } else {
+                        Color::rgba(0.03, 0.03, 0.05, dark)
+                    };
+                    p.fill_rounded(card, CARD_R, tint);
                 }
-                // no picture of the screen: a solid dark card
+                // no picture of the screen: a solid card
+                None if light => p.fill_rounded(card, CARD_R, Color::rgba(0.93, 0.95, 0.98, 0.96)),
                 None => p.fill_rounded(card, CARD_R, Color::rgba(0.05, 0.05, 0.07, dark.max(0.9))),
             }
-            p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, white(0.20));
+            let rim = if light { Color::white(0.75) } else { Color::white(0.20) };
+            p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, rim);
             let sub = Rect::new(PAD, PAD, BOX, BOX);
             let act = Rect::new(PAD + BOX + GAP, PAD, BOX, BOX);
             // the focus glides from one box to the other
             let ft = self.focus_t;
             for (r, on) in [(sub, 1.0 - ft), (act, ft)] {
-                p.fill_rounded(r, BOX_R, white(0.09 + 0.08 * on));
                 let w = 1.0 + 0.6 * on;
-                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, white(0.15 + 0.40 * on));
+                if light {
+                    // frosted white glass; the box with the focus turns soft blue
+                    let fill = Color::white(0.40).lerp(Color::rgba(0.62, 0.78, 0.97, 0.85), on);
+                    p.fill_rounded(r, BOX_R, fill);
+                    p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(0.55 + 0.30 * on));
+                } else {
+                    p.fill_rounded(r, BOX_R, Color::white(0.09 + 0.08 * on));
+                    p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, Color::white(0.15 + 0.40 * on));
+                }
             }
             let icon = cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
             let subject = Look {
@@ -1240,13 +1256,25 @@ impl Drop for Launcher {
 
 // -- pieces of the picture -----------------------------------------------------------------------------
 
+/// Light glass look (dark writing) or dark glass look (white writing); set at the start of every frame.
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The colour of writing, icons and soft highlights: white on dark glass, dark ink on light glass.
 fn white(a: f32) -> Color {
-    Color::white(a)
+    if LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+        Color::rgba(0.10, 0.12, 0.18, a)
+    } else {
+        Color::white(a)
+    }
 }
 
-fn magnifier(p: &Painter, cx: f32, cy: f32, c: Color) {
-    p.stroke_circle(cx - 5.0, cy - 5.0, 17.0, 4.0, c);
-    p.line(cx + 7.5, cy + 7.5, cx + 20.0, cy + 20.0, 4.5, c);
+/// The icon of an empty search box: a letter and a text cursor.
+fn type_glyph(p: &mut Painter, cx: f32, cy: f32, c: Color) {
+    p.text("A", Rect::centered(cx - 10.0, cy, 44.0, 56.0), &TextStyle::new(46.0, c).center());
+    let x = cx + 17.0;
+    p.fill_rect(Rect::new(x - 0.75, cy - 18.0, 1.5, 36.0), c);
+    p.fill_rect(Rect::new(x - 5.0, cy - 18.0, 10.0, 1.5), c);
+    p.fill_rect(Rect::new(x - 5.0, cy + 16.5, 10.0, 1.5), c);
 }
 
 /// How the card sits at this moment (it fades and grows a little while opening and closing).
@@ -1344,17 +1372,12 @@ struct Look<'a> {
 fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     let cx = r.cx();
     let Some(h) = v.cur else {
-        magnifier(p, cx, r.y + 64.0, white(0.78));
-        let msg = if v.ready { "Type to search" } else { "Getting ready…" };
+        type_glyph(p, cx, r.y + 68.0, white(0.62));
+        let msg = if v.ready { "Type…" } else { "Getting ready…" };
         p.text(
             msg,
-            Rect::new(r.x + 10.0, r.y + 106.0, r.w - 20.0, 22.0),
-            &TextStyle::new(13.5, white(0.7)).semibold().center(),
-        );
-        p.text(
-            "apps · files · sums · links",
-            Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0),
-            &TextStyle::new(10.5, white(0.42)).center(),
+            Rect::new(r.x + 10.0, r.y + 118.0, r.w - 20.0, 20.0),
+            &TextStyle::new(11.5, white(0.80)).semibold().center(),
         );
         return;
     };
@@ -1380,11 +1403,6 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
             Rect::new(r.x + 10.0, r.y + 116.0 + slide, r.w - 20.0, 20.0),
             &TextStyle::new(12.0, white(0.78)).semibold().center(),
         );
-        p.text(
-            "Weather",
-            Rect::new(r.x + 10.0, r.y + 138.0, r.w - 20.0, 18.0),
-            &TextStyle::new(10.5, white(0.5)).center(),
-        );
         p.alpha = a0;
         return;
     }
@@ -1397,41 +1415,39 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
             &TextStyle::new(36.0, white(0.96)).semibold().center(),
         );
     } else {
-        let ir = Rect::centered(cx, r.y + 62.0, 72.0, 72.0);
+        let ir = Rect::centered(cx, r.y + 68.0, 72.0, 72.0);
         pop_xf(p, v.tr, k, cx, ir.cy());
         p.alpha = a0 * (0.3 + 0.7 * fade);
         draw_thumb(p, ir, h, v.icon, v.wx);
         card_xf(p, v.tr);
     }
     p.alpha = a0 * (0.35 + 0.65 * fade);
-    let name_r = Rect::new(r.x + 10.0, r.y + 104.0 + slide, r.w - 20.0, 24.0);
-    let st = TextStyle::new(14.0, white(0.96)).semibold().center();
+    let name_r = Rect::new(r.x + 10.0, r.y + 116.0 + slide, r.w - 20.0, 22.0);
+    let st = TextStyle::new(11.5, white(0.90)).semibold().center();
     p.text(shown, name_r, &st);
     if h.kind.has_icon() {
         underline(p, shown, &h.spans, name_r, &st, true, v.ul);
     }
-    p.alpha = a0 * fade;
-    let caption = if h.kind == Kind::Day { h.detail.as_str() } else { h.kind.label() };
-    p.text(caption, Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0), &TextStyle::new(10.5, white(0.5)).center());
+    if h.kind == Kind::Day {
+        p.alpha = a0 * fade;
+        p.text(
+            &h.detail,
+            Rect::new(r.x + 10.0, r.y + 138.0, r.w - 20.0, 18.0),
+            &TextStyle::new(10.5, white(0.55)).center(),
+        );
+    }
     p.alpha = a0;
 }
 
-fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused: bool, pop: f32, tr: &Tr) {
+fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, _focused: bool, pop: f32, tr: &Tr) {
     let cx = r.cx();
-    let Some(h) = cur else {
-        p.text(
-            "Action",
-            Rect::new(r.x + 10.0, r.y + 106.0, r.w - 20.0, 22.0),
-            &TextStyle::new(13.5, white(0.4)).semibold().center(),
-        );
-        return;
-    };
+    let Some(h) = cur else { return };
     let acts = actions(h);
     let a = acts[act.min(acts.len() - 1)];
     let a0 = p.alpha;
     let fade = logic::ease_out((pop * 1.6).min(1.0));
     let k = 0.80 + 0.20 * logic::ease_back(pop);
-    let ir = Rect::centered(cx, r.y + 62.0, 46.0, 46.0);
+    let ir = Rect::centered(cx, r.y + 68.0, 56.0, 56.0);
     pop_xf(p, tr, k, cx, ir.cy());
     p.alpha = a0 * (0.3 + 0.7 * fade);
     p.icon(a.icon(), ir, white(0.92));
@@ -1440,18 +1456,9 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, focused:
     let slide = (1.0 - fade) * 5.0;
     p.text(
         a.label(),
-        Rect::new(r.x + 10.0, r.y + 104.0 + slide, r.w - 20.0, 24.0),
-        &TextStyle::new(14.0, white(0.96)).semibold().center(),
+        Rect::new(r.x + 10.0, r.y + 116.0 + slide, r.w - 20.0, 22.0),
+        &TextStyle::new(11.5, white(0.90)).semibold().center(),
     );
-    let hint = if acts.len() < 2 {
-        ""
-    } else if focused {
-        "↓ more actions"
-    } else {
-        "Tab to change"
-    };
-    p.alpha = a0 * fade;
-    p.text(hint, Rect::new(r.x + 10.0, r.y + 130.0, r.w - 20.0, 18.0), &TextStyle::new(10.5, white(0.5)).center());
     p.alpha = a0;
 }
 

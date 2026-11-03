@@ -418,6 +418,8 @@ pub struct LauncherCfg {
     pub dark: f32,
     /// Opening, closing, the list dropping down and the underline all move.
     pub animate: bool,
+    /// Light frosted glass with dark writing (false = dark glass with white writing).
+    pub light: bool,
     /// Where a web search goes; what you typed is added at the end.
     pub search_url: String,
 }
@@ -430,6 +432,7 @@ impl Default for LauncherCfg {
             blur: 0.7,
             dark: 0.55,
             animate: true,
+            light: true,
             search_url: "https://www.google.com/search?q=".to_string(),
         }
     }
@@ -1186,6 +1189,8 @@ blur = 0.7
 dark = 0.55
 # Opening, closing, the list dropping down and the underline move
 animate = true
+# Light frosted glass with dark writing (false = dark glass with white writing)
+light = true
 # Where a web search goes; what you typed is added at the end
 search_url = "https://www.google.com/search?q="
 

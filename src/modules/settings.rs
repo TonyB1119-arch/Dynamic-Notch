@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 14.0,
+        8 => 15.0,
         _ => 25.0,
     }
 }
@@ -1027,6 +1027,7 @@ impl Settings {
             "dark",
         );
         toggle_row(ui, row_rect(body, 13), "Launcher animations", l.animate, "launcher", "animate");
+        toggle_row(ui, row_rect(body, 14), "Launcher light look", l.light, "launcher", "light");
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
