@@ -498,8 +498,8 @@ impl Launcher {
             let work = mi.rcWork;
             let (wpx, hpx) = ((W * scale).ceil() as i32, (FULL_H * scale).ceil() as i32);
             let x = (work.left + work.right) / 2 - wpx / 2;
-            // the two boxes sit in the middle of the screen (a little above the exact middle); the list drops below them
-            let mid = work.top + ((work.bottom - work.top) as f32 * 0.46) as i32;
+            // the two boxes sit in the middle of the screen (a bit above the exact middle); the list drops below them
+            let mid = work.top + ((work.bottom - work.top) as f32 * 0.40) as i32;
             let mut y = mid - (FRAME_H * scale * 0.5) as i32;
             if y + hpx > work.bottom - 8 {
                 y = (work.bottom - 8 - hpx).max(work.top + 8);
