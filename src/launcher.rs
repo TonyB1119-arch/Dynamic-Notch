@@ -11,6 +11,9 @@
 //! window opening and closing, the list dropping down, the highlight sliding, the underline growing);
 //! the animation timer runs only while something is moving.
 //!
+//! Three modes, switched with Tab while it is open: searching, the clipboard history (Win+C) and a
+//! one-question chat with Gemini (Win+G): the question on the left, the answer on the right.
+//!
 //! Cost: nothing exists until the hotkey is pressed for the first time. The window, its drawing
 //! surface and the lists are built then; 20 seconds after it closes the drawing memory is handed
 //! back, and after five minutes everything is gone again. While it is closed it uses no CPU.
@@ -38,7 +41,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::UI::Composition::Compositor;
 
-use crate::config::LauncherCfg;
+use crate::config::{GeminiCfg, LauncherCfg};
 use crate::gfx::{Gfx, Icon, ImageData, Painter, Res, TextStyle};
 use crate::host::Host;
 use crate::modules::weather::Brief;
@@ -53,6 +56,8 @@ const T_FREE: usize = 4;
 const T_FLASH: usize = 5;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
+/// Gemini has sent more of the answer.
+const WM_AI: u32 = WM_APP + 32;
 
 // -- layout (dips) -------------------------------------------------------------------------------------
 const PAD: f32 = 14.0;
@@ -214,6 +219,80 @@ struct Hit {
 enum Mode {
     Search,
     Clip,
+    Ai,
+}
+
+impl Mode {
+    /// The next mode (or the one before) when Tab (Shift+Tab) is pressed.
+    fn cycle(self, back: bool) -> Mode {
+        match (self, back) {
+            (Mode::Search, false) | (Mode::Ai, true) => Mode::Clip,
+            (Mode::Clip, false) | (Mode::Search, true) => Mode::Ai,
+            (Mode::Ai, false) | (Mode::Clip, true) => Mode::Search,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Mode::Search => 0,
+            Mode::Clip => 1,
+            Mode::Ai => 2,
+        }
+    }
+}
+
+/// How far the Gemini question has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AiState {
+    Idle,
+    Waiting,
+    Done,
+    Failed,
+}
+
+/// The answer as the background request fills it in.
+struct AiShared {
+    /// Which question this belongs to (an answer to an older one is ignored).
+    seq: u64,
+    text: String,
+    done: bool,
+    err: Option<String>,
+}
+
+/// The Gemini mode: one question, one answer.
+struct Ai {
+    seq: u64,
+    state: AiState,
+    text: String,
+    /// How far the answer is scrolled, and how far it can be (set while drawing).
+    scroll: f32,
+    max_scroll: f32,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    shared: Arc<Mutex<AiShared>>,
+}
+
+impl Ai {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            state: AiState::Idle,
+            text: String::new(),
+            scroll: 0.0,
+            max_scroll: 0.0,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shared: Arc::new(Mutex::new(AiShared { seq: 0, text: String::new(), done: false, err: None })),
+        }
+    }
+
+    /// Stop the request that is running and forget the answer.
+    fn clear(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.seq += 1;
+        self.state = AiState::Idle;
+        self.text = String::new();
+        self.scroll = 0.0;
+        self.max_scroll = 0.0;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -282,6 +361,7 @@ pub struct Launcher {
     blur_img: Option<ImageData>,
     wx: Option<std::rc::Rc<crate::modules::weather::Brief>>,
     scratch: Vec<usize>,
+    ai: Ai,
 }
 
 impl Launcher {
@@ -335,6 +415,7 @@ impl Launcher {
             blur_img: None,
             wx: None,
             scratch: Vec::new(),
+            ai: Ai::new(),
         })
     }
 
@@ -370,6 +451,16 @@ impl Launcher {
             self.hide();
         } else {
             self.mode = Mode::Clip;
+            self.show(gfx, ui_scale, true);
+        }
+    }
+
+    /// The Gemini hotkey: ask one quick question.
+    pub fn toggle_ai(&mut self, gfx: &Gfx, ui_scale: f32) {
+        if self.open && self.mode == Mode::Ai {
+            self.hide();
+        } else {
+            self.mode = Mode::Ai;
             self.show(gfx, ui_scale, true);
         }
     }
@@ -421,12 +512,14 @@ impl Launcher {
         self.list_open = false;
         self.high = None;
         self.mouse = (-1.0, -1.0);
+        self.ai.clear();
         // nothing typed yet: the apps used most are what the Down arrow lists (a combo shows its own thing)
         if let Some(h) = self.pinned.take() {
             self.hits.push(h);
         } else {
             self.search();
         }
+
         // the clipboard history is a list: it is open from the start
         self.list_open = self.mode == Mode::Clip && !self.hits.is_empty();
         if self.cfg.files && !self.files_started && self.mode == Mode::Search {
@@ -495,6 +588,7 @@ impl Launcher {
         self.visible = false;
         self.query.clear();
         self.hits.clear();
+        self.ai.clear();
         self.list_open = false;
         self.lh = 0.0;
         self.wx = None;
@@ -624,6 +718,11 @@ impl Launcher {
     // -- search -----------------------------------------------------------------------------------------
 
     fn search(&mut self) {
+        if self.mode == Mode::Ai {
+            self.hits.clear();
+            self.wx = None;
+            return;
+        }
         if self.mode == Mode::Clip {
             self.clip_search();
             return;
@@ -890,6 +989,86 @@ impl Launcher {
 
     // -- doing it ----------------------------------------------------------------------------------------
 
+    /// Send the question to Gemini (the key is the one from Settings → Gemini).
+    fn ask(&mut self) {
+        let question = self.query.trim().to_string();
+        if question.is_empty() {
+            return;
+        }
+        self.ai.clear();
+        let key = crate::sys::dotenv::get_saved_first(crate::modules::gemini::KEY_VAR)
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
+        let Some(key) = key else {
+            self.ai.state = AiState::Failed;
+            self.ai.text = "There is no Gemini key yet. Paste one in Settings \u{2192} Gemini and ask again.".into();
+            return;
+        };
+        self.ai.state = AiState::Waiting;
+        self.ai.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut sh) = self.ai.shared.lock() {
+            *sh = AiShared { seq: self.ai.seq, text: String::new(), done: false, err: None };
+        }
+        spawn_ai(
+            self.ai.shared.clone(),
+            SendHwnd::new(self.hwnd),
+            self.ai.seq,
+            self.ai.cancel.clone(),
+            self.cfg.gemini.clone(),
+            key,
+            question,
+        );
+    }
+
+    /// Take what the request has written so far. True when the picture needs to change.
+    fn ai_poll(&mut self) -> bool {
+        let (text, done, err) = match self.ai.shared.lock() {
+            Ok(sh) if sh.seq == self.ai.seq && self.ai.state == AiState::Waiting => {
+                (sh.text.clone(), sh.done, sh.err.clone())
+            }
+            _ => return false,
+        };
+        let before = (self.ai.text.len(), self.ai.state);
+        if let Some(e) = err {
+            self.ai.state = AiState::Failed;
+            self.ai.text = if text.is_empty() { e } else { format!("{text}\n\n{e}") };
+        } else {
+            self.ai.text = text;
+            if done {
+                self.ai.state = AiState::Done;
+            }
+        }
+        before != (self.ai.text.len(), self.ai.state)
+    }
+
+    /// Keys that mean something else in Gemini mode. True when the key was used.
+    fn ai_key(&mut self, vk: u16, ctrl: bool) -> bool {
+        let step = |me: &mut Self, d: f32| me.ai.scroll = (me.ai.scroll + d).clamp(0.0, me.ai.max_scroll);
+        match VIRTUAL_KEY(vk) {
+            VK_RETURN => self.ask(),
+            VK_DOWN => step(self, 24.0),
+            VK_UP => step(self, -24.0),
+            VK_NEXT => step(self, 120.0),
+            VK_PRIOR => step(self, -120.0),
+            VK_HOME => step(self, f32::MIN / 2.0),
+            VK_END => step(self, f32::MAX / 2.0),
+            // Ctrl+C: take the answer along
+            VK_C if ctrl && self.ai.state == AiState::Done => {
+                clip::set_text(self.hwnd, &self.ai.text);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn query_limit(&self) -> usize {
+        if self.mode == Mode::Ai {
+            400
+        } else {
+            200
+        }
+    }
+
     fn run(&mut self) {
         let Some(h) = self.cur().cloned() else { return };
         let acts = actions(&h);
@@ -984,6 +1163,16 @@ impl Launcher {
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let has_rows = !self.hits.is_empty();
+        if VIRTUAL_KEY(vk) == VK_TAB {
+            // Search -> clipboard -> Gemini (Shift+Tab goes back); Left and Right move between the two boxes
+            self.mode = self.mode.cycle(shift);
+            self.show(gfx, 1.0, true);
+            return;
+        }
+        if self.mode == Mode::Ai && self.ai_key(vk, ctrl) {
+            self.draw(gfx);
+            return;
+        }
         match VIRTUAL_KEY(vk) {
             VK_ESCAPE => {
                 if self.list_open && self.mode == Mode::Search {
@@ -1009,11 +1198,6 @@ impl Launcher {
                     self.pop_a = 0.0;
                     let c = self.cursor();
                     self.set_cursor(c);
-                }
-            }
-            VK_TAB => {
-                if self.cur().is_some() {
-                    self.focus = if shift || self.focus == Focus::Action { Focus::Subject } else { Focus::Action };
                 }
             }
             VK_RIGHT => {
@@ -1090,8 +1274,13 @@ impl Launcher {
             }
             VK_V if ctrl => {
                 if let Some(t) = clip::get_text(self.hwnd) {
-                    let one: String =
-                        t.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).take(200).collect();
+                    let room = self.query_limit().saturating_sub(self.query.chars().count());
+                    let one: String = if self.mode == Mode::Ai {
+                        // a question may run over several lines: they are joined
+                        t.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(room).collect()
+                    } else {
+                        t.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).take(room).collect()
+                    };
                     self.query.push_str(&one);
                     self.changed();
                 }
@@ -1102,7 +1291,7 @@ impl Launcher {
     }
 
     fn typed(&mut self, gfx: &Gfx, c: char) {
-        if c.is_control() || (c == ' ' && self.query.is_empty()) || self.query.chars().count() >= 200 {
+        if c.is_control() || (c == ' ' && self.query.is_empty()) || self.query.chars().count() >= self.query_limit() {
             return;
         }
         self.query.push(c);
@@ -1206,7 +1395,11 @@ impl Launcher {
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL if self.open => {
-                if self.list_open && self.focus == Focus::Subject {
+                if self.mode == Mode::Ai {
+                    let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 / 120;
+                    self.ai.scroll = (self.ai.scroll - d as f32 * 36.0).clamp(0.0, self.ai.max_scroll);
+                    self.draw(gfx);
+                } else if self.list_open && self.focus == Focus::Subject {
                     let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 / 120;
                     let max = self.hits.len().saturating_sub(VIS) as i32;
                     self.top = (self.top as i32 - d).clamp(0, max) as usize;
@@ -1262,6 +1455,12 @@ impl Launcher {
                 }
                 if !self.open && !self.visible {
                     self.free_me = true;
+                }
+                Some(LRESULT(0))
+            }
+            WM_AI => {
+                if self.ai_poll() && self.open && self.mode == Mode::Ai {
+                    self.draw(gfx);
                 }
                 Some(LRESULT(0))
             }
@@ -1351,6 +1550,7 @@ impl Launcher {
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
+        let mut ai_max = self.ai.max_scroll;
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(err) => {
@@ -1411,8 +1611,28 @@ impl Launcher {
                 ready: self.apps_ready,
                 clip: self.mode == Mode::Clip,
             };
-            draw_subject(&mut p, sub, &subject);
-            draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &tr);
+            if self.mode == Mode::Ai {
+                let view = AiView {
+                    query: &self.query,
+                    state: self.ai.state,
+                    text: &self.ai.text,
+                    scroll: self.ai.scroll,
+                    pop_s: self.pop_s,
+                    pop_a: self.pop_a,
+                };
+                ai_max = draw_ai(&mut p, sub, act, &view);
+            } else {
+                draw_subject(&mut p, sub, &subject);
+                draw_action(&mut p, act, cur.as_ref(), self.act, ft > 0.5, self.pop_a, &tr);
+            }
+            if !self.flashing {
+                // which of the three modes this is
+                let on = self.mode.index();
+                for i in 0..3 {
+                    let (a, r) = if i == on { (0.85, 2.6) } else { (0.30, 2.2) };
+                    p.fill_circle(W * 0.5 + (i as f32 - 1.0) * 10.0, FRAME_H - 7.0, r, white(a));
+                }
+            }
             if self.lh > 1.0 {
                 p.push_clip(card);
                 let view = ListView {
@@ -1438,11 +1658,14 @@ impl Launcher {
             crate::log!("launcher: end_draw failed: {err}");
         }
         self.res.end_frame();
+        self.ai.max_scroll = ai_max;
+        self.ai.scroll = self.ai.scroll.min(ai_max);
     }
 }
 
 impl Drop for Launcher {
     fn drop(&mut self) {
+        self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             for t in [T_ANIM, T_ICON, T_TRIM, T_FREE] {
                 let _ = KillTimer(Some(self.hwnd), t);
@@ -1693,6 +1916,66 @@ fn draw_clip_preview(p: &mut Painter, r: Rect, h: &Hit, v: &Look) {
         &TextStyle::new(10.5, white(0.55)).center(),
     );
     p.alpha = a0;
+}
+
+/// What the two boxes of the Gemini mode show.
+struct AiView<'a> {
+    query: &'a str,
+    state: AiState,
+    text: &'a str,
+    scroll: f32,
+    pop_s: f32,
+    pop_a: f32,
+}
+
+/// Gemini mode: the question on the left, the answer on the right. Returns how far the answer can scroll.
+fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
+    let a0 = p.alpha;
+    let centered = TextStyle::new(11.5, white(0.80)).semibold().center();
+    // left: what was typed, the end of it kept in view
+    p.alpha = a0 * (0.35 + 0.65 * logic::ease_out((v.pop_s * 1.6).min(1.0)));
+    if v.query.is_empty() {
+        p.icon(Icon::Sparkle, Rect::centered(sub.cx(), sub.y + 68.0, 52.0, 52.0), white(0.62));
+        p.text("Ask Gemini\u{2026}", Rect::new(sub.x + 10.0, sub.y + 118.0, sub.w - 20.0, 20.0), &centered);
+    } else {
+        let view = Rect::new(sub.x + 14.0, sub.y + 14.0, sub.w - 28.0, sub.h - 28.0);
+        let st = TextStyle::new(15.0, white(0.94)).semibold().top().wrap();
+        let h = p.measure_wrapped(v.query, &st, view.w);
+        let y = if h > view.h { view.bottom() - h } else { view.y };
+        p.push_clip(view);
+        p.text(v.query, Rect::new(view.x, y, view.w, h.max(view.h)), &st);
+        p.pop_clip();
+    }
+    // right: the answer
+    p.alpha = a0 * (0.35 + 0.65 * logic::ease_out((v.pop_a * 1.6).min(1.0)));
+    let mut max = 0.0;
+    if v.text.is_empty() {
+        let (icon, msg) = match v.state {
+            AiState::Waiting => (Icon::Sparkle, "Thinking\u{2026}"),
+            _ => (Icon::Chat, "Press Enter to ask"),
+        };
+        p.icon(icon, Rect::centered(act.cx(), act.y + 68.0, 52.0, 52.0), white(0.62));
+        p.text(msg, Rect::new(act.x + 10.0, act.y + 118.0, act.w - 20.0, 20.0), &centered);
+    } else {
+        let view = Rect::new(act.x + 14.0, act.y + 14.0, act.w - 28.0, act.h - 28.0);
+        let st = TextStyle::new(12.5, white(0.92)).top().wrap();
+        let text_w = view.w - 8.0;
+        let h = p.measure_wrapped(v.text, &st, text_w);
+        max = (h - view.h).max(0.0);
+        let off = v.scroll.clamp(0.0, max);
+        p.push_clip(view);
+        p.text(v.text, Rect::new(view.x, view.y - off, text_w, h), &st);
+        p.pop_clip();
+        if max > 0.0 {
+            // a thin bar shows there is more
+            let track = view.h - 8.0;
+            let bar = (track * view.h / h).max(18.0);
+            let y = view.y + 4.0 + (track - bar) * off / max;
+            p.fill_rounded(Rect::new(act.right() - 10.0, y, 3.0, bar), 1.5, white(0.35));
+        }
+    }
+    p.alpha = a0;
+    max
 }
 
 fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, _focused: bool, pop: f32, tr: &Tr) {
@@ -2015,6 +2298,95 @@ fn finished(slot: &Slot, list: Vec<Entry>, hwnd: SendHwnd) {
     unsafe {
         let _ = PostMessageW(Some(hwnd.hwnd()), WM_INDEX, WPARAM(0), LPARAM(0));
     }
+}
+
+/// Ask Gemini in the background. The answer is written into `shared` as it streams in, and the
+/// launcher window is told each time.
+fn spawn_ai(
+    shared: Arc<Mutex<AiShared>>,
+    hwnd: SendHwnd,
+    seq: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cfg: GeminiCfg,
+    key: String,
+    question: String,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = std::thread::Builder::new().name("launcher-ai".into()).spawn(move || {
+        low_priority();
+        let body = serde_json::json!({
+            "systemInstruction": { "parts": [{ "text": cfg.system_prompt }] },
+            "contents": [{ "role": "user", "parts": [{ "text": question }] }],
+            "generationConfig": { "maxOutputTokens": cfg.max_tokens },
+        });
+        let url =
+            format!("{}/models/{}:streamGenerateContent?alt=sse", cfg.endpoint.trim_end_matches('/'), cfg.model.trim());
+        let headers = [
+            ("x-goog-api-key", key),
+            ("Content-Type", "application/json".to_string()),
+            ("Accept", "text/event-stream".to_string()),
+        ];
+        let payload = body.to_string().into_bytes();
+        let write = |f: &dyn Fn(&mut AiShared)| {
+            if let Ok(mut sh) = shared.lock() {
+                if sh.seq == seq {
+                    f(&mut sh);
+                }
+            }
+            unsafe {
+                let _ = PostMessageW(Some(hwnd.hwnd()), WM_AI, WPARAM(0), LPARAM(0));
+            }
+        };
+        let mut parser = crate::sys::http::SseParser::default();
+        let mut raw = Vec::new();
+        let mut stream_error: Option<String> = None;
+        let res = crate::sys::http::post_stream(&url, &headers, &payload, &cancel, |chunk| {
+            if raw.len() < 16 * 1024 {
+                raw.extend_from_slice(chunk);
+            }
+            parser.push(chunk, |data| {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return };
+                if let Some(e) = v.get("error") {
+                    stream_error =
+                        Some(e.get("message").and_then(|m| m.as_str()).unwrap_or("stream error").to_string());
+                    return;
+                }
+                if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()) {
+                    let text: String = parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect();
+                    if !text.is_empty() {
+                        write(&|sh: &mut AiShared| sh.text.push_str(&text));
+                    }
+                }
+                if let Some(reason) = v.pointer("/promptFeedback/blockReason").and_then(|r| r.as_str()) {
+                    stream_error = Some(format!("Gemini would not answer this ({reason})."));
+                }
+            });
+            !cancel.load(Relaxed)
+        });
+        if cancel.load(Relaxed) {
+            return;
+        }
+        match res {
+            Ok(200) if stream_error.is_none() => write(&|sh: &mut AiShared| sh.done = true),
+            Ok(status) => {
+                let msg = stream_error.unwrap_or_else(|| {
+                    serde_json::from_slice::<serde_json::Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| format!("HTTP {status}"))
+                });
+                let hint = match status {
+                    400 | 401 | 403 => " (check your key in Settings \u{2192} Gemini)",
+                    404 => " (check the model name in Settings \u{2192} Gemini)",
+                    429 => " (too many questions right now, try again shortly)",
+                    _ => "",
+                };
+                let msg = format!("{msg}{hint}");
+                write(&|sh: &mut AiShared| sh.err = Some(msg.clone()));
+            }
+            Err(e) => write(&|sh: &mut AiShared| sh.err = Some(e.clone())),
+        }
+    });
 }
 
 /// The installed apps, found in the background.

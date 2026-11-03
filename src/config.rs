@@ -179,6 +179,8 @@ pub struct Hotkeys {
     /// The launcher as a history of what you copied (text, links, images, files). Caught by a
     /// low-level hook, so Win+C works even though Windows wants it.
     pub launcher_clip: String,
+    /// The launcher as a one-question chat with Gemini (uses the key from Settings → Gemini).
+    pub launcher_ai: String,
 }
 
 impl Default for Hotkeys {
@@ -192,6 +194,7 @@ impl Default for Hotkeys {
             dictate: "Ctrl+Alt+D".into(),
             launcher: "Alt+Space".into(),
             launcher_clip: "Win+C".into(),
+            launcher_ai: "Win+G".into(),
         }
     }
 }
@@ -437,6 +440,9 @@ pub struct LauncherCfg {
     pub size: f32,
     /// Where a web search goes; what you typed is added at the end.
     pub search_url: String,
+    /// Handed over by the app (the Gemini mode asks with these settings); not stored here.
+    #[serde(skip)]
+    pub gemini: GeminiCfg,
 }
 
 impl Default for LauncherCfg {
@@ -450,6 +456,7 @@ impl Default for LauncherCfg {
             light: true,
             size: 0.8,
             search_url: "https://www.google.com/search?q=".to_string(),
+            gemini: GeminiCfg::default(),
         }
     }
 }
@@ -1022,6 +1029,8 @@ dictate = "Ctrl+Alt+D"
 launcher = "Alt+Space"
 # The launcher as a history of what you copied (text, links, images, files). Leave empty to turn it off.
 launcher_clip = "Win+C"
+# The launcher as a one-question chat with Gemini. Leave empty to turn it off.
+launcher_ai = "Win+G"
 
 [modules]
 media = true
@@ -1284,6 +1293,7 @@ mod tests {
         assert_eq!(c.hotkeys.dictate, d.hotkeys.dictate);
         assert_eq!(c.hotkeys.launcher, d.hotkeys.launcher);
         assert_eq!(c.hotkeys.launcher_clip, d.hotkeys.launcher_clip);
+        assert_eq!(c.hotkeys.launcher_ai, d.hotkeys.launcher_ai);
         assert_eq!(c.voice.model, d.voice.model);
         assert_eq!(c.voice.cleanup, d.voice.cleanup);
         assert_eq!(c.locks.caps, d.locks.caps);

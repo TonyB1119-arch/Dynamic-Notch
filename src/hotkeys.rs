@@ -16,6 +16,8 @@ pub enum Action {
     Launcher,
     /// The launcher in clipboard mode.
     LauncherClip,
+    /// The launcher in Gemini mode.
+    LauncherAi,
     /// One of the user's combos (its place in `[combos] items`).
     Combo(usize),
 }
@@ -144,6 +146,7 @@ pub fn unregister_all(hwnd: HWND) {
 const COMBO_BASE: i32 = BASE_ID + 32;
 const MAX_COMBOS: usize = 24;
 const CLIP_ID: i32 = COMBO_BASE + 80;
+const AI_ID: i32 = COMBO_BASE + 81;
 
 /// Is this a key combination a combo may use? It needs Ctrl, Alt, Shift or Win (or be an F key), so a
 /// combo can't take over a plain letter.
@@ -171,21 +174,24 @@ pub fn split_item(item: &str) -> (&str, &str, &str) {
 
 /// Hand the user's combos to the keyboard hook (`lowkeys`), which sees every key before Windows does.
 /// Returns what can be used and what cannot.
-pub fn register_combos(hwnd: HWND, items: &[String], clip_keys: &str) -> (Vec<Registered>, Vec<String>) {
+pub fn register_combos(hwnd: HWND, items: &[String], clip_keys: &str, ai_keys: &str) -> (Vec<Registered>, Vec<String>) {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
     let mut table = Vec::new();
-    // the clipboard hotkey goes first: it wins when a combo uses the same keys
-    let clip_keys = clip_keys.trim();
-    if !clip_keys.is_empty() {
-        match check_combo(clip_keys) {
+    // the launcher's own hotkeys go first: they win when a combo uses the same keys
+    for (keys, id, action) in [(clip_keys, CLIP_ID, Action::LauncherClip), (ai_keys, AI_ID, Action::LauncherAi)] {
+        let keys = keys.trim();
+        if keys.is_empty() {
+            continue;
+        }
+        match check_combo(keys) {
             Ok(()) => {
-                if let Some((mods, vk)) = parse(clip_keys) {
-                    table.push((mods.0 & 0xF, vk, CLIP_ID));
-                    ok.push(Registered { id: CLIP_ID, action: Action::LauncherClip });
+                if let Some((mods, vk)) = parse(keys) {
+                    table.push((mods.0 & 0xF, vk, id));
+                    ok.push(Registered { id, action });
                 }
             }
-            Err(e) => errors.push(format!("{clip_keys}: {e}")),
+            Err(e) => errors.push(format!("{keys}: {e}")),
         }
     }
     for (i, item) in items.iter().take(MAX_COMBOS).enumerate() {
