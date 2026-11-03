@@ -103,8 +103,8 @@ enum Focus {
     Name,
     Key,
     Model,
-    ComboKeys,
     ComboTarget,
+    ComboFind,
 }
 
 /// Where the "Check for updates" button stands.
@@ -125,8 +125,22 @@ pub struct Settings {
     name: TextField,
     key: TextField,
     model: TextField,
-    combo_keys: TextField,
+    /// The keys recorded for a new combo ("Win+B"), or nothing yet.
+    combo_keys: String,
     combo_target: TextField,
+    /// Searching the list of apps.
+    combo_find: TextField,
+    /// The name and path of an app picked from the list.
+    combo_label: String,
+    combo_path: String,
+    picker: bool,
+    pick_scroll: f32,
+    apps: std::sync::Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>,
+    app_list: Vec<(String, String)>,
+    apps_started: bool,
+    apps_loaded: bool,
+    /// Waiting for the user to press the keys.
+    recording: bool,
     focus: Focus,
     /// How far the current tab is scrolled (a whole number of rows) when it is taller than the page.
     scroll: f32,
@@ -145,8 +159,18 @@ impl Settings {
             name: TextField::new(24),
             key: TextField::new(200).masked(),
             model: TextField::new(80),
-            combo_keys: TextField::new(40),
+            combo_keys: String::new(),
             combo_target: TextField::new(260),
+            combo_find: TextField::new(60),
+            combo_label: String::new(),
+            combo_path: String::new(),
+            picker: false,
+            pick_scroll: 0.0,
+            apps: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            app_list: Vec::new(),
+            apps_started: false,
+            apps_loaded: false,
+            recording: false,
             focus: Focus::None,
             scroll: 0.0,
             has_key: false,
@@ -280,6 +304,10 @@ fn label(ui: &mut Ui, row: Rect, text: &str) {
     ui.p.text(text, Rect::new(row.x + 12.0, row.y, row.w * 0.5, row.h), &TextStyle::new(13.0, palette::TEXT));
 }
 
+fn label_row(ui: &mut Ui, row: Rect, text: &str) {
+    label(ui, row, text);
+}
+
 fn toggle_row(ui: &mut Ui, row: Rect, text: &str, on: bool, section: &str, key: &str) {
     label(ui, row, text);
     let sw = Rect::new(row.right() - 56.0, row.y, 48.0, row.h);
@@ -339,7 +367,15 @@ impl Module for Settings {
                 self.sync_fields();
                 cx.fx.redraw = true;
             }
-            SystemEvent::Expanded(false) => self.focus = Focus::None,
+            SystemEvent::Expanded(false) => {
+                self.focus = Focus::None;
+                if self.recording {
+                    self.recording = false;
+                    crate::lowkeys::cancel_capture();
+                }
+            }
+            // the keys were recorded: draw again, the page picks them up
+            SystemEvent::Hotkey(id) if *id == crate::lowkeys::CAPTURE_ID => cx.fx.redraw = true,
             _ => {}
         }
     }
@@ -373,16 +409,10 @@ impl Module for Settings {
             Focus::Name => self.name.key(key, self.hwnd),
             Focus::Key => self.key.key(key, self.hwnd),
             Focus::Model => self.model.key(key, self.hwnd),
-            Focus::ComboKeys => self.combo_keys.key(key, self.hwnd),
+            Focus::ComboFind => self.combo_find.key(key, self.hwnd),
             Focus::ComboTarget => self.combo_target.key(key, self.hwnd),
             Focus::None => false,
         };
-        if enter && self.focus == Focus::ComboKeys {
-            // Enter in the keys box moves on to the box for what to open
-            self.focus = Focus::ComboTarget;
-            cx.fx.layout_changed = true;
-            return;
-        }
         if enter && self.focus == Focus::ComboTarget {
             if let Some(list) = self.add_combo() {
                 cx.fx.save_config.push(("combos".into(), "items".into(), list_value(&list)));
@@ -412,7 +442,7 @@ impl Module for Settings {
                         self.say("Model saved", true);
                     }
                 }
-                Focus::None | Focus::ComboKeys | Focus::ComboTarget => {}
+                Focus::None | Focus::ComboTarget | Focus::ComboFind => {}
             }
             cx.fx.keyboard_focus = Some(false);
             self.focus = Focus::None;
@@ -442,6 +472,10 @@ impl Module for Settings {
             if hit && !on {
                 self.tab = i;
                 self.scroll = 0.0;
+                if self.recording {
+                    self.recording = false;
+                    crate::lowkeys::cancel_capture();
+                }
                 self.focus = Focus::None;
                 ui.fx.keyboard_focus = Some(false);
                 ui.fx.layout_changed = true;
@@ -1162,57 +1196,141 @@ impl Settings {
         );
     }
 
-    /// Check the two boxes and add the combo; returns the new list to save.
+    /// The keys were recorded (or the recording was cancelled with Esc).
+    fn apply_keys(&mut self, mods: u32, vk: u32) {
+        self.recording = false;
+        if vk == 0x1B && mods == 0 {
+            self.say("Recording cancelled", false);
+            return;
+        }
+        match crate::lowkeys::describe(mods, vk) {
+            Some(name) => match crate::hotkeys::check_combo(&name) {
+                Ok(()) => {
+                    self.combo_keys = name;
+                    self.say("Keys recorded", true);
+                }
+                Err(e) => self.say(e, false),
+            },
+            None => self.say("That key can't be used here, try another one", false),
+        }
+    }
+
+    /// Check what was entered and add the combo; returns the new list to save.
     fn add_combo(&mut self) -> Option<Vec<String>> {
-        let keys = self.combo_keys.text().trim().to_string();
-        let target = self.combo_target.text().trim().replace('|', " ");
+        let keys = self.combo_keys.trim().to_string();
+        if keys.is_empty() {
+            self.say("Click the keys button and press the keys first", false);
+            return None;
+        }
         if let Err(e) = crate::hotkeys::check_combo(&keys) {
             self.say(e, false);
             return None;
         }
+        let target = self.combo_target.text().trim().replace('|', " ");
         if target.is_empty() {
-            self.say("Say what it should open: an app, file, folder, link or browser", false);
+            self.say("Choose what it should open: the Apps menu, or type a folder or link", false);
             return None;
         }
         let mut items = self.cfg.combos.items.clone();
         // the same keys again replace the old combo
-        items.retain(|s| !s.split_once('|').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(&keys)));
+        items.retain(|s| !crate::hotkeys::split_item(s).0.eq_ignore_ascii_case(&keys));
         if items.len() >= 12 {
             self.say("That is the most combos (12)", false);
             return None;
         }
-        items.push(format!("{keys}|{target}"));
+        let label = if target == self.combo_path { self.combo_label.replace('|', " ") } else { String::new() };
+        items.push(if label.is_empty() { format!("{keys}|{target}") } else { format!("{keys}|{target}|{label}") });
         self.combo_keys.clear();
         self.combo_target.clear();
+        self.combo_label.clear();
+        self.combo_path.clear();
         self.say("Combo added", true);
         Some(items)
     }
 
+    /// Find the installed apps in the background (the first time the menu is opened).
+    fn load_apps(&mut self) {
+        if self.apps_started {
+            return;
+        }
+        self.apps_started = true;
+        let slot = self.apps.clone();
+        let _ = std::thread::Builder::new().name("combo-apps".into()).spawn(move || {
+            let mut v = crate::dock::installed_apps();
+            v.sort_by_key(|(n, _)| n.to_lowercase());
+            v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(v);
+            }
+        });
+    }
+
     fn combos(&mut self, ui: &mut Ui, body: Rect) {
         let accent = ui.accent;
+        // keys that were just recorded
+        if let Some((m, vk)) = crate::lowkeys::take_captured() {
+            self.apply_keys(m, vk);
+        }
+        let rec = crate::lowkeys::capturing();
+        if self.recording && !rec {
+            // ran out of time
+            self.recording = false;
+            crate::lowkeys::cancel_capture();
+        }
+        if self.apps_started && !self.apps_loaded {
+            match self.apps.lock().ok().and_then(|mut g| g.take()) {
+                Some(v) => {
+                    self.app_list = v;
+                    self.apps_loaded = true;
+                }
+                None => ui.animate(),
+            }
+        }
+        if rec {
+            // keep drawing, so the end of the recording is noticed
+            ui.animate();
+        }
+
         let row = row_rect(body, 0);
         ui.p.text(
-            "Your own hotkeys. Example: Win+B opens your default browser (type browser).",
+            "Your own hotkeys. Click the keys button, press the keys, then choose what to open.",
             Rect::new(row.x + 2.0, row.y, row.w, row.h),
             &TextStyle::new(11.5, palette::TEXT_DIM),
         );
         let row = row_rect(body, 1);
-        let add = Rect::new(row.right() - 74.0, row.y + 2.0, 74.0, row.h - 4.0);
-        let kf = Rect::new(row.x, row.y + 2.0, 150.0, row.h - 4.0);
-        let tf = Rect::new(kf.right() + 8.0, row.y + 2.0, add.x - 8.0 - (kf.right() + 8.0), row.h - 4.0);
-        if self.combo_keys.draw(ui, kf, "Win+B", accent, self.focus == Focus::ComboKeys) {
-            self.focus = Focus::ComboKeys;
-            ui.fx.keyboard_focus = Some(true);
+        let add = Rect::new(row.right() - 64.0, row.y + 2.0, 64.0, row.h - 4.0);
+        let apps = Rect::new(add.x - 8.0 - 84.0, row.y + 2.0, 84.0, row.h - 4.0);
+        let kb = Rect::new(row.x, row.y + 2.0, 176.0, row.h - 4.0);
+        let tf = Rect::new(kb.right() + 8.0, row.y + 2.0, (apps.x - 8.0) - (kb.right() + 8.0), row.h - 4.0);
+        let (text, style) = if rec {
+            ("Press the keys…".to_string(), ButtonStyle::inverted())
+        } else if self.combo_keys.is_empty() {
+            ("Click, then press keys".to_string(), ButtonStyle::filled(Color::white(0.10)))
+        } else {
+            (self.combo_keys.clone(), ButtonStyle::filled(Color::white(0.10)))
+        };
+        if ui.pill_button(kb, &text, Some(Icon::Keyboard), style) {
+            if rec {
+                self.recording = false;
+                crate::lowkeys::cancel_capture();
+            } else {
+                self.recording = true;
+                self.focus = Focus::None;
+                ui.fx.keyboard_focus = Some(false);
+                crate::lowkeys::start_capture(self.hwnd.hwnd());
+            }
         }
-        if self.combo_target.draw(
-            ui,
-            tf,
-            "browser, an app, a folder or a link",
-            accent,
-            self.focus == Focus::ComboTarget,
-        ) {
+        if self.combo_target.draw(ui, tf, "Apps menu, or a folder or link", accent, self.focus == Focus::ComboTarget) {
             self.focus = Focus::ComboTarget;
             ui.fx.keyboard_focus = Some(true);
+        }
+        if ui.pill_button(apps, "Apps", Some(Icon::Grid), ButtonStyle::filled(Color::white(0.10))) {
+            self.picker = !self.picker;
+            self.focus = Focus::None;
+            ui.fx.keyboard_focus = Some(false);
+            if self.picker {
+                self.load_apps();
+            }
         }
         if ui.pill_button(add, "Add", None, ButtonStyle::inverted()) {
             if let Some(list) = self.add_combo() {
@@ -1221,22 +1339,28 @@ impl Settings {
             self.focus = Focus::None;
             ui.fx.keyboard_focus = Some(false);
         }
+
+        if self.picker {
+            self.picker_menu(ui, body, accent);
+            return;
+        }
         let items = self.cfg.combos.items.clone();
         if items.is_empty() {
             let row = row_rect(body, 2);
             ui.p.text(
-                "No combos yet. Type keys like Ctrl+Alt+G, then what to open, then press Add.",
+                "No combos yet. Example: Win+B opens your default browser.",
                 Rect::new(row.x + 2.0, row.y, row.w, row.h),
                 &TextStyle::new(11.5, palette::TEXT_FAINT),
             );
         }
         for (i, item) in items.iter().enumerate().take(12) {
             let row = row_rect(body, 2 + i);
-            let (keys, target) = item.split_once('|').unwrap_or((item.as_str(), ""));
-            label(ui, row, keys.trim());
-            let x = row.x + 160.0;
+            let (keys, target, label) = crate::hotkeys::split_item(item);
+            label_row(ui, row, keys);
+            let x = row.x + 170.0;
+            let shown = if label.is_empty() { target } else { label };
             ui.p.text(
-                &crate::util::one_line(target.trim()),
+                &crate::util::one_line(shown),
                 Rect::new(x, row.y, row.right() - x - 48.0, row.h),
                 &TextStyle::new(12.0, palette::TEXT_DIM),
             );
@@ -1246,6 +1370,79 @@ impl Settings {
                 next.remove(i);
                 put(ui, "combos", "items", list_value(&next));
             }
+        }
+    }
+
+    /// The menu of all apps (and the default browser): search, scroll, click one.
+    fn picker_menu(&mut self, ui: &mut Ui, body: Rect, accent: Color) {
+        let row = row_rect(body, 2);
+        let close = Rect::new(row.right() - 84.0, row.y + 2.0, 84.0, row.h - 4.0);
+        let find = Rect::new(row.x, row.y + 2.0, close.x - 8.0 - row.x, row.h - 4.0);
+        if self.combo_find.draw(ui, find, "Search your apps", accent, self.focus == Focus::ComboFind) {
+            self.focus = Focus::ComboFind;
+            ui.fx.keyboard_focus = Some(true);
+        }
+        if ui.pill_button(
+            close,
+            "Close",
+            Some(Icon::Close),
+            ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM),
+        ) {
+            self.picker = false;
+            self.focus = Focus::None;
+            ui.fx.keyboard_focus = Some(false);
+            return;
+        }
+        let q = self.combo_find.text().trim().to_lowercase();
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        if q.is_empty() || "default browser".contains(&q) {
+            entries.push(("Default browser", "browser"));
+        }
+        entries.extend(
+            self.app_list
+                .iter()
+                .filter(|(n, _)| q.is_empty() || n.to_lowercase().contains(&q))
+                .map(|(n, p)| (n.as_str(), p.as_str())),
+        );
+        let pitch = ROW_H + ROW_GAP;
+        let area = Rect::new(body.x, row_rect(body, 3).y, body.w, 8.0 * pitch - ROW_GAP);
+        let content_h = entries.len() as f32 * pitch;
+        let off = crate::alcove::scroll_rows(ui, area, &mut self.pick_scroll, content_h, pitch, "combo-pick");
+        let was_live = ui.interactive;
+        // rows scrolled out of view must not answer the pointer
+        ui.interactive = was_live && ui.input.mouse.is_some_and(|(x, y)| area.contains(x, y));
+        ui.p.push_clip(area);
+        let mut chosen: Option<(String, String)> = None;
+        for (i, (name, path)) in entries.iter().enumerate() {
+            let r = Rect::new(area.x, area.y - off + i as f32 * pitch, area.w, ROW_H);
+            if r.bottom() < area.y || r.y > area.bottom() {
+                continue;
+            }
+            let hover = ui.hovered(r);
+            ui.row_bg(r, hover, None);
+            ui.p.text(name, Rect::new(r.x + 12.0, r.y, r.w - 24.0, r.h), &TextStyle::new(13.0, palette::TEXT));
+            if ui.clicked(r) {
+                chosen = Some((name.to_string(), path.to_string()));
+            }
+        }
+        if !self.apps_loaded {
+            let r = Rect::new(area.x, area.y + pitch, area.w, ROW_H);
+            ui.p.text(
+                "Loading your apps…",
+                Rect::new(r.x + 12.0, r.y, r.w, r.h),
+                &TextStyle::new(12.0, palette::TEXT_FAINT),
+            );
+        }
+        ui.p.pop_clip();
+        ui.interactive = was_live;
+        if let Some((name, path)) = chosen {
+            self.combo_path = path.replace('|', " ");
+            self.combo_label = if path == "browser" { String::new() } else { name };
+            let shown = self.combo_path.clone();
+            self.combo_target.set(&shown);
+            self.picker = false;
+            self.focus = Focus::None;
+            ui.fx.keyboard_focus = Some(false);
         }
     }
 

@@ -1879,7 +1879,10 @@ impl App {
             }
             Action::Launcher => self.launcher_toggle(),
             Action::Combo(i) => {
-                if let Some((_, target)) = self.cfg.combos.items.get(i).and_then(|s| s.split_once('|')) {
+                if let Some(item) = self.cfg.combos.items.get(i).cloned() {
+                    let (_, target, label) = hotkeys::split_item(&item);
+                    // the launcher shows what is opening, for a moment
+                    self.launcher_flash(label, target);
                     hotkeys::open_target(target, &self.cfg.launcher.search_url);
                 }
             }
@@ -3689,6 +3692,25 @@ impl App {
             self.launcher = None;
         }
         r
+    }
+
+    /// A combo fired: the launcher shows the thing that is opening for 0.7 seconds, without taking the
+    /// focus away from it.
+    fn launcher_flash(&mut self, label: &str, target: &str) {
+        if self.launcher.is_none() {
+            match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(l) => self.launcher = Some(l),
+                Err(e) => {
+                    log!("launcher failed to start: {e}");
+                    return;
+                }
+            }
+        }
+        let (cfg, scale) = (self.cfg.launcher.clone(), self.cfg.appearance.scale);
+        if let Some(l) = self.launcher.as_mut() {
+            l.configure(cfg);
+            l.flash(&self.gfx, scale, label, target);
+        }
     }
 
     /// The launcher hotkey: open the launcher, or put it away again.

@@ -50,6 +50,7 @@ const T_ANIM: usize = 1;
 const T_ICON: usize = 2;
 const T_TRIM: usize = 3;
 const T_FREE: usize = 4;
+const T_FLASH: usize = 5;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
 
@@ -212,6 +213,10 @@ pub struct Launcher {
     open: bool,
     /// The window is on screen (also while it fades out).
     visible: bool,
+    /// Shown for a moment by a combo (it puts itself away).
+    flashing: bool,
+    /// What to show instead of search results (a combo's target).
+    pinned: Option<Hit>,
     free_me: bool,
     scale: f32,
     win_px: (i32, i32, i32, i32),
@@ -272,6 +277,8 @@ impl Launcher {
             cfg: LauncherCfg::default(),
             open: false,
             visible: false,
+            flashing: false,
+            pinned: None,
             free_me: false,
             scale: 1.0,
             win_px: (0, 0, 0, 0),
@@ -330,11 +337,45 @@ impl Launcher {
         if self.open {
             self.hide();
         } else {
-            self.show(gfx, ui_scale);
+            self.show(gfx, ui_scale, true);
         }
     }
 
-    fn show(&mut self, gfx: &Gfx, ui_scale: f32) {
+    /// A combo fired: show what is being opened for a moment (0.7 s) without taking the focus away
+    /// from it, then put the launcher away again.
+    pub fn flash(&mut self, gfx: &Gfx, ui_scale: f32, label: &str, target: &str) {
+        let t = target.trim();
+        let expanded = crate::dock::expand_env(t);
+        let low = t.to_ascii_lowercase();
+        let on_disk = Path::new(&expanded);
+        let browser = low == "browser" || low == "default browser";
+        let (kind, path) = if browser {
+            (Kind::Url, self.cfg.search_url.clone())
+        } else if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("www.") {
+            (Kind::Url, expanded.clone())
+        } else if on_disk.is_dir() {
+            (Kind::Folder, expanded.clone())
+        } else if low.starts_with("shell:") || low.ends_with(".lnk") || low.ends_with(".exe") || !on_disk.exists() {
+            (Kind::App, expanded.clone())
+        } else {
+            (Kind::File, expanded.clone())
+        };
+        let name = if !label.trim().is_empty() {
+            label.trim().to_string()
+        } else if browser {
+            "Browser".to_string()
+        } else {
+            on_disk.file_stem().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty()).unwrap_or(expanded)
+        };
+        self.pinned = Some(Hit { name, detail: String::new(), path, kind, spans: Vec::new(), idx: 0 });
+        self.show(gfx, ui_scale, false);
+        self.flashing = true;
+        unsafe {
+            SetTimer(Some(self.hwnd), T_FLASH, 700, None);
+        }
+    }
+
+    fn show(&mut self, gfx: &Gfx, ui_scale: f32, focus: bool) {
         // asked again while it was still fading out: the window is already there
         let again = self.visible;
         self.query.clear();
@@ -346,8 +387,12 @@ impl Launcher {
         self.list_open = false;
         self.high = None;
         self.mouse = (-1.0, -1.0);
-        // nothing typed yet: the apps used most are what the Down arrow lists
-        self.search();
+        // nothing typed yet: the apps used most are what the Down arrow lists (a combo shows its own thing)
+        if let Some(h) = self.pinned.take() {
+            self.hits.push(h);
+        } else {
+            self.search();
+        }
         if self.cfg.files && !self.files_started {
             self.files_started = true;
             spawn_files(self.files_slot.clone(), SendHwnd::new(self.hwnd), self.cfg.folders.clone());
@@ -377,16 +422,21 @@ impl Launcher {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_TRIM);
             let _ = KillTimer(Some(self.hwnd), T_FREE);
+            let _ = KillTimer(Some(self.hwnd), T_FLASH);
+            self.flashing = false;
             if !again {
-                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                // a combo's flash must not take the focus from the thing that is opening
+                let _ = ShowWindow(self.hwnd, if focus { SW_SHOW } else { SW_SHOWNOACTIVATE });
             }
-            if !SetForegroundWindow(self.hwnd).as_bool() || GetForegroundWindow() != self.hwnd {
-                // Windows only lets the window in front take the focus: a harmless key tap unlocks it
-                let inputs = [key_input(VK_MENU, false), key_input(VK_MENU, true)];
-                SendInput(&inputs, size_of::<INPUT>() as i32);
-                let _ = SetForegroundWindow(self.hwnd);
+            if focus {
+                if !SetForegroundWindow(self.hwnd).as_bool() || GetForegroundWindow() != self.hwnd {
+                    // Windows only lets the window in front take the focus: a harmless key tap unlocks it
+                    let inputs = [key_input(VK_MENU, false), key_input(VK_MENU, true)];
+                    SendInput(&inputs, size_of::<INPUT>() as i32);
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+                let _ = SetFocus(Some(self.hwnd));
             }
-            let _ = SetFocus(Some(self.hwnd));
         }
         self.draw(gfx);
     }
@@ -397,8 +447,10 @@ impl Launcher {
             return;
         }
         self.open = false;
+        self.flashing = false;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_ICON);
+            let _ = KillTimer(Some(self.hwnd), T_FLASH);
         }
         self.kick();
     }
@@ -1083,6 +1135,15 @@ impl Launcher {
                     self.finish_hide();
                 } else {
                     self.draw(gfx);
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == T_FLASH => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), T_FLASH);
+                }
+                if self.flashing {
+                    self.hide();
                 }
                 Some(LRESULT(0))
             }

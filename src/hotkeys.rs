@@ -157,28 +157,33 @@ pub fn check_combo(keys: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Register the user's combos ("keys|what to open"). Returns what worked and what did not.
+/// A combo as it is saved: "keys|what to open|name shown" (the name is optional).
+pub fn split_item(item: &str) -> (&str, &str, &str) {
+    let mut it = item.splitn(3, '|');
+    let keys = it.next().unwrap_or("").trim();
+    let target = it.next().unwrap_or("").trim();
+    let label = it.next().unwrap_or("").trim();
+    (keys, target, label)
+}
+
+/// Hand the user's combos to the keyboard hook (`lowkeys`), which sees every key before Windows does.
+/// Returns what can be used and what cannot.
 pub fn register_combos(hwnd: HWND, items: &[String]) -> (Vec<Registered>, Vec<String>) {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
+    let mut table = Vec::new();
     for (i, item) in items.iter().take(MAX_COMBOS).enumerate() {
-        let Some((keys, _)) = item.split_once('|') else {
-            errors.push(format!("combo \"{item}\" has no |"));
-            continue;
-        };
-        let keys = keys.trim();
+        let keys = split_item(item).0;
         if let Err(e) = check_combo(keys) {
             errors.push(format!("{keys}: {e}"));
             continue;
         }
-        let (mods, vk) = parse(keys).unwrap_or((MOD_NOREPEAT, 0));
+        let Some((mods, vk)) = parse(keys) else { continue };
         let id = COMBO_BASE + i as i32;
-        if unsafe { RegisterHotKey(Some(hwnd), id, mods, vk) }.is_ok() {
-            ok.push(Registered { id, action: Action::Combo(i) });
-        } else {
-            errors.push(format!("{keys} is already in use"));
-        }
+        table.push((mods.0 & 0xF, vk, id));
+        ok.push(Registered { id, action: Action::Combo(i) });
     }
+    crate::lowkeys::set_combos(hwnd, table);
     (ok, errors)
 }
 

@@ -15,6 +15,7 @@ mod host;
 mod hotkeys;
 mod ipc;
 mod launcher;
+mod lowkeys;
 mod modules;
 mod pacer;
 mod refract;
