@@ -1654,7 +1654,8 @@ impl Launcher {
         let mut ai_max = self.ai.max_scroll;
         // live glass: the system blur behind the card, following the card as it grows
         let s0 = 0.95 + 0.05 * e;
-        let live_op = if self.live && self.cfg.glass { e } else { 0.0 };
+        // the system blur at full strength is nearly solid: like the dock, only part of it is used (the blur slider sets how much)
+        let live_op = if self.live && self.cfg.glass { e * (0.12 + 0.45 * self.cfg.blur) } else { 0.0 };
         self.host.set_backdrop_rounded(
             Rect::new(ANCHOR.0 * sc * (1.0 - s0), ANCHOR.1 * sc * (1.0 - s0), W * s0 * sc, card_h * s0 * sc),
             CARD_R * s0 * sc,
@@ -1702,9 +1703,9 @@ impl Launcher {
                 // live blur: the system's blur is behind the card, only the tint is drawn
                 None if glass && self.live => {
                     let tint = if light {
-                        Color::rgba(0.95, 0.97, 1.0, 0.25 + 0.4 * dark)
+                        Color::rgba(0.95, 0.97, 1.0, 0.15 + 0.3 * dark)
                     } else {
-                        Color::rgba(0.03, 0.03, 0.05, dark * 0.9)
+                        Color::rgba(0.03, 0.03, 0.05, dark * 0.5)
                     };
                     p.fill_rounded(card, CARD_R, tint);
                 }
