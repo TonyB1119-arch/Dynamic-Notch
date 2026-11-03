@@ -628,9 +628,9 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // media is playing: the system's own blur keeps showing what moves behind the window;
-            // otherwise the screen is copied once and blurred
-            self.live = self.cfg.glass && self.cfg.live && self.cfg.media_playing;
+            // live blur: the system's own blur keeps showing what moves behind the window (a video,
+            // say). A screen copy cannot see video, so it is only used when live blur is turned off
+            self.live = self.cfg.glass && self.cfg.live;
             self.blur_img = if self.live || !self.cfg.glass { None } else { capture_blur(x, y, w, h, self.cfg.blur) };
             self.anim = 0.0;
             self.lh = 0.0;
@@ -1699,12 +1699,12 @@ impl Launcher {
                     };
                     p.fill_rounded(card, CARD_R, tint);
                 }
-                // media is playing: the system's blur is behind the card, only the tint is drawn
+                // live blur: the system's blur is behind the card, only the tint is drawn
                 None if glass && self.live => {
                     let tint = if light {
                         Color::rgba(0.95, 0.97, 1.0, 0.25 + 0.4 * dark)
                     } else {
-                        Color::rgba(0.03, 0.03, 0.05, dark * 0.75)
+                        Color::rgba(0.03, 0.03, 0.05, dark * 0.9)
                     };
                     p.fill_rounded(card, CARD_R, tint);
                 }
@@ -1718,12 +1718,9 @@ impl Launcher {
                 if rw > 0.05 && rb > 0.005 {
                     p.stroke_rounded(card.inset(rw * 0.5), (CARD_R - rw * 0.5).max(0.0), rw, Color::white(rb));
                 }
-                // light catching the inside of the edge, and along the top
+                // light catching the inside of the edge
                 let inner = rw + 1.5;
                 p.stroke_rounded(card.inset(inner), (CARD_R - inner).max(0.0), 1.0, Color::white(0.09));
-                for (a, x0, x1) in [(0.28, 0.30, 0.70), (0.18, 0.18, 0.82), (0.12, 0.08, 0.92)] {
-                    p.line(W * x0, rw + 0.6, W * x1, rw + 0.6, 1.2, Color::white(a));
-                }
             } else {
                 let rim = if light { Color::white(0.6) } else { Color::white(0.12) };
                 p.stroke_rounded(card.inset(0.5), CARD_R - 0.5, 1.0, rim);
