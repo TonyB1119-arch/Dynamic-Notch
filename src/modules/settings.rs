@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 10.0,
+        8 => 11.0,
         _ => 25.0,
     }
 }
@@ -1004,6 +1004,7 @@ impl Settings {
             "dock",
             "rim_bright",
         );
+        toggle_row(ui, row_rect(body, 10), "Melt into the screen edge", d.melt, "dock", "melt");
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {

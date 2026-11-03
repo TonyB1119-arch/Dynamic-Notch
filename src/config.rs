@@ -426,6 +426,8 @@ pub struct DockCfg {
     /// The white rim around the dock: thickness in pixels (0 = none) and brightness (0 - 1).
     pub rim_width: f32,
     pub rim_bright: f32,
+    /// The bottom of the dock curves outward and flows into the screen edge, like the notch does at the top.
+    pub melt: bool,
     /// The liquid glass edge, the same glass as the notch (see Settings → Glass).
     pub glass: bool,
 }
@@ -445,6 +447,7 @@ impl Default for DockCfg {
             hide_apps: vec!["raycast.exe".to_string()],
             rim_width: 1.2,
             rim_bright: 0.35,
+            melt: false,
             glass: true,
         }
     }
@@ -1113,6 +1116,8 @@ hide_apps = ['raycast.exe']
 # The white rim around the dock: thickness (pixels, 0 = none) and brightness (0 - 1)
 rim_width = 1.2
 rim_bright = 0.35
+# Let the bottom of the dock curve outward and melt into the screen edge (true / false)
+melt = false
 # The liquid glass edge, the same glass as the notch
 glass = true
 # Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.

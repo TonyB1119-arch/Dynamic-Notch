@@ -201,6 +201,9 @@ impl Dock {
                 self.hide_to = 0.0;
             }
         }
+        if old.melt != cfg.melt {
+            self.region_full = None;
+        }
         if old.hide_taskbar != cfg.hide_taskbar {
             if cfg.hide_taskbar {
                 crate::taskbar::hide_taskbar();
@@ -252,7 +255,9 @@ impl Dock {
     /// Room under the bar: the shadow, plus (with auto-hide) the gap to the screen edge, so the
     /// window can touch the edge and catch the pointer there.
     fn foot(&self) -> f32 {
-        if self.cfg.auto_hide {
+        if self.cfg.melt {
+            0.0
+        } else if self.cfg.auto_hide {
             FOOT + self.cfg.bottom_margin
         } else {
             FOOT
@@ -280,10 +285,10 @@ impl Dock {
             let room = (work.right - work.left) as f32 / scale - 8.0;
             let win_w = (rest + 2.0 * pad + base * (mag - 1.0) * 2.4 + 24.0).min(room).max(120.0);
             let win_w = if self.picker { win_w.max(PICK_W + 16.0).min(room.max(PICK_W + 16.0)) } else { win_w };
-            let win_h = base * mag + 2.0 * pad + 44.0 + self.foot() - FOOT + if self.picker { PICK_H + 12.0 } else { 0.0 };
+            let win_h = base * mag + 2.0 * pad + 44.0 + self.foot().max(FOOT) - FOOT + if self.picker { PICK_H + 12.0 } else { 0.0 };
             let (wpx, hpx) = ((win_w * scale).ceil() as i32, (win_h * scale).ceil() as i32);
             let x = (work.left + work.right) / 2 - wpx / 2;
-            let lift = if self.cfg.auto_hide { 0 } else { (self.cfg.bottom_margin * scale) as i32 };
+            let lift = if self.cfg.auto_hide || self.cfg.melt { 0 } else { (self.cfg.bottom_margin * scale) as i32 };
             let y = work.bottom - hpx - lift;
             let geom = (x, y, wpx, hpx);
             if geom != self.win_px || (scale - self.scale).abs() > 0.001 {
@@ -333,6 +338,7 @@ impl Dock {
         self.region_full = Some(mode);
         let (_, _, wpx, hpx) = self.win_px;
         let s = self.scale;
+        let e = self.ear();
         let (l, t, r, b) = if mode == 1 {
             (0, 0, wpx, hpx)
         } else if mode == 2 {
@@ -340,12 +346,12 @@ impl Dock {
             let (divider, _) = self.divider_flags();
             let lay = layout(&divider, self.win_w, self.sizes().0, self.sizes().1, self.sizes().2, 0.0, 0.0);
             let bar = self.bar_rect(&lay);
-            ((bar.x * s).floor() as i32, hpx - (4.0 * s).ceil() as i32, (bar.right() * s).ceil() as i32, hpx)
+            (((bar.x - e) * s).floor() as i32, hpx - (4.0 * s).ceil() as i32, ((bar.right() + e) * s).ceil() as i32, hpx)
         } else {
             let (divider, _) = self.divider_flags();
             let lay = layout(&divider, self.win_w, self.sizes().0, self.sizes().1, self.sizes().2, 0.0, 0.0);
             let bar = self.bar_rect(&lay);
-            ((bar.x * s).floor() as i32, (bar.y * s).floor() as i32, (bar.right() * s).ceil() as i32, hpx)
+            (((bar.x - e) * s).floor() as i32, (bar.y * s).floor() as i32, ((bar.right() + e) * s).ceil() as i32, hpx)
         };
         unsafe {
             let rgn = CreateRectRgn(l.max(0), t.max(0), r.min(wpx), b.min(hpx));
@@ -355,6 +361,15 @@ impl Dock {
 
     fn divider_flags(&self) -> (Vec<bool>, usize) {
         (self.cells.iter().map(|c| c.is_none()).collect(), self.cells.len())
+    }
+
+    /// How far the curved feet of the melted dock reach out to each side (0 when it is off).
+    fn ear(&self) -> f32 {
+        if !self.cfg.melt {
+            return 0.0;
+        }
+        let (base, _, _, pad) = self.sizes();
+        ((base + 2.0 * pad) * 0.26).clamp(10.0, 26.0)
     }
 
     /// The bar behind the icons, from the row's current layout.
@@ -456,7 +471,7 @@ impl Dock {
         let dy = self.hide_t * (bar.h + self.foot() + 6.0);
         let op = self.cfg.opacity;
         self.host.set_backdrop_rounded(
-            Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, bar.h * sc),
+            Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, (bar.h + if self.cfg.melt { radius } else { 0.0 }) * sc),
             radius * sc,
             if self.hide_t > 0.98 { 0.0 } else { op },
         );
@@ -471,6 +486,7 @@ impl Dock {
         };
         {
             let panel = self.panel_rect();
+            let ear = self.ear();
             let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
             p.clear();
             p.set_local(1.0, 0.0, 0.0, 0.0, dy);
@@ -479,7 +495,13 @@ impl Dock {
             // the white rim: thickness and brightness come from the settings
             let rw = self.cfg.rim_width;
             if rw > 0.05 && self.cfg.rim_bright > 0.005 {
-                p.stroke_rounded(bar.inset(rw * 0.5), (radius - rw * 0.5).max(0.0), rw, Color::white(self.cfg.rim_bright));
+                if self.cfg.melt {
+                    if let Some(g) = melt_ring(&p, bar, radius, ear, rw) {
+                        p.fill_geometry(&g, Color::white(self.cfg.rim_bright));
+                    }
+                } else {
+                    p.stroke_rounded(bar.inset(rw * 0.5), (radius - rw * 0.5).max(0.0), rw, Color::white(self.cfg.rim_bright));
+                }
             }
             let icon_bottom = bar.bottom() - pad;
             let mut label: Option<(f32, f32, String)> = None;
@@ -1104,6 +1126,35 @@ fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
         }
     }
     dragdrop::thumbnail(&it.path, 128)
+}
+
+/// The white rim of the melted dock as one filled outline: round top corners, straight sides and
+/// concave feet that flare out and end flat on the screen edge (the notch's shape, upside down).
+/// The outline continues below the window, so no line shows along the screen edge.
+fn melt_ring(p: &Painter, bar: Rect, r: f32, e: f32, w: f32) -> Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> {
+    let (x0, x1, t, b) = (bar.x, bar.right(), bar.y, bar.bottom());
+    let h = w * 0.5;
+    let e = e.min(bar.h * 0.5).max(h + 0.5);
+    let r = r.min(bar.w * 0.5).min(bar.h - e).max(h + 0.5);
+    p.path(|g| {
+        g.move_to(x0 - e, b - h);
+        g.arc_to(x0 - h, b - e, e - h, false);
+        g.line_to(x0 - h, t + r);
+        g.arc_to(x0 + r, t - h, r + h, true);
+        g.line_to(x1 - r, t - h);
+        g.arc_to(x1 + h, t + r, r + h, true);
+        g.line_to(x1 + h, b - e);
+        g.arc_to(x1 + e, b - h, e - h, false);
+        g.line_to(x1 + e, b + h);
+        g.arc_to(x1 - h, b - e, e + h, true);
+        g.line_to(x1 - h, t + r);
+        g.arc_to(x1 - r, t + h, r - h, false);
+        g.line_to(x0 + r, t + h);
+        g.arc_to(x0 + h, t + r, r - h, false);
+        g.line_to(x0 + h, b - e);
+        g.arc_to(x0 - e, b + h, e + h, true);
+        g.close();
+    })
 }
 
 // -- open windows -------------------------------------------------------------------------------------
