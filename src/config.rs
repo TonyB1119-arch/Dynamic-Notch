@@ -423,6 +423,8 @@ pub struct DockCfg {
     pub opacity: f32,
     /// Programs that never show up in the dock.
     pub hide_apps: Vec<String>,
+    /// The liquid glass edge, the same glass as the notch (see Settings → Glass).
+    pub glass: bool,
 }
 
 impl Default for DockCfg {
@@ -438,6 +440,7 @@ impl Default for DockCfg {
             hide_taskbar: false,
             opacity: 0.42,
             hide_apps: vec!["raycast.exe".to_string()],
+            glass: true,
         }
     }
 }
@@ -1100,6 +1103,8 @@ hide_taskbar = false
 opacity = 0.42
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
+# The liquid glass edge, the same glass as the notch
+glass = true
 # Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.
 items = ['Explorer|%WINDIR%\explorer.exe']
 

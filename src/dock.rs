@@ -31,13 +31,14 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::UI::Composition::Compositor;
 
 use crate::config::DockCfg;
 use crate::gfx::image::decode;
-use crate::gfx::{Gfx, ImageData, Painter, Res, TextStyle};
+use crate::gfx::{Gfx, ImageData, Painter, Res, RimPic, TextStyle};
+use crate::refract::{self, Rim, Shape, Shot, Tune};
 use crate::host::Host;
 use crate::sys::{self, dragdrop};
 use crate::util::{app_dir, Color, Rect};
@@ -106,6 +107,13 @@ pub struct Dock {
     anim_on: bool,
     last_tick: Instant,
     hook: Option<HWINEVENTHOOK>,
+    /// Liquid glass edge: the dock is hidden from screen copies, the screen behind it is copied,
+    /// and the rim is bent from that copy (see `refract`). Made again only when something changed.
+    excl: bool,
+    tune: Tune,
+    glass: Option<GlassRim>,
+    glass_dirty: bool,
+    last_glass: Instant,
     picker: bool,
     apps: Vec<Item>,
     scroll: usize,
@@ -140,6 +148,11 @@ impl Dock {
             uwp_apps();
         });
         DOCK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        // hidden from screen copies, so a copy of the screen shows what is really behind the dock
+        let excl = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok() };
+        if !excl {
+            crate::log!("dock: cannot hide the dock from screen copies; no glass edge");
+        }
         let hook = unsafe {
             SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT)
         };
@@ -156,6 +169,11 @@ impl Dock {
             anim_on: false,
             last_tick: Instant::now(),
             hook: Some(hook),
+            excl,
+            tune: Tune::from(&crate::config::GlassCfg::default()),
+            glass: None,
+            glass_dirty: true,
+            last_glass: Instant::now(),
             picker: false,
             apps: Vec::new(),
             scroll: 0,
@@ -180,7 +198,11 @@ impl Dock {
     }
 
     /// New settings (or a first start): re-read the items and icons, then lay the bar out.
-    pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32) {
+    pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32, tune: Tune) {
+        self.tune = tune;
+        if !cfg.glass {
+            self.glass = None;
+        }
         // Settings reload on every change (a slider drag sends many): only redo what actually changed.
         let old = std::mem::replace(&mut self.cfg, cfg.clone());
         if old.auto_hide != cfg.auto_hide {
@@ -231,6 +253,8 @@ impl Dock {
         if let Ok(r) = Res::new(gfx) {
             self.res = r;
         }
+        self.glass = None;
+        self.glass_dirty = true;
         self.draw(gfx);
     }
 
@@ -293,6 +317,7 @@ impl Dock {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
+        self.glass_dirty = true;
         self.set_region(self.engage_to > 0.0);
     }
 
@@ -300,6 +325,71 @@ impl Dock {
     fn raise(&self) {
         unsafe {
             let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    /// Copy the screen behind the dock and make the glass rim from it. Does nothing when the glass
+    /// is off, and nothing again when what the rim can see has not changed. True when a new rim
+    /// was made.
+    fn rebuild_glass(&mut self) -> bool {
+        self.glass_dirty = false;
+        self.last_glass = Instant::now();
+        if !self.excl || !self.cfg.glass || !self.shown || self.win_px.2 == 0 {
+            return false;
+        }
+        let (x, y, wpx, hpx) = self.win_px;
+        let sc = self.scale;
+        let (base, mag, gap, _) = self.sizes();
+        let (divider, _) = self.divider_flags();
+        let bar = self.bar_rect(&layout(&divider, self.win_w, base, mag, gap, 0.0, 0.0));
+        let r = bar.h * 0.36;
+        let mut t = self.tune;
+        // a slim rim for a slim bar; it reaches the whole height so the two halves meet
+        t.width = (bar.h * 0.30).min(t.width);
+        t.pull = t.pull.min(bar.h * 0.28);
+        t.reach = bar.h - r;
+        t.mid = 0.0;
+        t.mid_warp = 0.0;
+        t.mid_blur = 0.0;
+        let shape = Shape {
+            left: bar.x * sc,
+            right: bar.right() * sc,
+            top: bar.y * sc,
+            bottom: bar.bottom() * sc,
+            radius: r * sc,
+            scale: sc,
+            tune: t,
+            band: 0.0,
+            fade: 0.0,
+            clear: 0.0,
+        };
+        let Some(shot) = refract::grab(x, y, wpx, hpx) else { return false };
+        // the same picture upside down gives the top corners and the top edge
+        let mut fpx = Vec::with_capacity(shot.px.len());
+        for row in shot.px.chunks(shot.w).rev() {
+            fpx.extend_from_slice(row);
+        }
+        let fshot = Shot { w: shot.w, h: shot.h, px: fpx, ox: 0, oy: 0, full: true, made_for: None };
+        let hh = shot.h as f32;
+        let mut shape2 = shape;
+        shape2.top = hh - shape.bottom;
+        shape2.bottom = hh - shape.top;
+        let sum = refract::ring_sum(&shot, shape).wrapping_mul(31).wrapping_add(refract::ring_sum(&fshot, shape2));
+        if self.glass.as_ref().is_some_and(|g| g.shape == shape && g.sum == sum) {
+            return false;
+        }
+        let (Some(r1), Some(r2)) = (refract::rim(&shot, shape, 1), refract::rim(&fshot, shape2, 1)) else {
+            self.glass = None;
+            return false;
+        };
+        let ymid = ((shape.top + shape.bottom) * 0.5) as i32;
+        let Some(c) = join_rims(&r1, &r2, shot.h as i32, ymid) else { return false };
+        match self.res.rim_pic(c.x0, c.y0, c.w, c.h, 1, &c.px, sc) {
+            Some(pic) => {
+                self.glass = Some(GlassRim { shape, sum, pic, bar });
+                true
+            }
+            None => false,
         }
     }
 
@@ -438,6 +528,9 @@ impl Dock {
         if self.picker {
             self.load_picker_icons();
         }
+        if self.glass_dirty {
+            self.rebuild_glass();
+        }
         let (base, mag, gap, pad) = self.sizes();
         let (divider, _) = self.divider_flags();
         let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, self.engage);
@@ -467,6 +560,14 @@ impl Dock {
             p.set_local(1.0, 0.0, 0.0, 0.0, dy);
             // plain blur: the blurred screen behind it plus one flat tint (the slider sets its strength)
             p.fill_rounded(bar, radius, Color::rgba(0.55, 0.57, 0.62, op * 0.30));
+            if let Some(g) = &self.glass {
+                // the rim was made for the bar at rest; while the icons grow the bar is a little
+                // wider, so the picture is stretched to it (as the notch does while it resizes)
+                let (sx, sy) = (bar.w / g.bar.w.max(1.0), bar.h / g.bar.h.max(1.0));
+                let r = g.pic.rect;
+                let dst = Rect::new(bar.x + (r.x - g.bar.x) * sx, bar.y + (r.y - g.bar.y) * sy, r.w * sx, r.h * sy);
+                p.draw_rim_to(&g.pic, dst, 0.35 + 0.65 * op);
+            }
             let icon_bottom = bar.bottom() - pad;
             let mut label: Option<(f32, f32, String)> = None;
             for (k, &(x, wd)) in lay.iter().enumerate() {
@@ -565,6 +666,10 @@ impl Dock {
             WM_RAISE => {
                 if self.shown {
                     self.raise();
+                    // another window came forward: the screen behind the dock may be different now
+                    if self.last_glass.elapsed() > Duration::from_millis(400) && self.hide_t < 0.5 && self.rebuild_glass() {
+                        self.draw(gfx);
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -676,6 +781,8 @@ impl Dock {
                 }
                 if changed {
                     self.place(gfx);
+                    self.draw(gfx);
+                } else if self.hide_t < 0.5 && self.rebuild_glass() {
                     self.draw(gfx);
                 }
                 unsafe {
@@ -882,6 +989,49 @@ impl Drop for Dock {
             let _ = DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// The glass rim of the dock and what it was made from.
+struct GlassRim {
+    shape: Shape,
+    sum: u64,
+    pic: RimPic,
+    /// The bar (dips) it was made for.
+    bar: Rect,
+}
+
+/// Join the rim made from the screen copy (the lower half of the bar: bottom edge and corners) with
+/// the one made from the upside-down copy (the upper half), into one picture in window pixels.
+/// Both are full strength at the middle line, so no seam shows.
+fn join_rims(a: &Rim, b: &Rim, hh: i32, ymid: i32) -> Option<Rim> {
+    if a.x0 != b.x0 || a.w != b.w || a.step != 1 || b.step != 1 {
+        return None;
+    }
+    // where the second one lies in the right-side-up copy
+    let (b_top, b_bot) = (hh - (b.y0 + b.h as i32), hh - b.y0);
+    let (y0, y1) = (a.y0.min(b_top), (a.y0 + a.h as i32).max(b_bot));
+    let h = (y1 - y0).max(0) as usize;
+    if h == 0 || a.w == 0 {
+        return None;
+    }
+    let mut px = vec![0u32; a.w * h];
+    for j in 0..h {
+        let y = y0 + j as i32;
+        let dst = &mut px[j * a.w..(j + 1) * a.w];
+        if y >= ymid {
+            let k = y - a.y0;
+            if (0..a.h as i32).contains(&k) {
+                dst.copy_from_slice(&a.px[k as usize * a.w..(k as usize + 1) * a.w]);
+            }
+        } else {
+            // upside down: window row y is row hh - 1 - y of the flipped copy
+            let k = hh - 1 - y - b.y0;
+            if (0..b.h as i32).contains(&k) {
+                dst.copy_from_slice(&b.px[k as usize * b.w..(k as usize + 1) * b.w]);
+            }
+        }
+    }
+    Some(Rim { x0: a.x0, y0, w: a.w, h, step: 1, px })
 }
 
 // -- layout --------------------------------------------------------------------------------------------
