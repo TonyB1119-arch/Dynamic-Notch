@@ -467,6 +467,11 @@ impl Dock {
             p.set_local(1.0, 0.0, 0.0, 0.0, dy);
             // plain blur: the blurred screen behind it plus one flat tint (the slider sets its strength)
             // no tint: the clear blur behind it is the whole background, `op` sets how strong it is
+            // the white rim: thickness and brightness come from the settings
+            let rw = self.cfg.rim_width;
+            if rw > 0.05 && self.cfg.rim_bright > 0.005 {
+                p.stroke_rounded(bar.inset(rw * 0.5), (radius - rw * 0.5).max(0.0), rw, Color::white(self.cfg.rim_bright));
+            }
             let icon_bottom = bar.bottom() - pad;
             let mut label: Option<(f32, f32, String)> = None;
             for (k, &(x, wd)) in lay.iter().enumerate() {

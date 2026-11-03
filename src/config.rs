@@ -423,6 +423,9 @@ pub struct DockCfg {
     pub opacity: f32,
     /// Programs that never show up in the dock.
     pub hide_apps: Vec<String>,
+    /// The white rim around the dock: thickness in pixels (0 = none) and brightness (0 - 1).
+    pub rim_width: f32,
+    pub rim_bright: f32,
     /// The liquid glass edge, the same glass as the notch (see Settings → Glass).
     pub glass: bool,
 }
@@ -440,6 +443,8 @@ impl Default for DockCfg {
             hide_taskbar: false,
             opacity: 0.30,
             hide_apps: vec!["raycast.exe".to_string()],
+            rim_width: 1.2,
+            rim_bright: 0.35,
             glass: true,
         }
     }
@@ -452,6 +457,8 @@ impl DockCfg {
         self.bottom_margin = self.bottom_margin.clamp(0.0, 80.0);
         self.opacity = self.opacity.clamp(0.1, 1.0);
         self.hide_apps.truncate(60);
+        self.rim_width = self.rim_width.clamp(0.0, 4.0);
+        self.rim_bright = self.rim_bright.clamp(0.0, 1.0);
         self.items.truncate(40);
     }
 }
@@ -1103,6 +1110,9 @@ hide_taskbar = false
 opacity = 0.30
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
+# The white rim around the dock: thickness (pixels, 0 = none) and brightness (0 - 1)
+rim_width = 1.2
+rim_bright = 0.35
 # The liquid glass edge, the same glass as the notch
 glass = true
 # Each item is "path", "Name|path" or "Name|path|icon.png". %VARS% work in paths.

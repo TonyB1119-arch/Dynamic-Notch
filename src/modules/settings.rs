@@ -258,7 +258,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 8.0,
+        8 => 10.0,
         _ => 25.0,
     }
 }
@@ -983,6 +983,26 @@ impl Settings {
             format!("{:.0}", d.bottom_margin),
             "dock",
             "bottom_margin",
+        );
+        slider_row(
+            ui,
+            row_rect(body, 8),
+            "Rim thickness",
+            d.rim_width,
+            (0.0, 4.0),
+            format!("{:.1}", d.rim_width),
+            "dock",
+            "rim_width",
+        );
+        slider_row(
+            ui,
+            row_rect(body, 9),
+            "Rim brightness",
+            d.rim_bright,
+            (0.0, 1.0),
+            format!("{:.0}%", d.rim_bright * 100.0),
+            "dock",
+            "rim_bright",
         );
     }
 
