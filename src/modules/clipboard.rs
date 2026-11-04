@@ -147,6 +147,10 @@ impl Module for Clipboard {
             }
             SystemEvent::ClipboardChanged => {
                 let owner = unsafe { GetClipboardOwner() }.ok();
+                crate::log!(
+                    "clipboard: copy seen (our own write: {})",
+                    self.self_write || owner == Some(self.hwnd.hwnd())
+                );
                 if self.self_write || owner == Some(self.hwnd.hwnd()) {
                     self.self_write = false;
                     return;
@@ -174,6 +178,7 @@ impl Module for Clipboard {
                 };
                 self.retry = 0;
                 let (kind, dib) = read;
+                crate::log!("clipboard: saved to the history");
                 // the launcher's clipboard mode keeps its own, longer history
                 let hist = match &kind {
                     Kind::Text(t) => crate::cliphist::Content::Text(t.clone()),
@@ -440,6 +445,7 @@ fn read_clipboard(hwnd: HWND) -> Option<(Kind, Option<Vec<u8>>)> {
         let viewer_ignore = RegisterClipboardFormatW(w!("Clipboard Viewer Ignore"));
         let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
         if IsClipboardFormatAvailable(exclude).is_ok() || IsClipboardFormatAvailable(viewer_ignore).is_ok() {
+            crate::log!("clipboard: skipped, the app marked it private");
             return None;
         }
         // another app may hold the clipboard for a moment
@@ -452,12 +458,14 @@ fn read_clipboard(hwnd: HWND) -> Option<(Kind, Option<Vec<u8>>)> {
             std::thread::sleep(Duration::from_millis(15));
         }
         if !opened {
+            crate::log!("clipboard: skipped, could not open the clipboard");
             return None;
         }
         let result = (|| {
             if let Ok(h) = GetClipboardData(history) {
                 if let Some(v) = with_global(h, |b| b.get(0..4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))) {
                     if v == Some(0) {
+                        crate::log!("clipboard: skipped, the app asked to keep it out of the history");
                         return None;
                     }
                 }
@@ -489,6 +497,7 @@ fn read_clipboard(hwnd: HWND) -> Option<(Kind, Option<Vec<u8>>)> {
                     String::from_utf16_lossy(&words)
                 })?;
                 if text.trim().is_empty() {
+                    crate::log!("clipboard: skipped, the text was empty");
                     return None;
                 }
                 return Some((Kind::Text(text), None));
@@ -502,6 +511,7 @@ fn read_clipboard(hwnd: HWND) -> Option<(Kind, Option<Vec<u8>>)> {
                 })
                 .flatten();
             }
+            crate::log!("clipboard: skipped, no text, files or picture on it");
             None
         })();
         let _ = CloseClipboard();
