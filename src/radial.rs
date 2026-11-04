@@ -22,12 +22,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::Graphics::Direct2D::ID2D1Geometry;
 use windows::UI::Composition::Compositor;
 
 use crate::config::RadialCfg;
 use crate::gfx::{Gfx, Icon, ImageData, Painter, Res, TextStyle};
 use crate::host::Host;
-use crate::sys::dragdrop;
 use crate::util::{Color, Rect};
 
 use geom::*;
@@ -186,6 +186,77 @@ mod geom {
     }
 }
 
+/// The colours of one look.
+struct Pal {
+    disc: Color,
+    slice: Color,
+    empty: Color,
+    center: Color,
+    /// The slice under the pointer.
+    hl: Color,
+    ink: Color,
+    /// Text over the slice under the pointer.
+    ink_hl: Color,
+    pill: Color,
+}
+
+/// Classic: grey slices, a white slice under the pointer. Tuna: Tuna's dark mode, graphite panels with a
+/// dark blue selection.
+fn pal(tuna: bool) -> Pal {
+    if tuna {
+        Pal {
+            disc: Color::hex(0x0A0B0C),
+            slice: Color::hex(0x151619),
+            empty: Color::hex(0x0F1012),
+            center: Color::hex(0x08090A),
+            hl: Color::hex(0x1F4562),
+            ink: Color::white(0.90),
+            ink_hl: Color::white(0.98),
+            pill: Color::hex(0x151619),
+        }
+    } else {
+        Pal {
+            disc: Color::hex(0x0B0B0C),
+            slice: Color::hex(0x262628),
+            empty: Color::hex(0x171718),
+            center: Color::hex(0x000000),
+            hl: Color::hex(0xECECEE),
+            ink: Color::white(0.86),
+            ink_hl: Color::hex(0x161617),
+            pill: Color::hex(0x2A2A2C),
+        }
+    }
+}
+
+/// One app of the menu, worked out once when the list changes.
+struct Slot {
+    name: String,
+    /// The name as shown under the picture (cut short).
+    label: String,
+    target: String,
+}
+
+fn make_slot(item: &str) -> Option<Slot> {
+    let item = item.trim();
+    let (name, target) = match item.split_once('|') {
+        Some((n, t)) => (n.trim(), t.trim()),
+        None => ("", item),
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let name = if name.is_empty() {
+        std::path::Path::new(target)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| target.to_string())
+    } else {
+        name.to_string()
+    };
+    Some(Slot { label: crate::util::truncate_chars(&name, 11), name, target: target.to_string() })
+}
+
 /// The white slice: where it is and where it is heading.
 struct Hl {
     a: Sp,
@@ -223,7 +294,11 @@ pub struct Radial {
     last_tick: Instant,
     /// The picture of each slot's app (where it has one).
     icons: Vec<Option<ImageData>>,
-    icons_for: Vec<String>,
+    icons_loaded: bool,
+    /// The apps, by slot.
+    slots: Vec<Option<Slot>>,
+    /// The 16 slices as shapes (built once; they only change with the list of apps).
+    geo: Vec<ID2D1Geometry>,
 }
 
 impl Radial {
@@ -257,11 +332,18 @@ impl Radial {
             tracking: false,
             last_tick: Instant::now(),
             icons: Vec::new(),
-            icons_for: Vec::new(),
+            icons_loaded: false,
+            slots: Vec::new(),
+            geo: Vec::new(),
         })
     }
 
     pub fn configure(&mut self, cfg: RadialCfg, search_url: String, ui_scale: f32) {
+        if self.slots.len() != SLOTS || cfg.apps != self.cfg.apps {
+            self.slots = (0..SLOTS).map(|i| cfg.apps.get(i).and_then(|s| make_slot(s))).collect();
+            self.icons_loaded = false;
+            self.geo.clear();
+        }
         self.cfg = cfg;
         self.search_url = search_url;
         self.ui_scale = ui_scale;
@@ -276,7 +358,8 @@ impl Radial {
         if let Ok(r) = Res::new(gfx) {
             self.res = r;
         }
-        self.icons_for.clear();
+        // the pictures are looked up again (they belong to the old drawing memory)
+        self.icons_loaded = false;
         self.draw(gfx);
     }
 
@@ -288,44 +371,23 @@ impl Radial {
         }
     }
 
-    /// What slot `i` is: its name and what it opens.
-    fn slot(&self, i: usize) -> Option<(String, String)> {
-        let item = self.cfg.apps.get(i)?.trim();
-        if item.is_empty() {
-            return None;
-        }
-        let (name, target) = match item.split_once('|') {
-            Some((n, t)) => (n.trim(), t.trim()),
-            None => ("", item),
-        };
-        if target.is_empty() {
-            return None;
-        }
-        let name = if name.is_empty() {
-            std::path::Path::new(target)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| target.to_string())
-        } else {
-            name.to_string()
-        };
-        Some((name, target.to_string()))
+    fn filled(&self, i: usize) -> bool {
+        self.slots.get(i).is_some_and(|s| s.is_some())
     }
 
-    /// The pictures of the apps, looked up again only when the list of apps has changed.
+    /// The pictures of the apps: the dock's own pictures (its dock-icons folder first), looked up again only
+    /// when the list of apps has changed.
     fn load_icons(&mut self) {
-        if self.icons_for == self.cfg.apps && self.icons.len() == SLOTS {
+        if self.icons_loaded {
             return;
         }
         for old in self.icons.drain(..).flatten() {
             self.res.forget(old.id);
         }
-        for i in 0..SLOTS {
-            let img = self.slot(i).and_then(|(_, target)| icon_of(&target));
-            self.icons.push(img);
+        for s in &self.slots {
+            self.icons.push(s.as_ref().and_then(|s| icon_of(&s.name, &s.target)));
         }
-        self.icons_for = self.cfg.apps.clone();
+        self.icons_loaded = true;
     }
 
     fn show(&mut self, gfx: &Gfx) {
@@ -457,7 +519,7 @@ impl Radial {
         }
         let (x, y, _, _) = self.win_px;
         let (dx, dy) = self.rel(pt.x - x, pt.y - y);
-        self.set_hover(hit(dx, dy).filter(|&i| self.slot(i).is_some()));
+        self.set_hover(hit(dx, dy).filter(|&i| self.filled(i)));
     }
 
     fn set_hover(&mut self, h: Option<usize>) {
@@ -513,7 +575,7 @@ impl Radial {
                 }
                 let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 let (dx, dy) = self.rel(x, y);
-                self.set_hover(hit(dx, dy).filter(|&i| self.slot(i).is_some()));
+                self.set_hover(hit(dx, dy).filter(|&i| self.filled(i)));
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
@@ -526,7 +588,8 @@ impl Radial {
                 let (dx, dy) = self.rel(x, y);
                 match hit(dx, dy) {
                     Some(i) => {
-                        if let Some((_, target)) = self.slot(i) {
+                        if let Some(Some(s)) = self.slots.get(i) {
+                            let target = s.target.clone();
                             self.hide();
                             crate::hotkeys::open_target(&target, &self.search_url);
                         }
@@ -581,79 +644,86 @@ impl Radial {
         let fade = ease_out((t * 1.8).min(1.0));
         // the slices and pictures appear a moment after the disc
         let content = ease_out(((t - 0.3) / 0.5).clamp(0.0, 1.0));
-        // looked up before the painter borrows the drawing memory
-        let slots: Vec<Option<(String, String)>> = (0..SLOTS).map(|i| self.slot(i)).collect();
-        let hover_label = self.hover.and_then(|i| slots[i].as_ref()).map(|(n, _)| n.clone());
+        let pl = pal(self.cfg.tuna);
+        self.load_icons();
+        let hover_label = self.hover.and_then(|i| self.slots.get(i)).and_then(|s| s.as_ref()).map(|s| s.name.clone());
         {
-            let mut p = Painter::new(dc, gfx, &mut self.res, self.scale, 0.0, 0.0);
+            let scale = self.scale;
+            let Self { res, slots, icons, geo, hl, .. } = &mut *self;
+            let mut p = Painter::new(dc, gfx, res, scale, 0.0, 0.0);
             p.clear();
             p.set_local(pop, c, c, 0.0, 0.0);
             p.alpha = fade;
             p.shadow(Rect::centered(c, c, OUT1 * 2.0, OUT1 * 2.0), OUT1, 0.55);
-            p.fill_circle(c, c, OUT1, Color::hex(0x0B0B0C).alpha(0.97));
+            p.fill_circle(c, c, OUT1, pl.disc.alpha(0.97));
 
-            // the slices
-            for i in 0..SLOTS {
-                let (r0, r1) = slot_radii(i);
-                let fill = if slots[i].is_some() {
-                    Color::hex(0x262628)
-                } else {
-                    Color::hex(0x171718)
-                };
-                if let Some(g) = p.path(|b| sector(b, c, c, r0, r1, slot_angle(i), HW, 8.0)) {
-                    p.fill_geometry(&g, fill.alpha(0.97 * content.max(0.35)));
+            // the slices (their shapes are built once)
+            if geo.len() != SLOTS {
+                geo.clear();
+                for i in 0..SLOTS {
+                    let (r0, r1) = slot_radii(i);
+                    match p.path(|b| sector(b, c, c, r0, r1, slot_angle(i), HW, 8.0)) {
+                        Some(g) => geo.push(g),
+                        None => break,
+                    }
                 }
             }
-            p.fill_circle(c, c, R_C, Color::hex(0x000000).alpha(0.98));
+            if geo.len() == SLOTS {
+                for (i, g) in geo.iter().enumerate() {
+                    let fill = if slots[i].is_some() { pl.slice } else { pl.empty };
+                    p.fill_geometry(g, fill.alpha(0.97 * content.max(0.35)));
+                }
+            }
+            p.fill_circle(c, c, R_C, pl.center.alpha(0.98));
 
-            // the white slice that follows the pointer
-            let h = &self.hl;
-            if h.alpha > 0.01 {
-                let r0 = h.r0.x.max(R_C + 1.0);
-                let r1 = h.r1.x.max(r0 + 6.0);
+            // the slice that follows the pointer
+            if hl.alpha > 0.01 {
+                let r0 = hl.r0.x.max(R_C + 1.0);
+                let r1 = hl.r1.x.max(r0 + 6.0);
                 let k = (r1 - r0) * 0.35;
                 let sw = (HW * r0 * 0.9).min(k);
-                if let Some(g) = p.path(|b| sector(b, c, c, r0, r1, h.a.x, HW, sw.min(10.0))) {
-                    p.fill_geometry(&g, Color::hex(0xECECEE).alpha(0.97 * h.alpha));
+                if let Some(g) = p.path(|b| sector(b, c, c, r0, r1, hl.a.x, HW, sw.min(10.0))) {
+                    p.fill_geometry(&g, pl.hl.alpha(0.97 * hl.alpha));
                 }
             }
 
-            // pictures and names
+            // pictures and names: the picture and its name sit together in the middle of the slice
             p.alpha = fade * content;
-            let hl_mid = polar(c, c, (self.hl.r0.x + self.hl.r1.x) * 0.5, self.hl.a.x);
-            for i in 0..SLOTS {
-                let Some((name, target)) = slots[i].as_ref() else { continue };
-                let (mx, my) = polar(c, c, (slot_radii(i).0 + slot_radii(i).1) * 0.5, slot_angle(i));
-                // dark text while the white slice is over this one
+            let hl_mid = polar(c, c, (hl.r0.x + hl.r1.x) * 0.5, hl.a.x);
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(slot) = slot else { continue };
+                let (r0, r1) = slot_radii(i);
+                let (mx, my) = polar(c, c, (r0 + r1) * 0.5, slot_angle(i));
                 let d = ((mx - hl_mid.0).powi(2) + (my - hl_mid.1).powi(2)).sqrt();
-                let cover = ((1.0 - d / 46.0).clamp(0.0, 1.0)) * self.hl.alpha;
-                let ink = Color::white(0.86).lerp(Color::hex(0x161617), cover);
-                let size = if i < 8 { 26.0 } else { 30.0 };
-                let ir = Rect::centered(mx, my - 8.0, size, size);
-                match self.icons.get(i).and_then(|o| o.as_ref()) {
-                    Some(img) => p.image(img, ir, 6.0, 1.0),
-                    None if target.to_ascii_lowercase().starts_with("ms-settings") => p.icon(Icon::Settings, ir, ink),
+                let cover = ((1.0 - d / 46.0).clamp(0.0, 1.0)) * hl.alpha;
+                let ink = pl.ink.lerp(pl.ink_hl, cover);
+                let size = if i < 8 { 34.0 } else { 38.0 };
+                // picture + 3 px + 12 px of text, centred on the slice
+                let top = my - (size + 15.0) * 0.5;
+                let ir = Rect::new(mx - size * 0.5, top, size, size);
+                match icons.get(i).and_then(|o| o.as_ref()) {
+                    Some(img) => p.image(img, ir, 7.0, 1.0),
+                    None if slot.target.to_ascii_lowercase().starts_with("ms-settings") => p.icon(Icon::Settings, ir, ink),
                     None => {
-                        let ch = name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
+                        let ch = slot.name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
                         p.glyph(ch, ir, size * 0.8, ink);
                     }
                 }
-                let label = crate::util::truncate_chars(name, 11);
                 p.text(
-                    &label,
-                    Rect::centered(mx, my + 15.0, 72.0, 14.0),
-                    &TextStyle::new(10.5, ink).medium().center(),
+                    &slot.label,
+                    Rect::centered(mx, top + size + 9.0, 74.0, 12.0),
+                    &TextStyle::new(10.0, ink).medium().center(),
                 );
             }
 
             // the name of the slice under the pointer, in the middle
             if let Some(name) = hover_label {
-                p.alpha = fade * content * self.hl.alpha;
+                p.alpha = fade * content * hl.alpha;
                 let label = crate::util::truncate_chars(&name, 16);
                 let st = TextStyle::new(12.0, Color::white(0.92)).medium().center();
                 let (tw, _) = p.measure(&label, &st);
                 let pill = Rect::centered(c, c, (tw + 26.0).min(R_C * 2.0 - 6.0), 26.0);
-                p.fill_rounded(pill, 13.0, Color::hex(0x2A2A2C));
+                p.fill_rounded(pill, 13.0, pl.pill);
                 p.text(&label, pill, &st);
             }
             p.reset_local();
@@ -705,15 +775,14 @@ fn sector(b: &crate::gfx::PathBuilder, cx: f32, cy: f32, r0: f32, r1: f32, a: f3
     b.close();
 }
 
-/// The picture of the app behind `target` (an exe, shortcut or Store app), when Windows has one.
-fn icon_of(target: &str) -> Option<ImageData> {
+/// The picture of an app, the way the dock finds it: a .png in the dock-icons folder (named after the app or
+/// its file) first, else the picture Windows has for the exe, shortcut or Store app.
+fn icon_of(name: &str, target: &str) -> Option<ImageData> {
     let t = crate::dock::expand_env(target);
     let low = t.to_ascii_lowercase();
-    if low.starts_with("http") || low == "browser" || low == "default browser" {
-        return None;
-    }
-    let full = if t.contains(['\\', '/', ':']) { t } else { find_exe(&t)? };
-    dragdrop::thumbnail(&full, 96)
+    let web = low.starts_with("http") || low == "browser" || low == "default browser";
+    let full = if web || t.contains(['\\', '/', ':']) { t } else { find_exe(&t).unwrap_or(t) };
+    crate::dock::icon_for(name, &full)
 }
 
 /// `notepad` or `calc`: the file in the system folders or on the PATH.

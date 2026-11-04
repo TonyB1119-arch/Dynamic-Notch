@@ -295,7 +295,7 @@ fn tab_rows(tab: usize) -> f32 {
         7 => 5.9,
         8 => 20.0,
         10 => 14.0,
-        11 => 19.0,
+        11 => 20.0,
         _ => 25.0,
     }
 }
@@ -1501,7 +1501,8 @@ impl Settings {
         let r = self.cfg.radial.clone();
         toggle_row(ui, row_rect(body, 0), "Radial menu (Win+M)", r.enabled, "radial", "enabled");
         toggle_row(ui, row_rect(body, 1), "Hide the Windows taskbar", r.hide_taskbar, "radial", "hide_taskbar");
-        let row = row_rect(body, 2);
+        toggle_row(ui, row_rect(body, 2), "Tuna dark look", r.tuna, "radial", "tuna");
+        let row = row_rect(body, 3);
         ui.p.text(
             "Pick an app for each slice. The inner ring comes first; both run clockwise from the top.",
             Rect::new(row.x + 2.0, row.y, row.w, row.h),
@@ -1512,7 +1513,7 @@ impl Settings {
         let mut apps = r.apps.clone();
         apps.resize(16, String::new());
         for i in 0..16 {
-            let row = row_rect(body, 3 + i);
+            let row = row_rect(body, 4 + i);
             label_row(ui, row, &format!("{} \u{b7} {}", if i < 8 { "Inner" } else { "Outer" }, POS[i % 8]));
             let item = apps[i].trim();
             let name = item.split_once('|').map_or(item, |(n, _)| n.trim());

@@ -431,6 +431,8 @@ pub struct RadialCfg {
     pub enabled: bool,
     /// Hide the Windows taskbar while Dynamic Notch runs (it comes back when you quit or turn this off).
     pub hide_taskbar: bool,
+    /// Tuna's dark look: graphite slices with a dark blue selection.
+    pub tuna: bool,
     /// 16 slots, "name|what to open" (an empty text is an empty slot): the first 8 are the inner ring and
     /// the last 8 the outer ring, both clockwise from the top.
     pub apps: Vec<String>,
@@ -452,7 +454,7 @@ impl Default for RadialCfg {
         .map(|s| s.to_string())
         .collect();
         apps.resize(16, String::new());
-        Self { enabled: true, hide_taskbar: false, apps }
+        Self { enabled: true, hide_taskbar: false, tuna: false, apps }
     }
 }
 
@@ -1322,6 +1324,8 @@ items = []
 enabled = true
 # Hide the Windows taskbar while Dynamic Notch runs (it comes back when you quit or turn this off).
 hide_taskbar = false
+# Tuna's dark look for the menu: graphite slices with a dark blue selection (Settings -> Radial).
+tuna = false
 # 16 slots: the first 8 are the inner ring, the last 8 the outer ring, both clockwise from the top.
 # Each one is 'name|what to open'; an empty text '' is an empty slot.
 apps = ['File Explorer|explorer.exe', 'Edge|%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe', 'Notepad|notepad.exe', 'Calculator|calc.exe', 'PowerShell|powershell.exe', 'Settings|ms-settings:', 'Task Manager|taskmgr.exe', 'Snipping Tool|snippingtool.exe', '', '', '', '', '', '', '', '']

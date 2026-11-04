@@ -1132,6 +1132,20 @@ fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
     dragdrop::thumbnail(&it.path, 128)
 }
 
+/// The picture the dock shows for an app called `label` that opens `path` (so the radial menu matches).
+pub fn icon_for(label: &str, path: &str) -> Option<ImageData> {
+    let it = with_key(Item {
+        label: label.to_string(),
+        path: path.to_string(),
+        exe: String::new(),
+        png: None,
+        pinned: false,
+        hwnd: 0,
+        key: String::new(),
+    });
+    load_icon(&it, &icons_dir())
+}
+
 /// The white rim of the melted dock as one filled outline: round top corners, straight sides and
 /// concave feet that flare out and end flat on the screen edge (the notch's shape, upside down).
 /// The outline continues below the window, so no line shows along the screen edge.
