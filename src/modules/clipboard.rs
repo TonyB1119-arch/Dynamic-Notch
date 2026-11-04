@@ -66,11 +66,13 @@ pub struct Clipboard {
     self_write: bool,
     /// Alcove: which items show (0 all, 1 text, 2 images, 3 files).
     filter: usize,
+    /// How many times in a row the clipboard could not be read (it is looked at again a moment later).
+    retry: u8,
 }
 
 impl Clipboard {
     pub fn new() -> Self {
-        Self { items: Vec::new(), next_id: 1, max: 8, hwnd: SendHwnd(0), self_write: false, filter: 0 }
+        Self { items: Vec::new(), next_id: 1, max: 8, hwnd: SendHwnd(0), self_write: false, filter: 0, retry: 0 }
     }
 
     fn push(&mut self, kind: Kind) -> u64 {
@@ -149,7 +151,28 @@ impl Module for Clipboard {
                     self.self_write = false;
                     return;
                 }
-                let Some(read) = read_clipboard(self.hwnd.hwnd()) else { return };
+                let Some(read) = read_clipboard(self.hwnd.hwnd()) else {
+                    // the app that copied may still hold the clipboard, or fill it a moment late: look again shortly
+                    if self.retry < 3 {
+                        self.retry += 1;
+                        let raw = self.hwnd;
+                        let _ = std::thread::Builder::new().name("clip-retry".into()).spawn(move || {
+                            std::thread::sleep(Duration::from_millis(200));
+                            unsafe {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                    Some(raw.hwnd()),
+                                    windows::Win32::UI::WindowsAndMessaging::WM_CLIPBOARDUPDATE,
+                                    windows::Win32::Foundation::WPARAM(0),
+                                    windows::Win32::Foundation::LPARAM(0),
+                                );
+                            }
+                        });
+                    } else {
+                        self.retry = 0;
+                    }
+                    return;
+                };
+                self.retry = 0;
                 let (kind, dib) = read;
                 // the launcher's clipboard mode keeps its own, longer history
                 let hist = match &kind {
