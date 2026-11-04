@@ -435,6 +435,8 @@ pub struct RadialCfg {
     pub tuna: bool,
     /// How much the glass blurs what is behind it (0 = not at all, 3 = a lot).
     pub blur: f32,
+    /// How see-through the glass is (0 = a solid tint, 1 = clear glass).
+    pub glass: f32,
     /// 16 slots, "name|what to open" (an empty text is an empty slot): the first 8 are the inner ring and
     /// the last 8 the outer ring, both clockwise from the top.
     pub apps: Vec<String>,
@@ -456,7 +458,7 @@ impl Default for RadialCfg {
         .map(|s| s.to_string())
         .collect();
         apps.resize(16, String::new());
-        Self { enabled: true, hide_taskbar: false, tuna: false, blur: 1.6, apps }
+        Self { enabled: true, hide_taskbar: false, tuna: false, blur: 1.6, glass: 0.65, apps }
     }
 }
 
@@ -464,6 +466,7 @@ impl RadialCfg {
     /// Always exactly 16 slots.
     fn fix(&mut self) {
         self.blur = self.blur.clamp(0.0, 3.0);
+        self.glass = self.glass.clamp(0.0, 1.0);
         self.apps.truncate(16);
         self.apps.resize(16, String::new());
     }
@@ -1331,6 +1334,8 @@ hide_taskbar = false
 tuna = false
 # How much the glass blurs what is behind it (0 = not at all, 3 = a lot).
 blur = 1.6
+# How see-through the glass is (0 = a solid tint, 1 = clear glass).
+glass = 0.65
 # 16 slots: the first 8 are the inner ring, the last 8 the outer ring, both clockwise from the top.
 # Each one is 'name|what to open'; an empty text '' is an empty slot.
 apps = ['File Explorer|explorer.exe', 'Edge|%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe', 'Notepad|notepad.exe', 'Calculator|calc.exe', 'PowerShell|powershell.exe', 'Settings|ms-settings:', 'Task Manager|taskmgr.exe', 'Snipping Tool|snippingtool.exe', '', '', '', '', '', '', '', '']

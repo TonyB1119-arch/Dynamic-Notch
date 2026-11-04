@@ -295,7 +295,7 @@ fn tab_rows(tab: usize) -> f32 {
         7 => 5.9,
         8 => 20.0,
         10 => 14.0,
-        11 => 21.0,
+        11 => 22.0,
         _ => 25.0,
     }
 }
@@ -1512,7 +1512,17 @@ impl Settings {
             "radial",
             "blur",
         );
-        let row = row_rect(body, 4);
+        slider_row(
+            ui,
+            row_rect(body, 4),
+            "Glassiness",
+            r.glass,
+            (0.0, 1.0),
+            format!("{:.0}%", r.glass * 100.0),
+            "radial",
+            "glass",
+        );
+        let row = row_rect(body, 5);
         ui.p.text(
             "Pick an app for each slice. The inner ring comes first; both run clockwise from the top.",
             Rect::new(row.x + 2.0, row.y, row.w, row.h),
@@ -1523,7 +1533,7 @@ impl Settings {
         let mut apps = r.apps.clone();
         apps.resize(16, String::new());
         for i in 0..16 {
-            let row = row_rect(body, 5 + i);
+            let row = row_rect(body, 6 + i);
             label_row(ui, row, &format!("{} \u{b7} {}", if i < 8 { "Inner" } else { "Outer" }, POS[i % 8]));
             let item = apps[i].trim();
             let name = item.split_once('|').map_or(item, |(n, _)| n.trim());

@@ -214,7 +214,6 @@ mod geom {
 struct Pal {
     /// The glass disc.
     tint: Color,
-    rim: Color,
     /// The slice under the pointer.
     hl: Color,
     ink: Color,
@@ -222,19 +221,18 @@ struct Pal {
 }
 
 /// Classic: light frosted glass. Tuna: Tuna's dark mode, smoked glass with a dark blue selection.
-fn pal(tuna: bool) -> Pal {
+/// `glass`: 0 = a solid tint, 1 = clear glass.
+fn pal(tuna: bool, glass: f32) -> Pal {
     if tuna {
         Pal {
-            tint: Color::hex(0x0E1013).alpha(0.34),
-            rim: Color::white(0.10),
+            tint: Color::hex(0x0E1013).alpha(0.85 * (1.0 - glass)),
             hl: Color::hex(0x2A6A9A).alpha(0.55),
             ink: Color::white(0.92),
             pill: Color::hex(0x000000).alpha(0.30),
         }
     } else {
         Pal {
-            tint: Color::white(0.07),
-            rim: Color::white(0.22),
+            tint: Color::white(0.30 * (1.0 - glass)),
             hl: Color::white(0.22),
             ink: Color::white(0.92),
             pill: Color::hex(0x000000).alpha(0.22),
@@ -690,7 +688,7 @@ impl Radial {
         let disc = if self.single { SINGLE1 + 2.0 } else { OUT1 };
         // the slices and pictures appear a moment after the disc
         let content = ease_out(((t - 0.3) / 0.5).clamp(0.0, 1.0));
-        let pl = pal(self.cfg.tuna);
+        let pl = pal(self.cfg.tuna, self.cfg.glass);
         let prog = self.prog();
         let single = self.single;
         self.load_icons();
@@ -709,8 +707,6 @@ impl Radial {
                 p.image_disc(img, c, c, disc, 0.0);
             }
             p.fill_circle(c, c, disc, pl.tint.alpha(content.max(0.5)));
-            p.stroke_circle(c, c, disc - 0.5, 1.0, pl.rim);
-            p.stroke_circle(c, c, R_C, 1.0, pl.rim);
 
             // the slice that follows the pointer
             if hl.alpha > 0.01 {
