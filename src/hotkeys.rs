@@ -1,7 +1,12 @@
 //! Global hotkeys from config strings like "Ctrl+Alt+Space".
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId, IsZoomed, PostMessageW,
+    ShowWindowAsync, GWL_STYLE, SW_MAXIMIZE, SW_RESTORE, WM_CLOSE, WS_MAXIMIZEBOX,
+};
 
 use crate::config::Hotkeys as HotkeyCfg;
 
@@ -18,6 +23,10 @@ pub enum Action {
     LauncherClip,
     /// The launcher in Gemini mode.
     LauncherAi,
+    /// Maximise the window in front, or put it back.
+    WindowMax,
+    /// Close the window in front.
+    WindowClose,
     /// One of the user's combos (its place in `[combos] items`).
     Combo(usize),
 }
@@ -147,6 +156,8 @@ const COMBO_BASE: i32 = BASE_ID + 32;
 const MAX_COMBOS: usize = 24;
 const CLIP_ID: i32 = COMBO_BASE + 80;
 const AI_ID: i32 = COMBO_BASE + 81;
+const MAX_ID: i32 = COMBO_BASE + 82;
+const CLOSE_ID: i32 = COMBO_BASE + 83;
 
 /// Is this a key combination a combo may use? It needs Ctrl, Alt, Shift or Win (or be an F key), so a
 /// combo can't take over a plain letter.
@@ -174,12 +185,18 @@ pub fn split_item(item: &str) -> (&str, &str, &str) {
 
 /// Hand the user's combos to the keyboard hook (`lowkeys`), which sees every key before Windows does.
 /// Returns what can be used and what cannot.
-pub fn register_combos(hwnd: HWND, items: &[String], clip_keys: &str, ai_keys: &str) -> (Vec<Registered>, Vec<String>) {
+/// `own` are the keys of the built-in ones that need the hook: clipboard, Gemini, maximise, close.
+pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 4]) -> (Vec<Registered>, Vec<String>) {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
     let mut table = Vec::new();
     // the launcher's own hotkeys go first: they win when a combo uses the same keys
-    for (keys, id, action) in [(clip_keys, CLIP_ID, Action::LauncherClip), (ai_keys, AI_ID, Action::LauncherAi)] {
+    for (keys, id, action) in [
+        (own[0], CLIP_ID, Action::LauncherClip),
+        (own[1], AI_ID, Action::LauncherAi),
+        (own[2], MAX_ID, Action::WindowMax),
+        (own[3], CLOSE_ID, Action::WindowClose),
+    ] {
         let keys = keys.trim();
         if keys.is_empty() {
             continue;
@@ -207,6 +224,51 @@ pub fn register_combos(hwnd: HWND, items: &[String], clip_keys: &str, ai_keys: &
     }
     crate::lowkeys::set_combos(hwnd, table);
     (ok, errors)
+}
+
+/// Maximise the window in front, or put it back if it already is maximised. Windows that cannot be
+/// maximised, the desktop and the taskbar are left alone.
+pub fn maximize_active() {
+    let Some(hwnd) = active_window() else { return };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if style & WS_MAXIMIZEBOX.0 == 0 {
+            return;
+        }
+        let _ = ShowWindowAsync(hwnd, if IsZoomed(hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE });
+    }
+}
+
+/// Close the window in front, the way its close button would.
+pub fn close_active() {
+    let Some(hwnd) = active_window() else { return };
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// The window in front, unless it is one of ours, the desktop or the taskbar.
+fn active_window() -> Option<HWND> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return None;
+        }
+        let mut class = [0u16; 64];
+        let n = (GetClassNameW(hwnd, &mut class).max(0) as usize).min(class.len());
+        let name = String::from_utf16_lossy(&class[..n]);
+        const SHELL: [&str; 5] =
+            ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Windows.UI.Core.CoreWindow"];
+        if SHELL.contains(&name.as_str()) {
+            return None;
+        }
+        Some(hwnd)
+    }
 }
 
 /// Open what a combo points at: `browser` is the default browser, anything else is opened as typed

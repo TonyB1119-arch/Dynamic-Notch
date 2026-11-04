@@ -289,7 +289,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 16.0,
+        8 => 20.0,
         10 => 14.0,
         _ => 25.0,
     }
@@ -1101,6 +1101,16 @@ impl Settings {
         toggle_row(ui, row_rect(body, 16), "Liquid glass: dock", d.glass, "dock", "glass");
         toggle_row(ui, row_rect(body, 17), "Liquid glass: launcher", l.glass, "launcher", "glass");
         toggle_row(ui, row_rect(body, 18), "Launcher: live blur (hides it from screenshots)", l.live, "launcher", "live");
+        slider_row(
+            ui,
+            row_rect(body, 19),
+            "Launcher tint (dark look)",
+            l.tint,
+            (0.0, 0.6),
+            format!("{:.0}%", l.tint * 100.0),
+            "launcher",
+            "tint",
+        );
     }
 
     fn glass(&mut self, ui: &mut Ui, body: Rect) {

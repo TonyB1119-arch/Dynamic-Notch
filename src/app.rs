@@ -1880,6 +1880,8 @@ impl App {
             Action::Launcher => self.launcher_toggle(),
             Action::LauncherClip => self.launcher_clip_toggle(),
             Action::LauncherAi => self.launcher_ai_toggle(),
+            Action::WindowMax => hotkeys::maximize_active(),
+            Action::WindowClose => hotkeys::close_active(),
             Action::Combo(i) => {
                 if let Some(item) = self.cfg.combos.items.get(i).cloned() {
                     let (_, target, label) = hotkeys::split_item(&item);
@@ -2027,8 +2029,12 @@ impl App {
         let (combos, combo_errors) = hotkeys::register_combos(
             self.hwnd,
             &self.cfg.combos.items,
-            &self.cfg.hotkeys.launcher_clip,
-            &self.cfg.hotkeys.launcher_ai,
+            [
+                self.cfg.hotkeys.launcher_clip.as_str(),
+                self.cfg.hotkeys.launcher_ai.as_str(),
+                self.cfg.hotkeys.window_max.as_str(),
+                self.cfg.hotkeys.window_close.as_str(),
+            ],
         );
         self.hotkeys = ok;
         self.hotkeys.extend(combos);

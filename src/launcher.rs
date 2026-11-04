@@ -151,6 +151,8 @@ enum Act {
     CopyTo,
     /// Run a system command.
     Run,
+    /// Take the app off the computer.
+    Uninstall,
     PasteEmoji,
     CopyEmoji,
 }
@@ -176,6 +178,7 @@ impl Act {
             Act::MoveTo => "Move to\u{2026}",
             Act::CopyTo => "Copy to\u{2026}",
             Act::Run => "Run",
+            Act::Uninstall => "Uninstall",
             Act::PasteEmoji => "Paste",
             Act::CopyEmoji => "Copy",
         }
@@ -199,6 +202,7 @@ impl Act {
             Act::MoveTo => Icon::Folder,
             Act::CopyTo | Act::CopyEmoji => Icon::Copy,
             Act::Run => Icon::Bolt,
+            Act::Uninstall => Icon::Trash,
             Act::PasteEmoji => Icon::Clipboard,
         }
     }
@@ -207,8 +211,8 @@ impl Act {
 /// What can be done with a match; the first one is what Enter does.
 fn actions(h: &Hit) -> &'static [Act] {
     match h.kind {
-        Kind::App if h.path.starts_with("shell:") => &[Act::Open],
-        Kind::App => &[Act::Open, Act::Admin, Act::Reveal, Act::Quit, Act::Restart, Act::ForceQuit],
+        Kind::App if h.path.starts_with("shell:") => &[Act::Open, Act::Uninstall],
+        Kind::App => &[Act::Open, Act::Admin, Act::Reveal, Act::Quit, Act::Restart, Act::ForceQuit, Act::Uninstall],
         Kind::Folder | Kind::File => &[Act::Open, Act::Reveal, Act::CopyPath, Act::OpenWith, Act::MoveTo, Act::CopyTo],
         Kind::Calc => &[Act::CopyResult],
         Kind::Url => &[Act::OpenLink, Act::CopyPath],
@@ -1236,6 +1240,7 @@ impl Launcher {
             Focus::Action => {
                 if i != self.act {
                     self.act = i;
+                    self.armed = None;
                     self.pop_a = 0.0;
                 }
             }
@@ -1470,6 +1475,16 @@ impl Launcher {
             self.kick();
             return;
         }
+        if a == Act::Uninstall {
+            // taking an app off the computer asks twice
+            if self.armed.as_deref() != Some(h.path.as_str()) {
+                self.armed = Some(h.path.clone());
+                return;
+            }
+            self.hide();
+            uninstall_app(&h.path, &h.name);
+            return;
+        }
         if a == Act::Run && h.kind == Kind::System && h.idx == conv::PICK_COLOR {
             self.start_pick();
             return;
@@ -1508,7 +1523,7 @@ impl Launcher {
                     }
                 }
             }
-            Act::DeleteClip | Act::OpenWith | Act::MoveTo | Act::CopyTo | Act::Run => {}
+            Act::DeleteClip | Act::OpenWith | Act::MoveTo | Act::CopyTo | Act::Run | Act::Uninstall => {}
             Act::PasteEmoji | Act::CopyEmoji => {
                 clip::set_text(hwnd, &h.path);
                 if a == Act::PasteEmoji {
@@ -2117,6 +2132,7 @@ impl Launcher {
                 whole: Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc),
                 light,
                 dark,
+                tint: self.cfg.tint,
                 glass,
                 // the rim is the dock's (its thickness and brightness come from the dock settings)
                 rim: (self.cfg.rim_width, if light { 0.75 } else { self.cfg.rim_bright }),
@@ -2308,6 +2324,8 @@ struct Glass<'a> {
     whole: Rect,
     light: bool,
     dark: f32,
+    /// A small dark-grey wash on the dark look (from Settings).
+    tint: f32,
     glass: bool,
     /// Rim thickness and brightness.
     rim: (f32, f32),
@@ -2330,6 +2348,10 @@ fn draw_glass(p: &mut Painter, g: &Glass, r: Rect, radius: f32) {
                 Color::rgba(0.03, 0.03, 0.05, 0.62 * g.dark)
             };
             p.fill_rounded(r, radius, tint);
+            if !g.light && g.tint > 0.005 {
+                // the small dark-grey wash
+                p.fill_rounded(r, radius, Color::rgba(0.07, 0.07, 0.08, g.tint));
+            }
         }
         // glass off, or no picture of the screen: a solid piece
         None if g.light => p.fill_rounded(r, radius, Color::rgba(0.93, 0.95, 0.98, 0.96)),
@@ -2821,6 +2843,7 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, armed: b
     let slide = (1.0 - fade) * 5.0;
     // a command shows its own name, and asks again before it switches the computer off
     let label = match (h.kind, armed) {
+        (_, true) if a == Act::Uninstall => "Press Enter to confirm",
         (Kind::System, true) => "Press Enter to confirm",
         (Kind::System, false) => h.name.as_str(),
         _ => a.label(),
@@ -3174,6 +3197,32 @@ fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         std::fs::copy(from, to).map(|_| ())
     }
+}
+
+/// Take an app off the computer. A Store app is removed with PowerShell; for any other app the uninstaller
+/// it registered is found by its name and started (it asks its own questions); when there is none, the
+/// installed apps page of Settings opens.
+fn uninstall_app(path: &str, name: &str) {
+    const NO_WINDOW: u32 = 0x0800_0000;
+    let store = path.strip_prefix("shell:AppsFolder\\").or_else(|| path.strip_prefix("shell:appsfolder\\"));
+    let script = match store {
+        Some(id) => {
+            let family = id.split('!').next().unwrap_or("");
+            if !family.is_empty() && family.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+                format!("Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq '{family}' }} | Remove-AppxPackage")
+            } else {
+                "Start-Process 'ms-settings:appsfeatures'".to_string()
+            }
+        }
+        None => format!(
+            "$n='{}'; $k=Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object {{ $_.DisplayName -and $_.UninstallString -and $_.DisplayName.StartsWith($n,[StringComparison]::OrdinalIgnoreCase) }} | Select-Object -First 1; if ($k) {{ Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c',([string][char]34+$k.UninstallString+[string][char]34) }} else {{ Start-Process 'ms-settings:appsfeatures' }}",
+            name.replace('\'', "''")
+        ),
+    };
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(NO_WINDOW)
+        .spawn();
 }
 
 /// Do a system command (its place in `conv::SYSTEM`).

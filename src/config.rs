@@ -181,6 +181,11 @@ pub struct Hotkeys {
     pub launcher_clip: String,
     /// The launcher as a one-question chat with Gemini (uses the key from Settings → Gemini).
     pub launcher_ai: String,
+    /// Maximise the window in front (press again to put it back). Caught by a low-level hook, so Win+F works
+    /// even though Windows wants it.
+    pub window_max: String,
+    /// Close the window in front.
+    pub window_close: String,
 }
 
 impl Default for Hotkeys {
@@ -195,6 +200,8 @@ impl Default for Hotkeys {
             launcher: "Alt+Space".into(),
             launcher_clip: "Win+C".into(),
             launcher_ai: "Win+G".into(),
+            window_max: "Win+F".into(),
+            window_close: "Win+Q".into(),
         }
     }
 }
@@ -432,6 +439,8 @@ pub struct LauncherCfg {
     pub blur: f32,
     /// How dark the glass is (higher = darker).
     pub dark: f32,
+    /// A small dark-grey wash on the dark look (0 = none).
+    pub tint: f32,
     /// Opening, closing, the list dropping down and the underline all move.
     pub animate: bool,
     /// Light frosted glass with dark writing (false = dark glass with white writing).
@@ -463,6 +472,7 @@ impl Default for LauncherCfg {
             folders: Vec::new(),
             blur: 0.7,
             dark: 0.55,
+            tint: 0.12,
             animate: true,
             light: false,
             size: 0.8,
@@ -481,6 +491,7 @@ impl LauncherCfg {
     fn clamped(&mut self) {
         self.blur = self.blur.clamp(0.0, 1.0);
         self.dark = self.dark.clamp(0.2, 0.95);
+        self.tint = self.tint.clamp(0.0, 0.6);
         self.size = self.size.clamp(0.5, 1.5);
         self.folders.truncate(20);
         let u = self.search_url.trim().to_string();
@@ -1047,6 +1058,10 @@ launcher = "Alt+Space"
 launcher_clip = "Win+C"
 # The launcher as a one-question chat with Gemini. Leave empty to turn it off.
 launcher_ai = "Win+G"
+# Maximise the window in front (press again to put it back). Leave empty to turn it off.
+window_max = "Win+F"
+# Close the window in front. Leave empty to turn it off.
+window_close = "Win+Q"
 
 [modules]
 media = true
@@ -1232,6 +1247,8 @@ folders = []
 blur = 0.7
 # How dark the glass is (0.2 = light, 0.95 = almost black)
 dark = 0.55
+# A small dark grey tint on the dark look (0 = none, 0.6 = strong)
+tint = 0.12
 # Opening, closing, the list dropping down and the underline move
 animate = true
 # Light frosted glass with dark writing (false = dark glass with white writing)
@@ -1315,6 +1332,8 @@ mod tests {
         assert_eq!(c.hotkeys.launcher, d.hotkeys.launcher);
         assert_eq!(c.hotkeys.launcher_clip, d.hotkeys.launcher_clip);
         assert_eq!(c.hotkeys.launcher_ai, d.hotkeys.launcher_ai);
+        assert_eq!(c.hotkeys.window_max, d.hotkeys.window_max);
+        assert_eq!(c.hotkeys.window_close, d.hotkeys.window_close);
         assert_eq!(c.voice.model, d.voice.model);
         assert_eq!(c.voice.cleanup, d.voice.cleanup);
         assert_eq!(c.locks.caps, d.locks.caps);
