@@ -868,7 +868,7 @@ impl App {
                 None // DefWindowProc must still see WM_INPUT
             }
             WM_CLIPBOARDUPDATE => {
-                self.broadcast(SystemEvent::ClipboardChanged);
+                self.clipboard_changed();
                 Some(LRESULT(0))
             }
             WM_POWERBROADCAST => {
@@ -1084,6 +1084,15 @@ impl App {
             }
         }
         self.schedule_wake();
+    }
+
+    /// Something was copied: the launcher's history takes it (also when the Clipboard module is off), then the
+    /// modules are told.
+    fn clipboard_changed(&mut self) {
+        if !self.module_index("clipboard").is_some_and(|i| self.started[i]) {
+            crate::modules::clipboard::record_history(self.hwnd);
+        }
+        self.broadcast(SystemEvent::ClipboardChanged);
     }
 
     fn broadcast(&mut self, ev: SystemEvent) {

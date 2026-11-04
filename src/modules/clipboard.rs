@@ -439,6 +439,34 @@ fn file_name(p: &str) -> String {
 
 /// Read the clipboard. Returns the item and, for images, a BMP file to
 /// decode off-thread.
+/// Put what was just copied into the launcher's history. The app calls this when the Clipboard module is off, so
+/// the Win+C list works either way.
+pub fn record_history(app: HWND) {
+    if unsafe { GetClipboardOwner() }.ok() == Some(app) {
+        return;
+    }
+    let Some((kind, dib)) = read_clipboard(app) else { return };
+    let hist = match &kind {
+        Kind::Text(t) => crate::cliphist::Content::Text(t.clone()),
+        Kind::Files(f) => crate::cliphist::Content::Files(f.clone()),
+        Kind::Image { w, h } => crate::cliphist::Content::Image { w: *w, h: *h },
+    };
+    let hid = crate::cliphist::add(hist, dib.as_deref());
+    if let Some(bytes) = dib {
+        let _ = std::thread::Builder::new().name("clip-thumb".into()).spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+            if let Some(i) = image::decode(&bytes, 160) {
+                crate::cliphist::set_thumb(hid, i);
+            }
+        });
+    }
+}
+
 fn read_clipboard(hwnd: HWND) -> Option<(Kind, Option<Vec<u8>>)> {
     unsafe {
         let exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
