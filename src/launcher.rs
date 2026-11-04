@@ -2166,18 +2166,18 @@ fn white(a: f32) -> Color {
 /// The blue of whatever is selected; it is translucent, so the glass shows through. `k` scales how strong.
 fn sel_fill(light: bool, k: f32) -> Color {
     if light {
-        Color::rgba(0.36, 0.64, 1.0, 0.50 * k)
+        Color::rgba(0.50, 0.74, 1.0, 0.62 * k)
     } else {
-        Color::rgba(0.14, 0.40, 0.95, 0.50 * k)
+        Color::rgba(0.34, 0.62, 1.0, 0.60 * k)
     }
 }
 
 /// The edge of something selected.
 fn sel_rim(light: bool) -> Color {
     if light {
-        Color::rgba(0.55, 0.78, 1.0, 0.90)
+        Color::rgba(0.70, 0.86, 1.0, 0.95)
     } else {
-        Color::rgba(0.50, 0.72, 1.0, 0.70)
+        Color::rgba(0.68, 0.84, 1.0, 0.85)
     }
 }
 
