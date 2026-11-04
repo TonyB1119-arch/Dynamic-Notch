@@ -59,6 +59,8 @@ const T_FLASH: usize = 5;
 const T_LIVE: usize = 6;
 /// Colour picker: the pixels around the pointer are looked at again.
 const T_PICK: usize = 7;
+/// The apps are looked for again a while after one was uninstalled.
+const T_RESCAN: usize = 8;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
 /// Gemini has sent more of the answer.
@@ -493,6 +495,8 @@ pub struct Launcher {
     apps: Vec<Entry>,
     files: Vec<Entry>,
     apps_ready: bool,
+    /// When the apps were last looked for (they are looked for again now and then).
+    apps_at: Instant,
     apps_slot: Slot,
     files_slot: Slot,
     files_started: bool,
@@ -574,6 +578,7 @@ impl Launcher {
             apps: Vec::new(),
             files: Vec::new(),
             apps_ready: false,
+            apps_at: Instant::now(),
             apps_slot,
             files_slot: Arc::new(Mutex::new(None)),
             files_started: false,
@@ -713,6 +718,10 @@ impl Launcher {
         self.pending = None;
         self.armed = None;
         self.stop_pick();
+        // apps installed or removed since the last look show up (looked for at most every 20 seconds)
+        if self.apps_ready && self.apps_at.elapsed().as_secs() >= 20 {
+            self.rescan_apps();
+        }
         if self.mode == Mode::Notes {
             self.notes = load_notes();
             self.notes_text = notes_text(&self.notes);
@@ -1512,6 +1521,11 @@ impl Launcher {
                 return;
             }
             self.hide();
+            // it leaves the list now; the apps are looked for again once the uninstaller has had time
+            self.apps.retain(|e| &*e.path != h.path.as_str());
+            unsafe {
+                SetTimer(Some(self.hwnd), T_RESCAN, 20_000, None);
+            }
             uninstall_app(&h.path, &h.name);
             return;
         }
@@ -1789,6 +1803,12 @@ impl Launcher {
         self.kick();
     }
 
+    /// Look for the installed apps again (in the background; the list is replaced when that is done).
+    fn rescan_apps(&mut self) {
+        self.apps_at = Instant::now();
+        spawn_apps(self.apps_slot.clone(), SendHwnd::new(self.hwnd));
+    }
+
     fn stop_pick(&mut self) {
         if self.pick.take().is_some() {
             unsafe {
@@ -1986,6 +2006,13 @@ impl Launcher {
                 if self.flashing {
                     self.hide();
                 }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == T_RESCAN => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), T_RESCAN);
+                }
+                self.rescan_apps();
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == T_PICK => {
@@ -2355,7 +2382,7 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK] {
+            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK, T_RESCAN] {
                 let _ = KillTimer(Some(self.hwnd), t);
             }
             let _ = DestroyWindow(self.hwnd);
