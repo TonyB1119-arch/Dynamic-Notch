@@ -156,12 +156,17 @@ pub fn protected(exe: &str) -> bool {
         "system",
         "registry",
     ];
-    let l = exe.to_ascii_lowercase();
-    if !l.ends_with(".exe") || exe.len() > 100 || exe.starts_with('-') || KEEP.contains(&l.as_str()) {
+    let bytes = exe.as_bytes();
+    let is_exe = bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe");
+    if !is_exe || exe.len() > 100 || exe.starts_with('-') || KEEP.iter().any(|k| exe.eq_ignore_ascii_case(k)) {
         return true;
     }
-    let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()));
-    me.as_deref() == Some(l.as_str())
+    // this app itself (its file name is looked up once)
+    static ME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let me = ME.get_or_init(|| {
+        std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+    });
+    me.as_deref().is_some_and(|m| exe.eq_ignore_ascii_case(m))
 }
 
 /// Look at every process once.

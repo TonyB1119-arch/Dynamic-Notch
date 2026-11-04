@@ -1256,7 +1256,6 @@ impl Launcher {
         });
     }
 
-    /// Clipboard mode: what was copied (the letters typed narrow it down).
     /// The Kill mode looks at the programs only while it is showing.
     fn sync_procs(&mut self) {
         if self.mode == Mode::Kill {
@@ -1350,6 +1349,7 @@ impl Launcher {
         self.kick();
     }
 
+    /// Clipboard mode: what was copied (the letters typed narrow it down).
     fn clip_search(&mut self) {
         self.hits.clear();
         self.wx = None;
@@ -4950,6 +4950,34 @@ mod logic {
     /// Letters wrong, missing, extra or swapped: the fewest changes to turn `a` into `b` (swapping two
     /// neighbours counts once). Only for short words.
     pub fn distance(a: &[u8], b: &[u8]) -> usize {
+        const MAX: usize = 48;
+        let (n, m) = (a.len(), b.len());
+        if n >= MAX || m >= MAX {
+            return distance_big(a, b);
+        }
+        // short words (all it is used for): the table lives on the stack
+        let mut d = [[0u8; MAX + 1]; MAX + 1];
+        for (i, row) in d.iter_mut().enumerate().take(n + 1) {
+            row[0] = i as u8;
+        }
+        for j in 0..=m {
+            d[0][j] = j as u8;
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = u8::from(a[i - 1] != b[j - 1]);
+                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    v = v.min(d[i - 2][j - 2] + 1);
+                }
+                d[i][j] = v;
+            }
+        }
+        d[n][m] as usize
+    }
+
+    /// `distance` for long words.
+    pub fn distance_big(a: &[u8], b: &[u8]) -> usize {
         let (n, m) = (a.len(), b.len());
         let mut d = vec![vec![0usize; m + 1]; n + 1];
         for (i, row) in d.iter_mut().enumerate() {
@@ -4995,13 +5023,19 @@ mod logic {
             while end < n && name[end].is_ascii_alphanumeric() && (end == st || !is_word_start(name, end)) {
                 end += 1;
             }
-            let word: Vec<u8> = name[st..end].iter().map(|c| c.to_ascii_lowercase()).collect();
-            if word.len() + allowed < m {
+            let wlen = end - st;
+            if wlen + allowed < m {
                 continue;
+            }
+            // the start of the word (lower case, on the stack), about as long as the query
+            let mut word = [0u8; 48];
+            let take = wlen.min(m + 1).min(48);
+            for (w, c) in word.iter_mut().zip(&name[st..st + take]) {
+                *w = c.to_ascii_lowercase();
             }
             // the start of the word, about as long as the query
             for len in m.saturating_sub(1)..=(m + 1) {
-                let len = len.min(word.len());
+                let len = len.min(wlen).min(take);
                 let d = distance(&word[..len], q);
                 if d <= allowed && best.map_or(true, |b| d < b.0) {
                     best = Some((d, st, len));
