@@ -51,6 +51,11 @@ pub struct Host {
     backdrop_geom: CompositionRoundedRectangleGeometry,
     backdrop_visible: bool,
     backdrop_last: [f32; 5],
+    /// A second blur, for a second piece of glass.
+    backdrop2: SpriteVisual,
+    backdrop2_geom: CompositionRoundedRectangleGeometry,
+    backdrop2_visible: bool,
+    backdrop2_last: [f32; 5],
     _content: SpriteVisual,
     sbrush: CompositionSurfaceBrush,
     swapchain: IDXGISwapChain1,
@@ -102,6 +107,15 @@ impl Host {
             backdrop.SetClip(&clip)?;
             backdrop.SetIsVisible(false)?;
             root.Children()?.InsertAtTop(&backdrop)?;
+            let backdrop2 = compositor.CreateSpriteVisual()?;
+            let brush2 = compositor.CreateHostBackdropBrush()?;
+            backdrop2.SetBrush(&brush2)?;
+            backdrop2.SetRelativeSizeAdjustment(v2(1.0, 1.0))?;
+            let backdrop2_geom = compositor.CreateRoundedRectangleGeometry()?;
+            let clip2 = compositor.CreateGeometricClipWithGeometry(&backdrop2_geom)?;
+            backdrop2.SetClip(&clip2)?;
+            backdrop2.SetIsVisible(false)?;
+            root.Children()?.InsertAtTop(&backdrop2)?;
 
             // Direct2D content
             let swapchain = create_swapchain(gfx, w, h)?;
@@ -129,6 +143,10 @@ impl Host {
                 backdrop_geom,
                 backdrop_visible: false,
                 backdrop_last: [f32::NAN; 5],
+                backdrop2,
+                backdrop2_geom,
+                backdrop2_visible: false,
+                backdrop2_last: [f32::NAN; 5],
                 _content: content,
                 sbrush,
                 swapchain,
@@ -225,6 +243,30 @@ impl Host {
         let _ = self.backdrop_geom.SetSize(v2(body_px.w, body_px.h + r));
         let _ = self.backdrop_geom.SetCornerRadius(v2(r, r));
         let _ = self.backdrop.SetOpacity(opacity);
+    }
+}
+
+impl Host {
+    /// The second blur (pixel coordinates, all four corners round); `opacity` 0 hides it.
+    pub fn set_backdrop2_rounded(&mut self, body_px: Rect, radius_px: f32, opacity: f32) {
+        let visible = opacity > 0.002;
+        if visible != self.backdrop2_visible {
+            let _ = self.backdrop2.SetIsVisible(visible);
+            self.backdrop2_visible = visible;
+        }
+        if !visible {
+            return;
+        }
+        let r = radius_px.max(0.0);
+        let now = [body_px.x, body_px.y, body_px.w, body_px.h, r + opacity * 1000.0];
+        if now == self.backdrop2_last {
+            return;
+        }
+        self.backdrop2_last = now;
+        let _ = self.backdrop2_geom.SetOffset(v2(body_px.x, body_px.y));
+        let _ = self.backdrop2_geom.SetSize(v2(body_px.w, body_px.h));
+        let _ = self.backdrop2_geom.SetCornerRadius(v2(r, r));
+        let _ = self.backdrop2.SetOpacity(opacity);
     }
 }
 

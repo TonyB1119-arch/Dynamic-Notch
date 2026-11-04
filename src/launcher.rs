@@ -788,11 +788,10 @@ impl Launcher {
             // live blur, only while media is playing: the window is hidden from screen copies, so the picture
             // behind it can be renewed while it is open. Otherwise (and when that is not possible) the picture
             // stays as it was when it opened, and the launcher shows up in screenshots and recordings
-            self.live = self.cfg.glass
-                && self.cfg.live
-                && self.cfg.media_playing
-                && unsafe { SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
-            self.blur_img = if self.cfg.glass { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
+            // while media plays the glass blurs with Windows' own live backdrop (nothing is copied, so there is
+            // nothing to renew and the window stays in screenshots); otherwise it is the picture taken now
+            self.live = self.cfg.glass && self.cfg.live && self.cfg.media_playing;
+            self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
             self.lh = 0.0;
             self.focus_t = 0.0;
@@ -808,9 +807,6 @@ impl Launcher {
             let _ = KillTimer(Some(self.hwnd), T_FREE);
             let _ = KillTimer(Some(self.hwnd), T_FLASH);
             self.flashing = false;
-            if self.live {
-                SetTimer(Some(self.hwnd), T_LIVE, 100, None);
-            }
             if !again {
                 // a combo's flash must not take the focus from the thing that is opening
                 let _ = ShowWindow(self.hwnd, if focus { SW_SHOW } else { SW_SHOWNOACTIVATE });
@@ -2415,7 +2411,31 @@ impl Launcher {
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
         // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
-        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+        if self.live {
+            // the glass grows from 95% around its middle while it opens; the blur follows it
+            let s0 = 0.95 + 0.05 * e;
+            let (ax, ay) = (W * 0.5, FRAME_H * 0.5);
+            let map = |r: Rect| {
+                Rect::new(
+                    (E + ax + (r.x - ax) * s0) * sc,
+                    (ay + (r.y - ay) * s0) * sc,
+                    r.w * s0 * sc,
+                    r.h * s0 * sc,
+                )
+            };
+            let grown = E * self.kw.clamp(0.0, 1.0);
+            self.host.set_backdrop_rounded(map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H)), CARD_R * s0 * sc, e);
+            let lh = self.lh.max(0.0);
+            if lh > 8.0 {
+                let r = LIST_R.min(lh * 0.5) * s0 * sc;
+                self.host.set_backdrop2_rounded(map(Rect::new(0.0, LIST_Y, W, lh)), r, e);
+            } else {
+                self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            }
+        } else {
+            self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+        }
         let mut ai_goal = None;
         let mut ai_agoal = None;
         let (dc, _) = match self.host.begin_draw() {
@@ -2465,6 +2485,7 @@ impl Launcher {
                 dark,
                 tint: self.cfg.tint,
                 glass,
+                native: self.live,
                 // the rim is the dock's (its thickness and brightness come from the dock settings)
                 rim: (self.cfg.rim_width, if light { 0.75 } else { self.cfg.rim_bright }),
             };
@@ -2731,6 +2752,8 @@ struct Glass<'a> {
     /// A small dark-grey wash on the dark look (from Settings).
     tint: f32,
     glass: bool,
+    /// Windows blurs what is behind the glass live (so no picture is drawn, only the tint).
+    native: bool,
     /// Rim thickness and brightness.
     rim: (f32, f32),
 }
@@ -2754,6 +2777,19 @@ fn draw_glass(p: &mut Painter, g: &Glass, r: Rect, radius: f32) {
             p.fill_rounded(r, radius, tint);
             if !g.light && g.tint > 0.005 {
                 // the small dark-grey wash
+                p.fill_rounded(r, radius, Color::rgba(0.07, 0.07, 0.08, g.tint));
+            }
+        }
+        // Windows' own blur behind: only the tint is drawn here, never less than a clear body so the glass
+        // never turns see-through (even where the blur is switched off in Windows)
+        None if g.native => {
+            let tint = if g.light {
+                Color::rgba(0.95, 0.97, 1.0, (0.12 + 0.40 * g.dark).max(0.34))
+            } else {
+                Color::rgba(0.03, 0.03, 0.05, (0.62 * g.dark).max(0.30))
+            };
+            p.fill_rounded(r, radius, tint);
+            if !g.light && g.tint > 0.005 {
                 p.fill_rounded(r, radius, Color::rgba(0.07, 0.07, 0.08, g.tint));
             }
         }

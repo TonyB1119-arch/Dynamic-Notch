@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW,
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
     GetWindowThreadProcessId, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SendMessageTimeoutW, SendNotifyMessageW,
-    SetWindowPos, HICON, HWND_BROADCAST, HWND_TOPMOST, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_COPYDATA,
+    FindWindowExW, SetWindowPos, HWND_MESSAGE, HICON, HWND_BROADCAST, HWND_TOPMOST, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_COPYDATA,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -431,6 +431,14 @@ fn start_listening() {
         }
         let again = RegisterWindowMessageW(w!("TaskbarCreated"));
         let _ = SendNotifyMessageW(HWND_BROADCAST, again, WPARAM(0), LPARAM(0));
+        // the broadcast only reaches normal windows: many apps keep their tray window hidden as a
+        // message-only window, so those are asked one by one
+        let mut prev = HWND::default();
+        for _ in 0..800 {
+            let Ok(next) = FindWindowExW(Some(HWND_MESSAGE), Some(prev), PCWSTR::null(), PCWSTR::null()) else { break };
+            let _ = SendNotifyMessageW(next, again, WPARAM(0), LPARAM(0));
+            prev = next;
+        }
     }
 }
 
