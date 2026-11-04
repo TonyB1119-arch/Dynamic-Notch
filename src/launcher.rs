@@ -90,13 +90,7 @@ const LIST_GAP: f32 = 10.0;
 const LIST_Y: f32 = FRAME_H + LIST_GAP;
 /// Rows the menu of things to do can show (a list of matches shows `VIS`).
 const VIS_MAX: usize = 8;
-/// The preview card under the list (pictures and text files): the gap above it, its height and its corners.
-const PV_GAP: f32 = 10.0;
-const PV_H: f32 = 236.0;
-const PV_R: f32 = 28.0;
-const PV_IMAGES: [&str; 9] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico"];
-const PV_TEXTS: [&str; 3] = ["txt", "md", "log"];
-const FULL_H: f32 = LIST_Y + HEAD + VIS_MAX as f32 * ROW + 10.0 + PV_GAP + PV_H;
+const FULL_H: f32 = LIST_Y + HEAD + VIS_MAX as f32 * ROW + 10.0;
 const CARD_R: f32 = 34.0;
 const LIST_R: f32 = 28.0;
 const BOX_R: f32 = 24.0;
@@ -570,13 +564,6 @@ pub struct Launcher {
     ai: Ai,
     /// The contents sliding in after Tab: 0 to 1, and the way they come from (1 or -1).
     sw: f32,
-    /// The preview card under the list: how far it has opened, and how far its contents have settled.
-    pv: f32,
-    pv_swap: f32,
-    /// The file it shows (kept while it closes), its name and what is known about it.
-    pv_path: String,
-    pv_name: String,
-    pv_info: String,
     /// A Tab pressed: the old contents are shrinking away; the next mode takes over when they have.
     switch: Option<Switch>,
     /// The picture behind the glass is renewed ten times a second while the launcher is open (a video
@@ -657,11 +644,6 @@ impl Launcher {
             scratch: Vec::new(),
             ai: Ai::new(),
             sw: 1.0,
-            pv: 0.0,
-            pv_swap: 1.0,
-            pv_path: String::new(),
-            pv_name: String::new(),
-            pv_info: String::new(),
             switch: None,
             live: false,
             pending: None,
@@ -812,8 +794,6 @@ impl Launcher {
             self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
             self.lh = 0.0;
-            self.pv = 0.0;
-            self.pv_swap = 1.0;
             self.focus_t = 0.0;
             self.sel_y = 0.0;
         }
@@ -946,27 +926,6 @@ impl Launcher {
         }
     }
 
-    /// The file the preview card is for: the picture or text file that is selected in the search results.
-    fn preview_path(&self) -> Option<&str> {
-        if self.mode != Mode::Search || self.pending.is_some() || !self.list_open {
-            return None;
-        }
-        let h = self.cur()?;
-        if h.kind != Kind::File {
-            return None;
-        }
-        let ext = Path::new(&h.path).extension()?.to_string_lossy().to_ascii_lowercase();
-        (PV_IMAGES.contains(&ext.as_str()) || PV_TEXTS.contains(&ext.as_str())).then_some(h.path.as_str())
-    }
-
-    fn pv_goal(&self) -> f32 {
-        if self.preview_path().is_some() {
-            1.0
-        } else {
-            0.0
-        }
-    }
-
     fn sel_target(&self) -> f32 {
         self.cursor().saturating_sub(self.view_top()) as f32
     }
@@ -980,8 +939,6 @@ impl Launcher {
             || self.pop_s < 1.0
             || self.pop_a < 1.0
             || self.sw < 1.0
-            || (self.pv - self.pv_goal()).abs() > 0.002
-            || self.pv_swap < 1.0
             || self.switch.is_some()
             || (self.kw - self.kw_target()).abs() > 0.004
             || (self.mode == Mode::Kill
@@ -1008,21 +965,6 @@ impl Launcher {
         self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.30) };
         self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.30) };
         self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.34) };
-        // the preview card: it opens for a picture or text file, and its contents settle when the file changes
-        let want = self.preview_path().map(str::to_string);
-        if let Some(path) = &want {
-            if *path != self.pv_path {
-                self.pv_name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let ext = Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
-                let size = std::fs::metadata(path).map(|m| human_size(m.len())).unwrap_or_default();
-                self.pv_info = if size.is_empty() { ext } else { format!("{ext} \u{b7} {size}") };
-                self.pv_path = path.clone();
-                self.pv_swap = 0.0;
-            }
-        }
-        let goal = if want.is_some() { 1.0 } else { 0.0 };
-        self.pv = if snap { goal } else { logic::toward(self.pv, goal, dt / 0.34) };
-        self.pv_swap = if snap { 1.0 } else { logic::toward(self.pv_swap, 1.0, dt / 0.22) };
         if let Some(sw) = self.switch.as_mut() {
             sw.t = if snap { 1.0 } else { (sw.t + dt / SWITCH_OUT).min(1.0) };
         }
@@ -1631,11 +1573,6 @@ impl Launcher {
             if !self.icons.contains_key(&key) {
                 let img = dragdrop::thumbnail(path, 256);
                 self.icons.insert(key, img);
-            }
-            let big = format!("big:{path}");
-            if !self.icons.contains_key(&big) {
-                let img = dragdrop::thumbnail(path, 720);
-                self.icons.insert(big, img);
             }
         } else if TEXTS.contains(&ext.as_str()) && !self.texts.contains_key(path) {
             use std::io::Read;
@@ -2472,8 +2409,7 @@ impl Launcher {
         let e = logic::ease_out(self.anim);
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        let pv_h = if self.pv > 0.003 || self.pv_goal() > 0.0 { PV_GAP + PV_H } else { 0.0 };
-        self.set_region(self.lh.max(self.list_target()) + pv_h, self.kw.max(self.kw_target()));
+        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
@@ -2525,16 +2461,16 @@ impl Launcher {
                 Some(sw) => {
                     let t = sw.t.clamp(0.0, 1.0);
                     let k = if t < 0.25 {
-                        1.0 + 0.07 * logic::ease_out(t / 0.25)
+                        1.0 + 0.12 * logic::ease_out(t / 0.25)
                     } else {
                         let u = (t - 0.25) / 0.75;
-                        1.07 * (1.0 - u * u * u)
+                        1.12 * (1.0 - u * u * u)
                     };
                     (k, 1.0 - ((t - 0.5) / 0.5).clamp(0.0, 1.0))
                 }
                 None => {
                     let sw = self.sw.clamp(0.0, 1.0);
-                    (0.30 + 0.70 * logic::ease_back(sw), logic::ease_out((sw * 2.0).min(1.0)))
+                    (0.15 + 0.85 * logic::ease_back(sw), logic::ease_out((sw * 2.0).min(1.0)))
                 }
             };
             let ct = Tr { ..tr };
@@ -2745,51 +2681,6 @@ impl Launcher {
                 draw_list(&mut p, &view);
                 p.pop_clip();
             }
-            if self.pv > 0.003 {
-                // Quick Look: the card opens from 94% around its middle, rising a few pixels and fading in
-                let t = logic::ease_out(self.pv);
-                let rc = Rect::new(0.0, LIST_Y + self.lh.max(0.0) + PV_GAP, W, PV_H);
-                let ptr = Tr { top: (1.0 - t) * 10.0, ..tr };
-                pop_xf(&mut p, &ptr, 0.94 + 0.06 * t, rc.cx(), rc.cy());
-                p.alpha = keep * t;
-                draw_glass(&mut p, &gl, rc, PV_R);
-                let ink = |a: f32| if light { Color::rgba(0.08, 0.09, 0.12, a) } else { white(a) };
-                let view = rc.inset(14.0);
-                let media = Rect::new(view.x, view.y, view.w, view.h - 42.0);
-                // the contents settle a little after the card (and again whenever another file is chosen)
-                let c = logic::ease_out(self.pv_swap);
-                p.alpha = keep * t * c;
-                match self.icons.get(&format!("big:{}", self.pv_path)).and_then(|o| o.as_ref()) {
-                    Some(img) => {
-                        let (iw, ih) = (img.width.max(1) as f32, img.height.max(1) as f32);
-                        let k = (media.w / iw).min(media.h / ih).min(1.0) * (0.97 + 0.03 * c);
-                        let fit = Rect::centered(media.cx(), media.cy(), iw * k, ih * k);
-                        p.shadow(fit, 14.0, 0.45);
-                        p.image(img, fit, 14.0, 1.0);
-                        p.stroke_rounded(fit.inset(0.5), 13.5, 1.0, Color::white(0.12));
-                    }
-                    None => {
-                        p.fill_rounded(media, 16.0, if light { Color::white(0.45) } else { Color::rgba(0.0, 0.0, 0.0, 0.24) });
-                        p.stroke_rounded(media.inset(0.5), 15.5, 1.0, if light { Color::white(0.6) } else { Color::white(0.08) });
-                        let text: String =
-                            self.texts.get(&self.pv_path).map(|t| t.trim().chars().take(900).collect()).unwrap_or_default();
-                        let inner = media.inset(14.0);
-                        if text.is_empty() {
-                            p.text("No preview", media, &TextStyle::new(12.0, ink(0.45)).medium().center());
-                        } else {
-                            let st = TextStyle::new(11.5, ink(0.86)).top().wrap();
-                            let hh = p.measure_wrapped(&text, &st, inner.w);
-                            p.push_clip(inner);
-                            p.text(&text, Rect::new(inner.x, inner.y, inner.w, hh), &st);
-                            p.pop_clip();
-                        }
-                    }
-                }
-                let name = crate::util::truncate_chars(&self.pv_name, 46);
-                p.text(&name, Rect::new(view.x + 2.0, view.bottom() - 36.0, view.w - 4.0, 18.0), &TextStyle::new(13.0, ink(0.94)).semibold());
-                p.text(&self.pv_info, Rect::new(view.x + 2.0, view.bottom() - 17.0, view.w - 4.0, 15.0), &TextStyle::new(11.5, ink(0.5)));
-                p.alpha = keep;
-            }
         }
         if let Err(err) = self.host.end_draw() {
             crate::log!("launcher: end_draw failed: {err}");
@@ -2827,15 +2718,6 @@ impl Drop for Launcher {
 static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// The colour of writing, icons and soft highlights: white on dark glass, dark ink on light glass.
-/// A size in bytes as people read it: 812 B, 14.2 KB, 3.1 MB.
-fn human_size(n: u64) -> String {
-    match n {
-        0..=1023 => format!("{n} B"),
-        1024..=1_048_575 => format!("{:.1} KB", n as f64 / 1024.0),
-        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
-    }
-}
-
 fn white(a: f32) -> Color {
     if LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
         Color::rgba(0.10, 0.12, 0.18, a)
