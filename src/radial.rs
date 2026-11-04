@@ -215,8 +215,6 @@ struct Pal {
     /// The glass disc.
     tint: Color,
     rim: Color,
-    /// The round hollow in the middle.
-    center: Color,
     /// The slice under the pointer.
     hl: Color,
     ink: Color,
@@ -227,9 +225,8 @@ struct Pal {
 fn pal(tuna: bool) -> Pal {
     if tuna {
         Pal {
-            tint: Color::hex(0x0E1013).alpha(0.50),
+            tint: Color::hex(0x0E1013).alpha(0.34),
             rim: Color::white(0.10),
-            center: Color::hex(0x000000).alpha(0.30),
             hl: Color::hex(0x2A6A9A).alpha(0.55),
             ink: Color::white(0.92),
             pill: Color::hex(0x000000).alpha(0.30),
@@ -238,7 +235,6 @@ fn pal(tuna: bool) -> Pal {
         Pal {
             tint: Color::white(0.07),
             rim: Color::white(0.22),
-            center: Color::hex(0x000000).alpha(0.20),
             hl: Color::white(0.22),
             ink: Color::white(0.92),
             pill: Color::hex(0x000000).alpha(0.22),
@@ -431,7 +427,7 @@ impl Radial {
             let disc = if self.single { SINGLE1 + 2.0 } else { OUT1 };
             let d = (disc * 2.0 * self.scale).ceil() as i32;
             let (x, y, side, _) = self.win_px;
-            self.blur_img = crate::launcher::capture_blur(x + (side - d) / 2, y + (side - d) / 2, d, d, 0.85);
+            self.blur_img = crate::launcher::capture_blur(x + (side - d) / 2, y + (side - d) / 2, d, d, 1.6);
         }
         unsafe {
             if !again {
@@ -714,7 +710,7 @@ impl Radial {
             }
             p.fill_circle(c, c, disc, pl.tint.alpha(content.max(0.5)));
             p.stroke_circle(c, c, disc - 0.5, 1.0, pl.rim);
-            p.fill_circle(c, c, R_C, pl.center);
+            p.stroke_circle(c, c, R_C, 1.0, pl.rim);
 
             // the slice that follows the pointer
             if hl.alpha > 0.01 {
