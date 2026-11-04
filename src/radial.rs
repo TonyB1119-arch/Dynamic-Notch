@@ -54,6 +54,8 @@ mod geom {
     pub const IN1: f32 = 120.0;
     pub const OUT0: f32 = 124.0;
     pub const OUT1: f32 = 188.0;
+    /// With only the inner ring filled the menu is one bigger ring (to this radius).
+    pub const SINGLE1: f32 = 150.0;
     pub const SLOTS: usize = 16;
     /// Half the angle a slice spans (a thin gap is left between neighbours).
     pub const HW: f32 = PI / 8.0 - 0.022;
@@ -70,6 +72,27 @@ mod geom {
         } else {
             (OUT0, OUT1)
         }
+    }
+
+    /// `slot_radii`, or the one big ring when the outer ring is empty.
+    pub fn radii(i: usize, single: bool) -> (f32, f32) {
+        if single {
+            (IN0, SINGLE1)
+        } else {
+            slot_radii(i)
+        }
+    }
+
+    /// `hit`, or the one big ring when the outer ring is empty.
+    pub fn hit_in(dx: f32, dy: f32, single: bool) -> Option<usize> {
+        if !single {
+            return hit(dx, dy);
+        }
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < R_C || d > SINGLE1 {
+            return None;
+        }
+        hit(dx * (IN0 + 1.0) / d, dy * (IN0 + 1.0) / d)
     }
 
     pub fn polar(cx: f32, cy: f32, r: f32, a: f32) -> (f32, f32) {
@@ -290,6 +313,10 @@ pub struct Radial {
     /// The picture of each slot's app (where it has one).
     icons: Vec<Option<ImageData>>,
     icons_loaded: bool,
+    /// The blurred screen behind the menu.
+    blur_img: Option<ImageData>,
+    /// Only the inner ring has apps: the menu is one big ring.
+    single: bool,
     /// The apps, by slot.
     slots: Vec<Option<Slot>>,
 }
@@ -327,6 +354,8 @@ impl Radial {
             dwell_since: Instant::now(),
             icons: Vec::new(),
             icons_loaded: false,
+            blur_img: None,
+            single: false,
             slots: Vec::new(),
         })
     }
@@ -336,6 +365,7 @@ impl Radial {
             self.slots = (0..SLOTS).map(|i| cfg.apps.get(i).and_then(|s| make_slot(s))).collect();
             self.icons_loaded = false;
         }
+        self.single = self.slots.iter().skip(8).all(|s| s.is_none());
         self.cfg = cfg;
         self.search_url = search_url;
         self.ui_scale = ui_scale;
@@ -394,6 +424,14 @@ impl Radial {
         self.visible = true;
         if !again {
             self.anim = 0.0;
+            // the screen behind the disc, copied before the window shows (so it does not photograph itself)
+            if let Some(old) = self.blur_img.take() {
+                self.res.forget(old.id);
+            }
+            let disc = if self.single { SINGLE1 + 2.0 } else { OUT1 };
+            let d = (disc * 2.0 * self.scale).ceil() as i32;
+            let (x, y, side, _) = self.win_px;
+            self.blur_img = crate::launcher::capture_blur(x + (side - d) / 2, y + (side - d) / 2, d, d, 0.85);
         }
         unsafe {
             if !again {
@@ -424,6 +462,9 @@ impl Radial {
 
     fn finish_hide(&mut self) {
         self.visible = false;
+        if let Some(old) = self.blur_img.take() {
+            self.res.forget(old.id);
+        }
         self.hover = None;
         self.hl.alpha = 0.0;
         self.tracking = false;
@@ -528,7 +569,7 @@ impl Radial {
         }
         let (x, y, _, _) = self.win_px;
         let (dx, dy) = self.rel(pt.x - x, pt.y - y);
-        self.set_hover(hit(dx, dy).filter(|&i| self.filled(i)));
+        self.set_hover(hit_in(dx, dy, self.single).filter(|&i| self.filled(i)));
     }
 
     fn set_hover(&mut self, h: Option<usize>) {
@@ -538,7 +579,7 @@ impl Radial {
         self.hover = h;
         self.dwell_since = Instant::now();
         if let Some(i) = h {
-            let (r0, r1) = slot_radii(i);
+            let (r0, r1) = radii(i, self.single);
             let a = nearest_turn(self.hl.a.x, slot_angle(i));
             let hl = &mut self.hl;
             hl.ta = a;
@@ -585,7 +626,7 @@ impl Radial {
                 }
                 let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 let (dx, dy) = self.rel(x, y);
-                self.set_hover(hit(dx, dy).filter(|&i| self.filled(i)));
+                self.set_hover(hit_in(dx, dy, self.single).filter(|&i| self.filled(i)));
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
@@ -596,7 +637,7 @@ impl Radial {
             WM_LBUTTONUP if self.open => {
                 let (x, y) = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 let (dx, dy) = self.rel(x, y);
-                match hit(dx, dy) {
+                match hit_in(dx, dy, self.single) {
                     Some(i) => {
                         if let Some(Some(s)) = self.slots.get(i) {
                             let target = s.target.clone();
@@ -650,27 +691,29 @@ impl Radial {
         // opening: grows from 40% with a little overshoot; closing: shrinks to 75% while it fades
         let pop = if self.open { 0.4 + 0.6 * ease_back(t) } else { 0.75 + 0.25 * ease_out(t) };
         let fade = ease_out((t * 1.8).min(1.0));
-        // the frosted glass (blur of what is behind) in the shape of the menu, growing with it
-        let mid = SIDE * 0.5 * self.scale;
-        let rad = OUT1 * pop * self.scale;
-        self.host.set_backdrop_rounded(Rect::centered(mid, mid, rad * 2.0, rad * 2.0), rad, fade);
+        let disc = if self.single { SINGLE1 + 2.0 } else { OUT1 };
         // the slices and pictures appear a moment after the disc
         let content = ease_out(((t - 0.3) / 0.5).clamp(0.0, 1.0));
         let pl = pal(self.cfg.tuna);
         let prog = self.prog();
+        let single = self.single;
         self.load_icons();
         let hover_label = self.hover.and_then(|i| self.slots.get(i)).and_then(|s| s.as_ref()).map(|s| s.name.clone());
         {
             let scale = self.scale;
-            let Self { res, slots, icons, hl, .. } = &mut *self;
+            let Self { res, slots, icons, hl, blur_img, .. } = &mut *self;
             let mut p = Painter::new(dc, gfx, res, scale, 0.0, 0.0);
             p.clear();
             p.set_local(pop, c, c, 0.0, 0.0);
             p.alpha = fade;
 
             // one disc of glass with a thin rim, and the round hollow in the middle
-            p.fill_circle(c, c, OUT1, pl.tint.alpha(content.max(0.5)));
-            p.stroke_circle(c, c, OUT1 - 0.5, 1.0, pl.rim);
+            // the frosted glass: the screen behind, copied and blurred when the menu opened
+            if let Some(img) = blur_img.as_ref() {
+                p.image_disc(img, c, c, disc, 0.0);
+            }
+            p.fill_circle(c, c, disc, pl.tint.alpha(content.max(0.5)));
+            p.stroke_circle(c, c, disc - 0.5, 1.0, pl.rim);
             p.fill_circle(c, c, R_C, pl.center);
 
             // the slice that follows the pointer
@@ -689,10 +732,16 @@ impl Radial {
             p.alpha = fade * content;
             for (i, slot) in slots.iter().enumerate() {
                 let Some(slot) = slot else { continue };
-                let (r0, r1) = slot_radii(i);
+                let (r0, r1) = radii(i, single);
                 let (mx, my) = polar(c, c, (r0 + r1) * 0.5, slot_angle(i));
                 let ink = pl.ink;
-                let size = if i < 8 { 50.0 } else { 58.0 };
+                let size = if single {
+                    66.0
+                } else if i < 8 {
+                    50.0
+                } else {
+                    58.0
+                };
                 let top = my - size * 0.5;
                 let ir = Rect::new(mx - size * 0.5, top, size, size);
                 match icons.get(i).and_then(|o| o.as_ref()) {
