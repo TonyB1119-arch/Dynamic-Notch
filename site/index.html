@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dynamic Notch for Windows</title>
-  <meta name="description" content="A MacBook-style dynamic notch for Windows. Music, timers, downloads, dictation and AI live in a small black island at the top of your screen. Free and open source.">
+  <title>Dynamic Notch: a shell replacement for Windows</title>
+  <meta name="description" content="Replace the Windows shell. A notch, a dock, a launcher and a tray in one small Rust program. Free and open source.">
   <meta name="theme-color" content="#1C1916">
-  <meta property="og:title" content="Dynamic Notch for Windows">
-  <meta property="og:description" content="Music, timers, downloads, dictation and AI in a small black island at the top of your screen.">
+  <meta property="og:title" content="Dynamic Notch: a shell replacement for Windows">
+  <meta property="og:description" content="A notch, a dock, a launcher and a tray. One small program that replaces the Windows taskbar and Start search.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -29,6 +29,7 @@
           <span>Dynamic Notch</span>
         </a>
         <nav class="bar-nav" aria-label="Sections">
+          <a href="#shell">Shell</a>
           <a href="#states">How it works</a>
           <a href="#modules">Modules</a>
         </nav>
@@ -38,8 +39,8 @@
           <a href="#scripting">Scripting</a>
           <a href="#performance">Performance</a>
         </nav>
-        <a class="bar-link" href="https://github.com/eigenes/DynamicNotch">GitHub</a>
-        <a class="btn btn-primary btn-sm" href="https://github.com/eigenes/DynamicNotch/releases/latest">Download</a>
+        <a class="bar-link" href="https://github.com/TonyB1119-arch/Notch">GitHub</a>
+        <a class="btn btn-primary btn-sm" href="https://github.com/TonyB1119-arch/Notch/releases/latest">Download</a>
       </div>
     </div>
   </header>
@@ -51,15 +52,15 @@
     <!-- ============================================================ hero -->
     <section class="hero" id="top">
       <div class="wrap hero-head">
-        <h1>The notch Windows never had.</h1>
+        <h1>Replace the Windows shell.</h1>
         <div class="hero-side">
-          <p class="lede">Dynamic Notch puts a small black island at the top of your screen. Music, timers, downloads, dictation and AI live inside it. It grows when something happens and gets out of the way when nothing does.</p>
+          <p class="lede">Dynamic Notch is a notch, a dock, a launcher and a tray in one small program. It takes over the work of the Windows taskbar, Start search and notification area, and it stays out of the way until you need it.</p>
           <div class="cta-row">
-            <a class="btn btn-primary" href="https://github.com/eigenes/DynamicNotch/releases/latest">
+            <a class="btn btn-primary" href="https://github.com/TonyB1119-arch/Notch/releases/latest">
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></svg>
               Download for Windows
             </a>
-            <a class="btn btn-ghost" href="https://github.com/eigenes/DynamicNotch">View source</a>
+            <a class="btn btn-ghost" href="https://github.com/TonyB1119-arch/Notch">View source</a>
           </div>
           <p class="fine">Free and open source. Windows 10 and 11, x64 and ARM64.</p>
         </div>
@@ -119,6 +120,73 @@
             </button>
           </figcaption>
         </figure>
+      </div>
+    </section>
+
+    <!-- ========================================================== shell -->
+    <section class="shell" id="shell">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>One shell. Four parts.</h2>
+          <p>The notch, the dock, the launcher and the tray share one look and one program. Together they do what the taskbar, the Start menu search and the notification area do, with less in the way.</p>
+        </div>
+
+        <div class="shell-rows">
+          <article class="shell-row">
+            <div class="shell-copy">
+              <p class="shell-kicker">Top of the screen</p>
+              <h3>The notch</h3>
+              <p>Media, Wi-Fi and Bluetooth, tray icons, calendar, camera mirror, clipboard and notes, one hover away. Volume and battery changes appear as a small round peek and leave on their own.</p>
+            </div>
+            <figure class="shell-video shell-wide">
+              <video src="media/notch.mp4" poster="media/notch.jpg" muted loop playsinline preload="metadata" aria-label="The notch opening to Bluetooth, tray, calendar, mirror and media pages"></video>
+            </figure>
+          </article>
+
+          <article class="shell-row">
+            <div class="shell-copy">
+              <p class="shell-kicker">One keystroke</p>
+              <h3>The launcher</h3>
+              <p>Type to find apps, files and quick answers. <kbd>Tab</kbd> switches between Search, Clipboard, Gemini, Kill, Emoji and Notes. Every result has actions: open, run as administrator, show in folder, quit, restart, force quit, uninstall.</p>
+              <p>Kill mode shows memory and processor load and asks you to press Enter twice before it ends anything.</p>
+            </div>
+            <figure class="shell-video">
+              <video src="media/launcher.mp4" poster="media/launcher.jpg" muted loop playsinline preload="metadata" aria-label="The launcher in its search, AI, clipboard, kill and notes modes"></video>
+            </figure>
+          </article>
+
+          <article class="shell-row">
+            <div class="shell-copy">
+              <p class="shell-kicker">Bottom of the screen</p>
+              <h3>The dock</h3>
+              <p>Pinned and running apps with magnified icons, live window previews and a right-click menu. Switch on &ldquo;Hide the Windows taskbar&rdquo; and it becomes a full taskbar replacement. The taskbar returns when you turn it off or quit.</p>
+            </div>
+            <figure class="shell-video shell-wide">
+              <video src="media/dock.mp4" poster="media/dock.jpg" muted loop playsinline preload="metadata" aria-label="The dock with pinned apps and its right-click menu"></video>
+            </figure>
+          </article>
+
+          <article class="shell-row shell-row-text">
+            <div class="shell-copy">
+              <p class="shell-kicker">Inside the notch</p>
+              <h3>The tray</h3>
+              <p>Your tray icons get their own tab, so the corner of the taskbar is no longer needed. Click an icon to open its app.</p>
+            </div>
+          </article>
+        </div>
+
+        <div class="swap">
+          <h3>What it replaces</h3>
+          <dl class="swap-list">
+            <div><dt>Taskbar</dt><dd>The dock, hiding the Windows taskbar if you like</dd></div>
+            <div><dt>Start menu search</dt><dd>The launcher</dd></div>
+            <div><dt>Notification area</dt><dd>The Tray tab</dd></div>
+            <div><dt>Quick settings</dt><dd>The notch: Wi-Fi, Bluetooth, volume, battery</dd></div>
+            <div><dt>Clipboard history, Task Manager, emoji panel</dt><dd>Launcher modes: Clipboard, Kill, Emoji</dd></div>
+            <div><dt>Sticky notes</dt><dd>The Notes mode and the Notes tab</dd></div>
+          </dl>
+          <p class="footnote">File Explorer still manages your files and Windows still runs underneath. Dynamic Notch replaces the parts you look at all day.</p>
+        </div>
       </div>
     </section>
 
@@ -383,6 +451,10 @@ dictate = <span class="c-s">"Ctrl+Alt+D"</span></code></pre>
             <p>It needs Windows 10 version 1903 or later. Windows 11 is recommended for the frosted glass. x64 and ARM64 both work, and there is nothing else to install.</p>
           </details>
           <details>
+            <summary>Does it really replace the Windows shell?</summary>
+            <p>It replaces the parts you use all day: the taskbar (the dock can hide it), Start menu search, the notification area and quick settings. File Explorer still manages your files, and the taskbar comes back whenever you switch the dock off, quit, or start the app again after a crash.</p>
+          </details>
+          <details>
             <summary>Will it get in the way of games?</summary>
             <p>No. The notch hides when a game, video or presentation goes fullscreen, and it doesn't draw anything while it's idle.</p>
           </details>
@@ -409,14 +481,14 @@ dictate = <span class="c-s">"Ctrl+Alt+D"</span></code></pre>
     <!-- ========================================================= closing -->
     <section class="closing">
       <div class="wrap">
-        <h2>Look up.</h2>
-        <p>Free, open source, and about a megabyte.</p>
+        <h2>Make Windows yours.</h2>
+        <p>A new shell for Windows. Free, open source, and about a megabyte.</p>
         <div class="cta-row">
-          <a class="btn btn-primary" href="https://github.com/eigenes/DynamicNotch/releases/latest">
+          <a class="btn btn-primary" href="https://github.com/TonyB1119-arch/Notch/releases/latest">
             <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></svg>
             Download for Windows
           </a>
-          <a class="btn btn-ghost" href="https://github.com/eigenes/DynamicNotch">View source</a>
+          <a class="btn btn-ghost" href="https://github.com/TonyB1119-arch/Notch">View source</a>
         </div>
       </div>
     </section>
@@ -430,13 +502,31 @@ dictate = <span class="c-s">"Ctrl+Alt+D"</span></code></pre>
       </a>
       <p>MIT licensed. Built in Rust for Windows.</p>
       <nav aria-label="Project links">
-        <a href="https://github.com/eigenes/DynamicNotch">Source</a>
-        <a href="https://github.com/eigenes/DynamicNotch/releases">Releases</a>
-        <a href="https://github.com/eigenes/DynamicNotch/issues">Report an issue</a>
+        <a href="https://github.com/TonyB1119-arch/Notch">Source</a>
+        <a href="https://github.com/TonyB1119-arch/Notch/releases">Releases</a>
+        <a href="https://github.com/TonyB1119-arch/Notch/issues">Report an issue</a>
       </nav>
     </div>
   </footer>
 
+  <script>
+    // The shell videos play only while they are on screen (and not at all with reduced motion).
+    (function () {
+      var v = document.querySelectorAll('.shell-video video');
+      if (!v.length) return;
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches || !('IntersectionObserver' in window)) {
+        v.forEach(function (x) { x.controls = true; });
+        return;
+      }
+      var io = new IntersectionObserver(function (es) {
+        es.forEach(function (e) {
+          if (e.isIntersecting) e.target.play().catch(function () {});
+          else e.target.pause();
+        });
+      }, { threshold: 0.35 });
+      v.forEach(function (x) { io.observe(x); });
+    })();
+  </script>
   <svg class="defs" width="0" height="0" aria-hidden="true" focusable="false"><defs id="isoDefs"></defs></svg>
 </body>
 </html>

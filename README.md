@@ -1,12 +1,54 @@
 # Dynamic Notch
 
-A small black notch at the top of your Windows screen that grows into a control panel when you need it, and gets out of the way when you don't.
+**Replace the Windows shell.** A notch, a dock, a launcher and a tray, drawn in one style and running as one small program.
 
-It shows what is playing, what your PC is doing and what needs your attention, and it puts a dozen everyday tools one hover away: clipboard, timer, notes, weather, AI chat, a camera mirror and more. Everything is drawn in one style: flat black glass, thin icons, and rows of tiny glowing bars we call **beams**.
+Dynamic Notch takes over the jobs of the Windows taskbar: it shows what is playing, what your PC is doing and what needs your attention in a notch at the top, it keeps your apps in a dock at the bottom (and can hide the Windows taskbar for you), it finds and starts anything from a launcher, and it lists your tray icons. Everything shares the same flat black glass, thin icons and rows of tiny glowing bars we call **beams**.
 
 Written in Rust. No browser engine, no runtime to install, one `.exe`.
 
 <p align="center"><img src="docs/screenshots/home.png" alt="The home page with media, system stats and weather" width="640"></p>
+
+---
+
+## One shell, four parts
+
+### The notch
+
+Hangs at the top of the screen and grows into a control panel when you need it: media, Wi-Fi and Bluetooth, your tray icons, calendar, camera mirror, clipboard, notes and more. Volume, battery and other changes show up as a small round peek and go away by themselves.
+
+<p align="center"><a href="docs/media/notch.mp4"><img src="docs/media/notch.gif" alt="The notch: Bluetooth and Wi-Fi, tray, calendar, mirror, media, battery and volume (3x speed)" width="640"></a></p>
+<p align="center"><sub>3x speed. <a href="docs/media/notch.mp4">Watch the full video</a></sub></p>
+
+### The launcher
+
+Two glass boxes in the middle of the screen. Type to find apps, files and quick answers; press <kbd>Tab</kbd> to switch what it searches: **Search**, **Clipboard**, **Gemini**, **Kill**, **Emoji** and **Notes**. Every result has actions (open, run as administrator, show in folder, quit, restart, force quit, uninstall). Kill mode shows memory and processor load, lists the programs using the most memory, and asks you to press Enter twice before it ends anything.
+
+<p align="center"><a href="docs/media/launcher.mp4"><img src="docs/media/launcher.gif" alt="The launcher: actions, AI, web search, clipboard, kill and notes (3x speed)" width="560"></a></p>
+<p align="center"><sub>3x speed. <a href="docs/media/launcher.mp4">Watch the full video</a></sub></p>
+
+### The dock
+
+A dock for the bottom of the screen with your pinned and running apps, magnified icons, live window previews and a right-click menu. Turn on "Hide the Windows taskbar" and it becomes a full taskbar replacement; the Windows taskbar comes back when you switch it off or quit.
+
+<p align="center"><a href="docs/media/dock.mp4"><img src="docs/media/dock.gif" alt="The dock with pinned apps and its right-click menu" width="640"></a></p>
+<p align="center"><sub><a href="docs/media/dock.mp4">Watch the video</a></sub></p>
+
+### The tray
+
+Your tray icons live in a tab of the notch, so the corner of the taskbar is no longer needed. Click an icon to open its app.
+
+### What it replaces
+
+| In Windows | In Dynamic Notch |
+|---|---|
+| Taskbar | The dock, optionally hiding the Windows taskbar |
+| Start menu search | The launcher |
+| Notification area | The Tray tab |
+| Quick settings (Wi-Fi, Bluetooth, volume, battery) | The notch |
+| Clipboard history, Task Manager, emoji panel | Launcher modes: Clipboard, Kill, Emoji |
+| Sticky notes | The Notes mode and the Notes tab |
+
+File Explorer still manages your files, and Windows still runs underneath. Dynamic Notch replaces the parts you look at and reach for all day.
 
 ---
 
