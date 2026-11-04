@@ -12,8 +12,8 @@ use std::time::Instant;
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_HOSTBACKDROPBRUSH,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateEllipticRgn, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -41,6 +41,8 @@ const SIDE: f32 = (OUT1 + MARGIN) * 2.0;
 /// Spring of the highlight: stiffness and damping (a little overshoot, settled in about 0.25 s).
 const SPRING_K: f32 = 900.0;
 const SPRING_C: f32 = 40.0;
+/// Keep the pointer in one direction this long (seconds) and that app opens, no click needed.
+const DWELL: f32 = 0.8;
 
 /// Pure geometry and springs (no Windows in here, so it can be tested anywhere).
 mod geom {
@@ -283,6 +285,8 @@ pub struct Radial {
     timer_on: bool,
     tracking: bool,
     last_tick: Instant,
+    /// Since when the pointer has been over the current slice.
+    dwell_since: Instant,
     /// The picture of each slot's app (where it has one).
     icons: Vec<Option<ImageData>>,
     icons_loaded: bool,
@@ -320,6 +324,7 @@ impl Radial {
             timer_on: false,
             tracking: false,
             last_tick: Instant::now(),
+            dwell_since: Instant::now(),
             icons: Vec::new(),
             icons_loaded: false,
             slots: Vec::new(),
@@ -443,7 +448,16 @@ impl Radial {
     fn needs_anim(&self) -> bool {
         let open_to = if self.open { 1.0 } else { 0.0 };
         let alpha_to = if self.hover.is_some() { 1.0 } else { 0.0 };
-        self.anim != open_to || self.hl.moving() || self.hl.alpha != alpha_to
+        self.anim != open_to || self.hl.moving() || self.hl.alpha != alpha_to || self.prog() < 1.0 && self.hover.is_some() && self.open
+    }
+
+    /// How far the hold on the slice under the pointer has come (0 to 1; at 1 the app opens).
+    fn prog(&self) -> f32 {
+        if self.open && self.hover.is_some() {
+            (self.dwell_since.elapsed().as_secs_f32() / DWELL).min(1.0)
+        } else {
+            0.0
+        }
     }
 
     fn tick(&mut self) -> bool {
@@ -459,6 +473,14 @@ impl Radial {
         h.r1.step(h.tr1, dt, SPRING_K, SPRING_C);
         let alpha_to = if self.hover.is_some() { 1.0 } else { 0.0 };
         h.alpha = toward(h.alpha, alpha_to, dt / 0.12);
+        // held long enough on one slice: open it
+        if let (true, Some(i)) = (self.open && self.prog() >= 1.0, self.hover) {
+            if let Some(Some(s)) = self.slots.get(i) {
+                let target = s.target.clone();
+                self.hide();
+                crate::hotkeys::open_target(&target, &self.search_url);
+            }
+        }
         self.needs_anim()
     }
 
@@ -514,6 +536,7 @@ impl Radial {
             return;
         }
         self.hover = h;
+        self.dwell_since = Instant::now();
         if let Some(i) = h {
             let (r0, r1) = slot_radii(i);
             let a = nearest_turn(self.hl.a.x, slot_angle(i));
@@ -634,6 +657,7 @@ impl Radial {
         // the slices and pictures appear a moment after the disc
         let content = ease_out(((t - 0.3) / 0.5).clamp(0.0, 1.0));
         let pl = pal(self.cfg.tuna);
+        let prog = self.prog();
         self.load_icons();
         let hover_label = self.hover.and_then(|i| self.slots.get(i)).and_then(|s| s.as_ref()).map(|s| s.name.clone());
         {
@@ -656,7 +680,8 @@ impl Radial {
                 let k = (r1 - r0) * 0.35;
                 let sw = (HW * r0 * 0.9).min(k);
                 if let Some(g) = p.path(|b| sector(b, c, c, r0, r1, hl.a.x, HW, sw.min(10.0))) {
-                    p.fill_geometry(&g, pl.hl.alpha(hl.alpha));
+                    // it gets stronger while the pointer is held there
+                    p.fill_geometry(&g, pl.hl.with_a((pl.hl.a * (1.0 + 1.2 * prog)).min(1.0) * hl.alpha));
                 }
             }
 
@@ -667,11 +692,11 @@ impl Radial {
                 let (r0, r1) = slot_radii(i);
                 let (mx, my) = polar(c, c, (r0 + r1) * 0.5, slot_angle(i));
                 let ink = pl.ink;
-                let size = if i < 8 { 40.0 } else { 44.0 };
+                let size = if i < 8 { 50.0 } else { 58.0 };
                 let top = my - size * 0.5;
                 let ir = Rect::new(mx - size * 0.5, top, size, size);
                 match icons.get(i).and_then(|o| o.as_ref()) {
-                    Some(img) => p.image(img, ir, 7.0, 1.0),
+                    Some(img) => p.image(img, ir, 11.0, 1.0),
                     None if slot.target.to_ascii_lowercase().starts_with("ms-settings") => p.icon(Icon::Settings, ir, ink),
                     None => {
                         let ch = slot.name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
@@ -799,6 +824,8 @@ fn create_window() -> windows::core::Result<HWND> {
         );
         let on = BOOL(1);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, &on as *const _ as _, 4);
+        // lets the window blur what is behind it (the frosted glass)
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, &on as *const _ as _, 4);
         let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const _ as _, 4);
         Ok(hwnd)
