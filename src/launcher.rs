@@ -119,6 +119,8 @@ enum Kind {
     Emoji,
     /// A running program (its `path` is where it lives, or just its file name).
     Process,
+    /// A command from the Run box's history (its `path` is the command).
+    Run,
 }
 
 impl Kind {
@@ -136,6 +138,7 @@ impl Kind {
             Kind::System => "System",
             Kind::Emoji => "Emoji",
             Kind::Process => "Program",
+            Kind::Run => "Command",
         }
     }
     fn has_icon(self) -> bool {
@@ -240,6 +243,7 @@ fn actions(h: &Hit) -> &'static [Act] {
         Kind::System => &[Act::Run],
         Kind::Emoji => &[Act::PasteEmoji, Act::CopyEmoji],
         Kind::Process => &[Act::Kill],
+        Kind::Run => &[Act::Run],
     }
 }
 
@@ -285,6 +289,8 @@ enum Mode {
     Emoji,
     /// Ending programs.
     Kill,
+    /// The Run box (Win+R): one wide box, never reached with Tab.
+    Run,
 }
 
 impl Mode {
@@ -580,6 +586,12 @@ pub struct Launcher {
     notes_text: String,
     /// The first lines of the text file on the left.
     texts: HashMap<String, String>,
+    /// The commands run from the Run box, newest first.
+    run_hist: Vec<String>,
+    /// The last command could not be started.
+    run_err: bool,
+    /// How much of the card is the one Run box (0 = two boxes, 1 = one box).
+    rw: f32,
 }
 
 impl Launcher {
@@ -652,6 +664,9 @@ impl Launcher {
             notes: Vec::new(),
             notes_text: String::new(),
             texts: HashMap::new(),
+            run_hist: Vec::new(),
+            run_err: false,
+            rw: 0.0,
         })
     }
 
@@ -697,6 +712,16 @@ impl Launcher {
             self.hide();
         } else {
             self.mode = Mode::Ai;
+            self.show(gfx, ui_scale, true);
+        }
+    }
+
+    /// The Run hotkey: the launcher as one wide box for a command.
+    pub fn toggle_run(&mut self, gfx: &Gfx, ui_scale: f32) {
+        if self.open && self.mode == Mode::Run {
+            self.hide();
+        } else {
+            self.mode = Mode::Run;
             self.show(gfx, ui_scale, true);
         }
     }
@@ -753,10 +778,14 @@ impl Launcher {
         self.ai.q = Glide::new(Q_SIZES[0]);
         self.pending = None;
         self.armed = None;
+        self.run_err = false;
         self.stop_pick();
         // apps installed or removed since the last look show up (looked for at most every 20 seconds)
         if self.apps_ready && self.apps_at.elapsed().as_secs() >= 20 {
             self.rescan_apps();
+        }
+        if self.mode == Mode::Run {
+            self.run_hist = load_run_history();
         }
         if self.mode == Mode::Notes {
             self.notes = load_notes();
@@ -796,6 +825,7 @@ impl Launcher {
             self.lh = 0.0;
             self.focus_t = 0.0;
             self.sel_y = 0.0;
+            self.rw = self.rw_target();
         }
         self.open = true;
         self.visible = true;
@@ -905,6 +935,15 @@ impl Launcher {
         }
     }
 
+    /// The card is one wide box in the Run mode.
+    fn rw_target(&self) -> f32 {
+        if self.mode == Mode::Run {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     /// What the processor and memory gauges are heading for (0 to 1).
     fn gauge_goal(&self) -> (f32, f32) {
         match &self.snap {
@@ -955,7 +994,8 @@ impl Launcher {
                 && ((self.cpu_s - self.gauge_goal().0).abs() > 0.002
                     || (self.ram_s - self.gauge_goal().1).abs() > 0.002
                     || (self.arm_t - if self.armed.is_some() { 1.0 } else { 0.0 }).abs() > 0.01))
-            || (matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai.moving())
+            || (matches!(self.mode, Mode::Ai | Mode::Notes | Mode::Run) && self.ai.moving())
+            || (self.rw - self.rw_target()).abs() > 0.004
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
     }
@@ -980,6 +1020,8 @@ impl Launcher {
         }
         let kt = self.kw_target();
         self.kw = if snap { kt } else { logic::follow(self.kw, kt, dt, 24.0, 0.004) };
+        let rt = self.rw_target();
+        self.rw = if snap { rt } else { logic::follow(self.rw, rt, dt, 22.0, 0.004) };
         let (gc, gr) = self.gauge_goal();
         self.cpu_s = if snap { gc } else { logic::follow(self.cpu_s, gc, dt, 8.0, 0.002) };
         self.ram_s = if snap { gr } else { logic::follow(self.ram_s, gr, dt, 8.0, 0.002) };
@@ -1089,6 +1131,22 @@ impl Launcher {
     }
 
     fn search_inner(&mut self) {
+        if self.mode == Mode::Run {
+            self.hits.clear();
+            self.wx = None;
+            let q = self.query.trim().to_lowercase();
+            for c in self.run_hist.iter().filter(|c| q.is_empty() || c.to_lowercase().contains(&q)) {
+                self.hits.push(Hit {
+                    name: c.clone(),
+                    detail: "Recent command".into(),
+                    path: c.clone(),
+                    kind: Kind::Run,
+                    spans: Vec::new(),
+                    idx: 0,
+                });
+            }
+            return;
+        }
         if matches!(self.mode, Mode::Ai | Mode::Notes) {
             self.hits.clear();
             self.wx = None;
@@ -1401,6 +1459,7 @@ impl Launcher {
 
     /// The text changed: start again from the best match.
     fn changed(&mut self) {
+        self.run_err = false;
         let before = self.cur().map(|h| (h.path.clone(), h.kind));
         self.focus = Focus::Subject;
         self.sel = 0;
@@ -1670,6 +1729,25 @@ impl Launcher {
         true
     }
 
+    /// Enter in the Run box: start the highlighted recent command, or else what was typed, the way the Windows
+    /// Run box does, and remember it. When it cannot be started the box stays open and says so.
+    fn run_cmd(&mut self) {
+        let picked = if self.list_open { self.hits.get(self.sel).map(|h| h.path.clone()) } else { None };
+        let cmd = picked.unwrap_or_else(|| self.query.trim().to_string());
+        if cmd.is_empty() {
+            return;
+        }
+        if !sys::shell_run(&cmd) {
+            self.run_err = true;
+            return;
+        }
+        self.run_hist.retain(|c| !c.eq_ignore_ascii_case(&cmd));
+        self.run_hist.insert(0, cmd);
+        self.run_hist.truncate(RUN_KEEP);
+        save_run_history(&self.run_hist);
+        self.hide();
+    }
+
     fn query_limit(&self) -> usize {
         if matches!(self.mode, Mode::Ai | Mode::Notes) {
             400
@@ -1679,6 +1757,10 @@ impl Launcher {
     }
 
     fn run(&mut self) {
+        if self.mode == Mode::Run {
+            self.run_cmd();
+            return;
+        }
         let Some(h) = self.cur().cloned() else { return };
         let acts = actions(&h);
         let a = acts[self.act.min(acts.len() - 1)];
@@ -1832,6 +1914,10 @@ impl Launcher {
             return;
         }
         if VIRTUAL_KEY(vk) == VK_TAB {
+            // the Run box is only reached with its own hotkey
+            if self.mode == Mode::Run {
+                return;
+            }
             // Search -> clipboard -> Gemini (Shift+Tab goes back); Left and Right move between the two boxes
             if !self.cfg.animate {
                 self.mode = self.mode.cycle(shift);
@@ -1851,6 +1937,40 @@ impl Launcher {
         if matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai_key(vk, ctrl) {
             self.draw(gfx);
             return;
+        }
+        if self.mode == Mode::Run {
+            match VIRTUAL_KEY(vk) {
+                VK_RETURN => {
+                    self.run_cmd();
+                    self.draw(gfx);
+                    return;
+                }
+                // Right takes the highlighted command into the box, to change it before it runs
+                VK_RIGHT if self.list_open => {
+                    if let Some(c) = self.hits.get(self.sel).map(|h| h.path.clone()) {
+                        self.query = c;
+                        self.list_open = false;
+                        self.changed();
+                    }
+                    self.draw(gfx);
+                    return;
+                }
+                VK_LEFT | VK_RIGHT => return,
+                // Delete forgets the highlighted command
+                VK_DELETE if self.list_open && !self.hits.is_empty() => {
+                    if let Some(c) = self.hits.get(self.sel).map(|h| h.path.clone()) {
+                        self.run_hist.retain(|x| *x != c);
+                        save_run_history(&self.run_hist);
+                    }
+                    let keep = self.sel;
+                    self.search();
+                    self.sel = keep.min(self.hits.len().saturating_sub(1));
+                    self.list_open = !self.hits.is_empty();
+                    self.draw(gfx);
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.mode == Mode::Kill {
             match VIRTUAL_KEY(vk) {
@@ -1883,7 +2003,7 @@ impl Launcher {
                     self.ul = 0.0;
                     self.pop_s = 0.0;
                     self.pop_a = 0.0;
-                } else if self.list_open && matches!(self.mode, Mode::Search | Mode::Kill) {
+                } else if self.list_open && matches!(self.mode, Mode::Search | Mode::Kill | Mode::Run) {
                     self.list_open = false;
                 } else {
                     self.hide();
@@ -1928,7 +2048,7 @@ impl Launcher {
             }
             VK_UP => {
                 if self.list_open {
-                    if self.cursor() == 0 && matches!(self.mode, Mode::Search | Mode::Kill) {
+                    if self.cursor() == 0 && matches!(self.mode, Mode::Search | Mode::Kill | Mode::Run) {
                         self.list_open = false;
                     } else {
                         self.step(-1);
@@ -2510,6 +2630,10 @@ impl Launcher {
             }
             let sub = Rect::new(PAD - grown, PAD, BOX, BOX);
             let act = Rect::new(PAD + BOX + GAP - grown, PAD, BOX, BOX);
+            // the Run box: the left box stretches over the whole card while the right one fades away
+            let rw = self.rw.clamp(0.0, 1.0);
+            let solo = Rect::new(PAD, PAD, W - 2.0 * PAD, BOX);
+            let sub_box = Rect::new(sub.x + (solo.x - sub.x) * rw, sub.y, sub.w + (solo.w - sub.w) * rw, BOX);
             // the third box (Kill mode) comes in on the right as the card grows
             let third = Rect::new(PAD + 2.0 * (BOX + GAP) - grown, PAD, BOX, BOX);
             // the focus glides from one box to the other
@@ -2527,7 +2651,15 @@ impl Launcher {
             };
             let n_boxes = if self.kw > 0.01 { 3 } else { 2 };
             let keep_a = p.alpha;
-            for (i, (r, on)) in [(sub, ons[0]), (act, ons[1]), (third, ons[2])].into_iter().enumerate().take(n_boxes) {
+            for (i, (r, on)) in
+                [(sub_box, ons[0]), (act, ons[1]), (third, ons[2])].into_iter().enumerate().take(n_boxes)
+            {
+                if i == 1 {
+                    if rw > 0.995 {
+                        continue;
+                    }
+                    p.alpha = keep_a * (1.0 - rw);
+                }
                 if i == 2 {
                     p.alpha = keep_a * self.kw.clamp(0.0, 1.0);
                     p.push_clip(card);
@@ -2556,6 +2688,7 @@ impl Launcher {
                     p.alpha = keep_a;
                 }
             }
+            p.alpha = keep_a;
             // choosing a target: the left box keeps the thing the action is for
             let subj = self.pending.as_ref().map(|(_, h)| h).or(cur.as_ref());
             let icon = subj.and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
@@ -2619,6 +2752,21 @@ impl Launcher {
                     draw_pick(&mut p, sub, act, pk);
                 } else if kill_ui {
                     draw_kill(&mut p, [sub, act, third], &kv, only, &ctb);
+                } else if self.mode == Mode::Run {
+                    // the command, centred and sized like a question to Gemini
+                    let qh = text_hash(&self.query);
+                    if qh != self.ai.q.fit_for || self.query.is_empty() {
+                        ai_goal =
+                            Some((qh, fit_text(&mut p, &self.query, solo.w - 28.0, BOX - 44.0, &Q_SIZES, 600, true)));
+                    }
+                    let view = RunView {
+                        query: &self.query,
+                        pop: self.pop_s,
+                        q: (self.ai.q.sz, self.ai.q.y, self.ai.q.center),
+                        err: self.run_err,
+                        recent: !self.run_hist.is_empty(),
+                    };
+                    draw_run(&mut p, sub_box, &view);
                 } else if matches!(self.mode, Mode::Ai | Mode::Notes) {
                     let notes = self.mode == Mode::Notes;
                     let qh = text_hash(&self.query);
@@ -2688,6 +2836,7 @@ impl Launcher {
                     wx: wx.as_deref(),
                     clip: self.mode == Mode::Clip,
                     kill: self.mode == Mode::Kill,
+                    run: self.mode == Mode::Run,
                 };
                 draw_list(&mut p, &view);
                 p.pop_clip();
@@ -2905,6 +3054,10 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Op
             p.icon(sys_icon(h.idx), r.inset(r.w * 0.22), white(0.9));
         }
         Kind::Emoji => p.text(&h.path, r, &TextStyle::new(r.w * 0.72, white(0.95)).center()),
+        Kind::Run => {
+            p.fill_rounded(r, r.w * 0.26, white(0.12));
+            p.icon(Icon::Play, r.inset(r.w * 0.27), white(0.9));
+        }
         Kind::Clip => match img {
             Some(i) => p.image(i, r, 5.0, 1.0),
             None => {
@@ -3097,6 +3250,47 @@ struct AiView<'a> {
     /// Size, top edge and centring of the question and of the answer (they glide).
     q: (f32, f32, bool),
     a: (f32, f32, bool),
+}
+
+struct RunView<'a> {
+    query: &'a str,
+    pop: f32,
+    /// Size, top edge and centring of the command (they glide).
+    q: (f32, f32, bool),
+    /// The last command could not be started.
+    err: bool,
+    /// There are recent commands to list with the Down arrow.
+    recent: bool,
+}
+
+/// The Run box: one wide box with the command in the middle, centred like a question to Gemini.
+fn draw_run(p: &mut Painter, r: Rect, v: &RunView) {
+    let a0 = p.alpha;
+    p.alpha = a0 * (0.35 + 0.65 * logic::ease_out((v.pop * 1.6).min(1.0)));
+    if v.query.is_empty() {
+        p.icon(Icon::Play, Rect::centered(r.cx(), r.y + 62.0, 46.0, 46.0), white(0.62));
+        let hint = TextStyle::new(11.5, white(0.80)).semibold().center();
+        p.text("Type a command to run\u{2026}", Rect::new(r.x + 10.0, r.y + 106.0, r.w - 20.0, 20.0), &hint);
+    } else {
+        let view = Rect::new(r.x + 14.0, r.y + 14.0, r.w - 28.0, r.h - 44.0);
+        let mut st = TextStyle::new(v.q.0, white(0.94)).semibold().top().wrap();
+        if v.q.2 {
+            st = st.center();
+        }
+        let h = p.measure_wrapped(v.query, &st, view.w);
+        p.push_clip(view);
+        p.text(v.query, Rect::new(view.x, view.y + v.q.1, view.w, h), &st);
+        p.pop_clip();
+    }
+    let (note, k) = if v.err {
+        ("Couldn\u{2019}t find that \u{b7} check the name and try again", 0.90)
+    } else if v.recent {
+        ("Enter runs it  \u{b7}  \u{2193} recent commands", 0.45)
+    } else {
+        ("Enter runs it", 0.45)
+    };
+    p.text(note, Rect::new(r.x + 10.0, r.bottom() - 26.0, r.w - 20.0, 16.0), &TextStyle::new(10.5, white(k)).center());
+    p.alpha = a0;
 }
 
 /// Gemini mode: the question on the left, the answer on the right. Returns how far the answer can scroll.
@@ -3458,6 +3652,7 @@ struct ListView<'a> {
     wx: Option<&'a Brief>,
     clip: bool,
     kill: bool,
+    run: bool,
 }
 
 /// The list drops down: the card grows, each row fades and slides in as the edge passes it, and the
@@ -3481,6 +3676,13 @@ fn draw_list(p: &mut Painter, v: &ListView) {
                 format!("Clipboard  ·  {count}")
             } else {
                 format!("{count}  ·  “{}”", logic::mid(v.query.trim(), 24))
+            }
+        }
+        Focus::Subject if v.run => {
+            if v.query.trim().is_empty() {
+                "Recent commands".to_string()
+            } else {
+                format!("Recent commands  \u{b7}  \u{201c}{}\u{201d}", logic::mid(v.query.trim(), 20))
             }
         }
         Focus::Subject if v.kill => {
@@ -3759,6 +3961,23 @@ fn unix_secs() -> u64 {
 
 fn notes_path() -> PathBuf {
     app_dir().join("notes.txt")
+}
+
+/// How many commands the Run box remembers.
+const RUN_KEEP: usize = 20;
+
+fn run_history_path() -> PathBuf {
+    app_dir().join("run_history.txt")
+}
+
+/// The commands run from the Run box, newest first.
+fn load_run_history() -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(run_history_path()) else { return Vec::new() };
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).take(RUN_KEEP).map(String::from).collect()
+}
+
+fn save_run_history(list: &[String]) {
+    let _ = std::fs::write(run_history_path(), list.join("\n"));
 }
 
 /// The last twelve notes, newest first.

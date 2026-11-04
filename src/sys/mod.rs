@@ -95,6 +95,33 @@ pub fn shell_open(target: &str) {
     }
 }
 
+/// Run a command line the way the Windows Run box does: a program with its arguments, a folder, a file or a
+/// link (%VARIABLES% work). False when Windows could not start it.
+pub fn shell_run(cmd: &str) -> bool {
+    let c = crate::dock::expand_env(cmd.trim());
+    if c.is_empty() {
+        return false;
+    }
+    // a quoted program, a path or link taken whole, or else the first word and its arguments
+    let (file, args) = if let Some(rest) = c.strip_prefix('"') {
+        match rest.split_once('"') {
+            Some((f, a)) => (f.to_string(), a.trim().to_string()),
+            None => (rest.to_string(), String::new()),
+        }
+    } else if c.contains("://") || std::path::Path::new(&c).exists() {
+        (c.clone(), String::new())
+    } else {
+        match c.split_once(char::is_whitespace) {
+            Some((f, a)) => (f.to_string(), a.trim().to_string()),
+            None => (c.clone(), String::new()),
+        }
+    };
+    let (f, a) = (wide(&file), wide(&args));
+    let params = if args.is_empty() { PCWSTR::null() } else { PCWSTR(a.as_ptr()) };
+    let r = unsafe { ShellExecuteW(None, w!("open"), PCWSTR(f.as_ptr()), params, PCWSTR::null(), SW_SHOWNORMAL) };
+    r.0 as usize > 32
+}
+
 /// Reveal a file in Explorer.
 pub fn shell_reveal(path: &str) {
     let args = wide(&format!("/select,\"{path}\""));

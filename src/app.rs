@@ -1890,6 +1890,7 @@ impl App {
             Action::Launcher => self.launcher_toggle(),
             Action::LauncherClip => self.launcher_clip_toggle(),
             Action::LauncherAi => self.launcher_ai_toggle(),
+            Action::LauncherRun => self.launcher_run_toggle(),
             Action::Radial => self.radial_toggle(),
             Action::WindowMax => hotkeys::maximize_active(),
             Action::WindowClose => hotkeys::close_active(),
@@ -2047,6 +2048,7 @@ impl App {
                 self.cfg.hotkeys.window_max.as_str(),
                 self.cfg.hotkeys.window_close.as_str(),
                 self.cfg.hotkeys.radial.as_str(),
+                self.cfg.hotkeys.launcher_run.as_str(),
             ],
         );
         self.hotkeys = ok;
@@ -3745,6 +3747,30 @@ impl App {
         if let Some(l) = self.launcher.as_mut() {
             l.configure(cfg);
             l.toggle_ai(&self.gfx, scale);
+        }
+    }
+
+    /// The launcher, started if it is not there yet and given the current settings. Returns the UI scale.
+    fn launcher_ready(&mut self) -> Option<f32> {
+        if self.launcher.is_none() {
+            match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(l) => self.launcher = Some(l),
+                Err(e) => {
+                    log!("launcher failed to start: {e}");
+                    return None;
+                }
+            }
+        }
+        let cfg = self.launcher_cfg();
+        self.launcher.as_mut()?.configure(cfg);
+        Some(self.cfg.appearance.scale)
+    }
+
+    /// The Run hotkey (Win+R): the launcher as one Run box, or put it away again.
+    fn launcher_run_toggle(&mut self) {
+        let Some(scale) = self.launcher_ready() else { return };
+        if let Some(l) = self.launcher.as_mut() {
+            l.toggle_run(&self.gfx, scale);
         }
     }
 
