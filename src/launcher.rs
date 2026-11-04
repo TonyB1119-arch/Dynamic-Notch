@@ -1273,11 +1273,15 @@ impl Launcher {
         self.hits.clear();
         self.wx = None;
         let Some(snap) = self.snap.as_ref() else { return };
-        for i in procs::rank(&snap.procs, &self.query).into_iter().take(KEEP) {
+        for i in procs::rank(&snap.procs, &self.query) {
             let p = &snap.procs[i];
             self.hits.push(Hit {
                 name: procs::title(&p.name),
-                detail: format!("{} \u{b7} {} CPU", procs::mem_text(p.mem), procs::cpu_text(p.cpu)),
+                detail: if p.locked {
+                    format!("{} \u{b7} {} CPU \u{b7} protected", procs::mem_text(p.mem), procs::cpu_text(p.cpu))
+                } else {
+                    format!("{} \u{b7} {} CPU", procs::mem_text(p.mem), procs::cpu_text(p.cpu))
+                },
                 path: if p.path.is_empty() { p.name.clone() } else { p.path.clone() },
                 kind: Kind::Process,
                 spans: Vec::new(),

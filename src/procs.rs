@@ -55,6 +55,8 @@ pub struct Proc {
     pub cpu: f32,
     /// How many processes it runs.
     pub count: u32,
+    /// A system program (or this app): listed, but it cannot be ended from here.
+    pub locked: bool,
 }
 
 /// What the computer is doing right now.
@@ -194,7 +196,7 @@ fn take(prev: &mut Prev) -> Snap {
             loop {
                 let pid = e.th32ProcessID;
                 let name = from_wide(&e.szExeFile);
-                if pid > 4 && !protected(&name) {
+                if pid > 4 && !name.is_empty() {
                     let key = name.to_ascii_lowercase();
                     let mut used = 0u64;
                     let mut mine = 0u64;
@@ -230,7 +232,7 @@ fn take(prev: &mut Prev) -> Snap {
                         }
                     }
                     ticks.insert(pid, mine);
-                    let p = by_name.entry(key).or_insert_with(|| Proc { name: name.clone(), ..Default::default() });
+                    let p = by_name.entry(key).or_insert_with(|| Proc { name: name.clone(), locked: protected(&name), ..Default::default() });
                     p.mem += used;
                     p.cpu += share;
                     p.count += 1;
