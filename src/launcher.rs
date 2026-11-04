@@ -79,7 +79,9 @@ const VIS: usize = 6;
 /// The list floats as its own glass panel this far below the two boxes.
 const LIST_GAP: f32 = 10.0;
 const LIST_Y: f32 = FRAME_H + LIST_GAP;
-const FULL_H: f32 = LIST_Y + HEAD + VIS as f32 * ROW + 10.0;
+/// Rows the menu of things to do can show (a list of matches shows `VIS`).
+const VIS_MAX: usize = 8;
+const FULL_H: f32 = LIST_Y + HEAD + VIS_MAX as f32 * ROW + 10.0;
 const CARD_R: f32 = 34.0;
 const LIST_R: f32 = 28.0;
 const BOX_R: f32 = 24.0;
@@ -427,6 +429,16 @@ enum Focus {
     Action,
 }
 
+/// How long the old contents take to swell and shrink away when Tab changes the mode (seconds).
+const SWITCH_OUT: f32 = 0.20;
+
+/// A mode change in progress: the contents of both boxes swell a little and shrink away into the middle of
+/// their box (`t` runs 0 to 1); then `to` takes over and its contents grow back out of the middle.
+struct Switch {
+    to: Mode,
+    t: f32,
+}
+
 /// Pixels across the little magnifier of the colour picker (odd, so one is in the middle).
 const PICK_N: i32 = 11;
 
@@ -520,7 +532,8 @@ pub struct Launcher {
     ai: Ai,
     /// The contents sliding in after Tab: 0 to 1, and the way they come from (1 or -1).
     sw: f32,
-    sw_dir: f32,
+    /// A Tab pressed: the old contents are shrinking away; the next mode takes over when they have.
+    switch: Option<Switch>,
     /// The picture behind the glass is renewed ten times a second while the launcher is open (a video
     /// behind it keeps moving). The window is hidden from screen copies for that.
     live: bool,
@@ -590,7 +603,7 @@ impl Launcher {
             scratch: Vec::new(),
             ai: Ai::new(),
             sw: 1.0,
-            sw_dir: 1.0,
+            switch: None,
             live: false,
             pending: None,
             armed: None,
@@ -685,6 +698,7 @@ impl Launcher {
     fn show(&mut self, gfx: &Gfx, ui_scale: f32, focus: bool) {
         // asked again while it was still fading out: the window is already there
         let again = self.visible;
+        self.switch = None;
         self.query.clear();
         self.hits.clear();
         self.sel = 0;
@@ -725,10 +739,12 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // live blur: the window is hidden from screen copies, so the picture behind it can be renewed
-            // while it is open; when that is not possible the picture stays as it was when it opened
+            // live blur, only while media is playing: the window is hidden from screen copies, so the picture
+            // behind it can be renewed while it is open. Otherwise (and when that is not possible) the picture
+            // stays as it was when it opened, and the launcher shows up in screenshots and recordings
             self.live = self.cfg.glass
                 && self.cfg.live
+                && self.cfg.media_playing
                 && unsafe { SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
             self.blur_img = if self.cfg.glass { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
@@ -773,6 +789,7 @@ impl Launcher {
         }
         self.open = false;
         self.flashing = false;
+        self.switch = None;
         self.stop_pick();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_ICON);
@@ -822,11 +839,20 @@ impl Launcher {
         }
     }
 
+    /// How many rows the list shows at once: all of the things to do with a match, or a page of matches.
+    fn vis(&self) -> usize {
+        if self.focus == Focus::Action {
+            VIS_MAX
+        } else {
+            VIS
+        }
+    }
+
     /// How tall the list wants to be.
     fn list_target(&self) -> f32 {
         let rows = self.rows_len();
         if self.list_open && rows > 0 {
-            HEAD + rows.min(VIS) as f32 * ROW + 10.0
+            HEAD + rows.min(self.vis()) as f32 * ROW + 10.0
         } else {
             0.0
         }
@@ -845,6 +871,7 @@ impl Launcher {
             || self.pop_s < 1.0
             || self.pop_a < 1.0
             || self.sw < 1.0
+            || self.switch.is_some()
             || (matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai.moving())
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
@@ -864,7 +891,10 @@ impl Launcher {
         self.ul = if snap { 1.0 } else { logic::toward(self.ul, 1.0, dt / 0.32) };
         self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.30) };
         self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.30) };
-        self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.28) };
+        self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.34) };
+        if let Some(sw) = self.switch.as_mut() {
+            sw.t = if snap { 1.0 } else { (sw.t + dt / SWITCH_OUT).min(1.0) };
+        }
         self.ai.glide(dt, snap);
         let ft = if self.focus == Focus::Action { 1.0 } else { 0.0 };
         self.focus_t = if snap { ft } else { logic::follow(self.focus_t, ft, dt, 18.0, 0.01) };
@@ -1601,10 +1631,19 @@ impl Launcher {
         }
         if VIRTUAL_KEY(vk) == VK_TAB {
             // Search -> clipboard -> Gemini (Shift+Tab goes back); Left and Right move between the two boxes
-            self.mode = self.mode.cycle(shift);
-            self.sw = if self.cfg.animate { 0.0 } else { 1.0 };
-            self.sw_dir = if shift { -1.0 } else { 1.0 };
-            self.show(gfx, 1.0, true);
+            if !self.cfg.animate {
+                self.mode = self.mode.cycle(shift);
+                self.sw = 1.0;
+                self.show(gfx, 1.0, true);
+                return;
+            }
+            // the old contents shrink away first; pressing Tab again meanwhile just aims further along
+            let to = self.switch.as_ref().map_or(self.mode, |sw| sw.to).cycle(shift);
+            match self.switch.as_mut() {
+                Some(sw) => sw.to = to,
+                None => self.switch = Some(Switch { to, t: 0.0 }),
+            }
+            self.kick();
             return;
         }
         if matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai_key(vk, ctrl) {
@@ -1744,7 +1783,6 @@ impl Launcher {
         self.list_open = false;
         self.sample();
         self.sw = if self.cfg.animate { 0.0 } else { 1.0 };
-        self.sw_dir = 1.0;
         unsafe {
             SetTimer(Some(self.hwnd), T_PICK, 40, None);
         }
@@ -1823,7 +1861,7 @@ impl Launcher {
             return None;
         }
         let k = ((y - y0) / ROW) as usize;
-        (k < self.rows_len().min(VIS)).then(|| self.view_top() + k)
+        (k < self.rows_len().min(self.vis())).then(|| self.view_top() + k)
     }
 
     pub fn handle(&mut self, gfx: &Gfx, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -1920,6 +1958,14 @@ impl Launcher {
             }
             WM_TIMER if wp.0 == T_ANIM => {
                 let more = self.tick();
+                // the old contents have shrunk away: the next mode takes over and grows in
+                if self.switch.as_ref().is_some_and(|sw| sw.t >= 1.0) {
+                    if let Some(sw) = self.switch.take() {
+                        self.mode = sw.to;
+                        self.sw = 0.0;
+                        self.show(gfx, 1.0, true);
+                    }
+                }
                 if !more {
                     unsafe {
                         let _ = KillTimer(Some(self.hwnd), T_ANIM);
@@ -2094,7 +2140,7 @@ impl Launcher {
         let light = self.cfg.light;
         let sc = self.scale;
         let e = logic::ease_out(self.anim);
-        let shown = self.rows_len().min(VIS);
+        let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
         self.set_region(self.lh.max(self.list_target()));
         let cur = self.cur().cloned();
@@ -2117,10 +2163,26 @@ impl Launcher {
             p.clear();
             p.alpha = e;
             // opening: appears where it is, fading in while growing from 95% around its middle; closing runs it backwards
-            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0, dx: 0.0 };
-            // changing the mode: the contents slide in from the side they came from
-            let sw = logic::ease_out(self.sw);
-            let ct = Tr { dx: self.sw_dir * (1.0 - sw) * 30.0, ..tr };
+            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0, dx: 0.0, k: 1.0, kx: 0.0, ky: 0.0 };
+            // changing the mode: the old contents swell a little, then shrink away into the middle of their
+            // box; the new ones grow out of the middle (with a small overshoot)
+            let (pop, fade) = match &self.switch {
+                Some(sw) => {
+                    let t = sw.t.clamp(0.0, 1.0);
+                    let k = if t < 0.25 {
+                        1.0 + 0.12 * logic::ease_out(t / 0.25)
+                    } else {
+                        let u = (t - 0.25) / 0.75;
+                        1.12 * (1.0 - u * u * u)
+                    };
+                    (k, 1.0 - ((t - 0.5) / 0.5).clamp(0.0, 1.0))
+                }
+                None => {
+                    let sw = self.sw.clamp(0.0, 1.0);
+                    (0.15 + 0.85 * logic::ease_back(sw), logic::ease_out((sw * 2.0).min(1.0)))
+                }
+            };
+            let ct = Tr { ..tr };
             card_xf(&mut p, &tr);
             let card = Rect::new(0.0, 0.0, W, FRAME_H);
             // the list is a second piece of glass that floats below the boxes
@@ -2169,65 +2231,83 @@ impl Launcher {
                     None => self.texts.get(&h.path).filter(|t| !t.trim().is_empty()).map(|t| Peek::Text(t)),
                 }
             });
-            let subject = Look {
-                cur: subj,
-                icon,
-                wx: wx.as_deref(),
-                pop: self.pop_s,
-                ul: self.ul,
-                tr: &ct,
-                ready: self.apps_ready,
-                clip: self.mode == Mode::Clip,
-                peek,
-            };
-            // the contents of both boxes slide and fade in when the mode changes
+            // the contents of both boxes pop (and fade) when the mode changes: while they do, each box's
+            // contents are drawn on their own, scaled around the middle of that box
             let keep = p.alpha;
-            p.alpha = keep * (0.25 + 0.75 * sw);
-            card_xf(&mut p, &ct);
-            if let Some(pk) = self.pick.as_ref() {
-                draw_pick(&mut p, sub, act, pk);
-            } else if matches!(self.mode, Mode::Ai | Mode::Notes) {
-                let notes = self.mode == Mode::Notes;
-                let qh = text_hash(&self.query);
-                if qh != self.ai.q.fit_for || self.query.is_empty() {
-                    ai_goal = Some((qh, fit_text(&mut p, &self.query, BOX - 28.0, BOX - 28.0, &Q_SIZES, 600, true)));
-                }
-                let ah = text_hash(&self.ai.text);
-                if !notes && (ah != self.ai.a.fit_for || self.ai.text.is_empty()) {
-                    ai_agoal =
-                        Some((ah, fit_text(&mut p, &self.ai.text, BOX - 36.0, BOX - 28.0, &A_SIZES, 500, false)));
-                }
-                let view = AiView {
-                    query: &self.query,
-                    state: self.ai.state,
-                    text: if notes { &self.notes_text } else { &self.ai.text },
-                    notes,
-                    scroll: self.ai.scroll,
-                    pop_s: self.pop_s,
-                    pop_a: self.pop_a,
-                    q: (self.ai.q.sz, self.ai.q.y, self.ai.q.center),
-                    a: (self.ai.a.sz, self.ai.a.y, self.ai.a.center),
+            p.alpha = keep * fade;
+            let popping = (pop - 1.0).abs() > 0.001;
+            let (both, one) = ([Some(sub), Some(act)], [None]);
+            let passes: &[Option<Rect>] = if popping { &both } else { &one };
+            for &only in passes {
+                let ctb = match only {
+                    Some(r) => Tr { k: pop, kx: r.cx(), ky: r.cy(), ..ct },
+                    None => Tr { ..ct },
                 };
-                ai_max = draw_ai(&mut p, sub, act, &view);
-            } else {
-                draw_subject(&mut p, sub, &subject);
-                match &self.pending {
-                    Some((a, _)) => {
-                        let target_icon = cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
-                        draw_target(
-                            &mut p,
-                            act,
-                            cur.as_ref(),
-                            target_icon,
-                            a.label().trim_end_matches('\u{2026}'),
-                            self.pop_a,
-                            &ct,
-                        );
+                let subject = Look {
+                    cur: subj,
+                    icon,
+                    wx: wx.as_deref(),
+                    pop: self.pop_s,
+                    ul: self.ul,
+                    tr: &ctb,
+                    ready: self.apps_ready,
+                    clip: self.mode == Mode::Clip,
+                    peek,
+                };
+                card_xf(&mut p, &ctb);
+                if let Some(r) = only {
+                    p.push_clip(r);
+                }
+                if let Some(pk) = self.pick.as_ref() {
+                    draw_pick(&mut p, sub, act, pk);
+                } else if matches!(self.mode, Mode::Ai | Mode::Notes) {
+                    let notes = self.mode == Mode::Notes;
+                    let qh = text_hash(&self.query);
+                    if qh != self.ai.q.fit_for || self.query.is_empty() {
+                        ai_goal =
+                            Some((qh, fit_text(&mut p, &self.query, BOX - 28.0, BOX - 28.0, &Q_SIZES, 600, true)));
                     }
-                    None => {
-                        let armed = cur.as_ref().is_some_and(|h| self.armed.as_deref() == Some(h.path.as_str()));
-                        draw_action(&mut p, act, cur.as_ref(), self.act, armed, self.pop_a, &ct);
+                    let ah = text_hash(&self.ai.text);
+                    if !notes && (ah != self.ai.a.fit_for || self.ai.text.is_empty()) {
+                        ai_agoal =
+                            Some((ah, fit_text(&mut p, &self.ai.text, BOX - 36.0, BOX - 28.0, &A_SIZES, 500, false)));
                     }
+                    let view = AiView {
+                        query: &self.query,
+                        state: self.ai.state,
+                        text: if notes { &self.notes_text } else { &self.ai.text },
+                        notes,
+                        scroll: self.ai.scroll,
+                        pop_s: self.pop_s,
+                        pop_a: self.pop_a,
+                        q: (self.ai.q.sz, self.ai.q.y, self.ai.q.center),
+                        a: (self.ai.a.sz, self.ai.a.y, self.ai.a.center),
+                    };
+                    ai_max = draw_ai(&mut p, sub, act, &view);
+                } else {
+                    draw_subject(&mut p, sub, &subject);
+                    match &self.pending {
+                        Some((a, _)) => {
+                            let target_icon =
+                                cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
+                            draw_target(
+                                &mut p,
+                                act,
+                                cur.as_ref(),
+                                target_icon,
+                                a.label().trim_end_matches('\u{2026}'),
+                                self.pop_a,
+                                &ctb,
+                            );
+                        }
+                        None => {
+                            let armed = cur.as_ref().is_some_and(|h| self.armed.as_deref() == Some(h.path.as_str()));
+                            draw_action(&mut p, act, cur.as_ref(), self.act, armed, self.pop_a, &ctb);
+                        }
+                    }
+                }
+                if only.is_some() {
+                    p.pop_clip();
                 }
             }
             p.alpha = keep;
@@ -2384,22 +2464,28 @@ fn type_glyph(p: &mut Painter, cx: f32, cy: f32, c: Color) {
 struct Tr {
     s0: f32,
     top: f32,
-    /// Sideways shift (the contents sliding in when the mode changes).
+    /// Sideways shift.
     dx: f32,
+    /// An extra scale (the pop when the mode changes) around the point (`kx`, `ky`).
+    k: f32,
+    kx: f32,
+    ky: f32,
 }
 
 /// The point the card grows from.
 const ANCHOR: (f32, f32) = (W * 0.5, FRAME_H * 0.5);
 
 fn card_xf(p: &mut Painter, t: &Tr) {
-    p.set_local(t.s0, ANCHOR.0, ANCHOR.1, t.dx, t.top);
+    let dx = t.s0 * (1.0 - t.k) * t.kx + (1.0 - t.s0) * ANCHOR.0 + t.dx;
+    let dy = t.s0 * (1.0 - t.k) * t.ky + (1.0 - t.s0) * ANCHOR.1 + t.top;
+    p.set_local(t.s0 * t.k, 0.0, 0.0, dx, dy);
 }
 
 /// Scale one thing by `k` around (cx, cy), on top of the card's own transform.
 fn pop_xf(p: &mut Painter, t: &Tr, k: f32, cx: f32, cy: f32) {
-    let dx = ANCHOR.0 + t.s0 * (cx - k * cx - ANCHOR.0) + t.dx;
-    let dy = ANCHOR.1 + t.s0 * (cy - k * cy - ANCHOR.1) + t.top;
-    p.set_local(t.s0 * k, 0.0, 0.0, dx, dy);
+    let dx = t.s0 * t.k * (1.0 - k) * cx + t.s0 * (1.0 - t.k) * t.kx + (1.0 - t.s0) * ANCHOR.0 + t.dx;
+    let dy = t.s0 * t.k * (1.0 - k) * cy + t.s0 * (1.0 - t.k) * t.ky + (1.0 - t.s0) * ANCHOR.1 + t.top;
+    p.set_local(t.s0 * t.k * k, 0.0, 0.0, dx, dy);
 }
 
 /// A thin line under the letters that matched what was typed. It grows from left to right.
@@ -2495,6 +2581,7 @@ struct Look<'a> {
     peek: Option<Peek<'a>>,
 }
 
+#[derive(Clone, Copy)]
 enum Peek<'a> {
     Img(&'a ImageData),
     Text(&'a str),
