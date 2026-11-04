@@ -188,7 +188,6 @@ mod geom {
 
 /// The colours of one look.
 struct Pal {
-    disc: Color,
     slice: Color,
     empty: Color,
     center: Color,
@@ -205,7 +204,6 @@ struct Pal {
 fn pal(tuna: bool) -> Pal {
     if tuna {
         Pal {
-            disc: Color::hex(0x0A0B0C),
             slice: Color::hex(0x151619),
             empty: Color::hex(0x0F1012),
             center: Color::hex(0x08090A),
@@ -216,7 +214,6 @@ fn pal(tuna: bool) -> Pal {
         }
     } else {
         Pal {
-            disc: Color::hex(0x0B0B0C),
             slice: Color::hex(0x262628),
             empty: Color::hex(0x171718),
             center: Color::hex(0x000000),
@@ -231,8 +228,6 @@ fn pal(tuna: bool) -> Pal {
 /// One app of the menu, worked out once when the list changes.
 struct Slot {
     name: String,
-    /// The name as shown under the picture (cut short).
-    label: String,
     target: String,
 }
 
@@ -254,7 +249,7 @@ fn make_slot(item: &str) -> Option<Slot> {
     } else {
         name.to_string()
     };
-    Some(Slot { label: crate::util::truncate_chars(&name, 11), name, target: target.to_string() })
+    Some(Slot { name, target: target.to_string() })
 }
 
 /// The white slice: where it is and where it is heading.
@@ -628,8 +623,6 @@ impl Radial {
         if !self.visible || self.win_px.2 == 0 {
             return;
         }
-        // the glass of the system is not used: the menu is solid
-        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         let (dc, _) = match self.host.begin_draw() {
             Ok(v) => v,
             Err(err) => {
@@ -642,6 +635,10 @@ impl Radial {
         // opening: grows from 40% with a little overshoot; closing: shrinks to 75% while it fades
         let pop = if self.open { 0.4 + 0.6 * ease_back(t) } else { 0.75 + 0.25 * ease_out(t) };
         let fade = ease_out((t * 1.8).min(1.0));
+        // the frosted glass (blur of what is behind) in the shape of the menu, growing with it
+        let mid = SIDE * 0.5 * self.scale;
+        let rad = OUT1 * pop * self.scale;
+        self.host.set_backdrop_rounded(Rect::centered(mid, mid, rad * 2.0, rad * 2.0), rad, fade);
         // the slices and pictures appear a moment after the disc
         let content = ease_out(((t - 0.3) / 0.5).clamp(0.0, 1.0));
         let pl = pal(self.cfg.tuna);
@@ -654,8 +651,6 @@ impl Radial {
             p.clear();
             p.set_local(pop, c, c, 0.0, 0.0);
             p.alpha = fade;
-            p.shadow(Rect::centered(c, c, OUT1 * 2.0, OUT1 * 2.0), OUT1, 0.55);
-            p.fill_circle(c, c, OUT1, pl.disc.alpha(0.97));
 
             // the slices (their shapes are built once)
             if geo.len() != SLOTS {
@@ -671,10 +666,10 @@ impl Radial {
             if geo.len() == SLOTS {
                 for (i, g) in geo.iter().enumerate() {
                     let fill = if slots[i].is_some() { pl.slice } else { pl.empty };
-                    p.fill_geometry(g, fill.alpha(0.97 * content.max(0.35)));
+                    p.fill_geometry(g, fill.alpha(0.8 * content.max(0.35)));
                 }
             }
-            p.fill_circle(c, c, R_C, pl.center.alpha(0.98));
+            p.fill_circle(c, c, R_C, pl.center.alpha(0.55));
 
             // the slice that follows the pointer
             if hl.alpha > 0.01 {
@@ -697,9 +692,8 @@ impl Radial {
                 let d = ((mx - hl_mid.0).powi(2) + (my - hl_mid.1).powi(2)).sqrt();
                 let cover = ((1.0 - d / 46.0).clamp(0.0, 1.0)) * hl.alpha;
                 let ink = pl.ink.lerp(pl.ink_hl, cover);
-                let size = if i < 8 { 34.0 } else { 38.0 };
-                // picture + 3 px + 12 px of text, centred on the slice
-                let top = my - (size + 15.0) * 0.5;
+                let size = if i < 8 { 40.0 } else { 44.0 };
+                let top = my - size * 0.5;
                 let ir = Rect::new(mx - size * 0.5, top, size, size);
                 match icons.get(i).and_then(|o| o.as_ref()) {
                     Some(img) => p.image(img, ir, 7.0, 1.0),
@@ -709,11 +703,6 @@ impl Radial {
                         p.glyph(ch, ir, size * 0.8, ink);
                     }
                 }
-                p.text(
-                    &slot.label,
-                    Rect::centered(mx, top + size + 9.0, 74.0, 12.0),
-                    &TextStyle::new(10.0, ink).medium().center(),
-                );
             }
 
             // the name of the slice under the pointer, in the middle
