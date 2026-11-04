@@ -19,6 +19,14 @@ use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICBitmapSourc
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ,
+};
+use windows::Win32::Foundation::WIN32_ERROR;
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
@@ -63,6 +71,145 @@ pub fn clear_tiles() {
     if let Ok(mut t) = TILES.lock() {
         t.clear();
     }
+}
+
+/// Icons Windows 11 lists for the taskbar: found from its own list and the programs that are running.
+/// Apps that do not announce their icon the old way still show up this way (without their own menu).
+static FALLBACK: Mutex<Vec<Fb>> = Mutex::new(Vec::new());
+
+#[derive(Clone)]
+struct Fb {
+    /// File name without .exe, lower case.
+    name: String,
+    tip: String,
+    path: String,
+    pids: Vec<u32>,
+    img: Option<ImageData>,
+}
+
+enum Tile<'a> {
+    Live(&'a Entry),
+    Reg(&'a Fb),
+}
+
+/// The programs Windows 11 keeps a tray icon for (HKCU\Control Panel\NotifyIconSettings) that are running now.
+fn registry_icons() -> Vec<Fb> {
+    // (file name in lower case, tooltip)
+    let mut want: Vec<(String, String)> = Vec::new();
+    unsafe {
+        let key: Vec<u16> = "Control Panel\\NotifyIconSettings".encode_utf16().chain(Some(0)).collect();
+        let mut h = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), Some(0), KEY_READ, &mut h) != WIN32_ERROR(0) {
+            return Vec::new();
+        }
+        let mut i = 0u32;
+        loop {
+            let mut name = [0u16; 256];
+            let mut len = name.len() as u32;
+            if RegEnumKeyExW(h, i, Some(windows::core::PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None)
+                != WIN32_ERROR(0)
+            {
+                break;
+            }
+            i += 1;
+            let sub: Vec<u16> = name[..len as usize].iter().copied().chain(Some(0)).collect();
+            let read = |value: PCWSTR| -> String {
+                let mut buf = [0u16; 520];
+                let mut sz = (buf.len() * 2) as u32;
+                let r = RegGetValueW(
+                    h,
+                    PCWSTR(sub.as_ptr()),
+                    value,
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    Some(&mut sz),
+                );
+                if r == WIN32_ERROR(0) {
+                    crate::util::from_wide(&buf)
+                } else {
+                    String::new()
+                }
+            };
+            let exe = read(w!("ExecutablePath"));
+            let file = exe.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+            if file.ends_with(".exe") && !want.iter().any(|(n, _)| *n == file) {
+                want.push((file, read(w!("InitialTooltip"))));
+            }
+        }
+        let _ = RegCloseKey(h);
+    }
+    let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()));
+    want.retain(|(n, _)| n != "explorer.exe" && me.as_deref() != Some(n.as_str()));
+    // which of them are running
+    let mut running: Vec<(String, Vec<u32>)> = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let n = crate::util::from_wide(&e.szExeFile).to_ascii_lowercase();
+                if want.iter().any(|(w, _)| *w == n) {
+                    match running.iter_mut().find(|(r, _)| *r == n) {
+                        Some((_, pids)) => pids.push(e.th32ProcessID),
+                        None => running.push((n, vec![e.th32ProcessID])),
+                    }
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    let mut out = Vec::new();
+    for (n, pids) in running {
+        let tip = want.iter().find(|(w, _)| *w == n).map(|(_, t)| t.clone()).unwrap_or_default();
+        let path = pids.iter().find_map(|&pid| unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 520];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            let _ = CloseHandle(h);
+            ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        });
+        let Some(path) = path else { continue };
+        let img = crate::sys::dragdrop::thumbnail(&path, 64);
+        let stem = n.strip_suffix(".exe").unwrap_or(&n).to_string();
+        out.push(Fb { name: stem, tip, path, pids, img });
+    }
+    out
+}
+
+/// Bring the program's window forward (or start it, which most programs answer by showing themselves).
+fn open_fb(f: &Fb) {
+    struct Find {
+        pids: Vec<u32>,
+        found: isize,
+    }
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let f = &mut *(lp.0 as *mut Find);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if f.pids.contains(&pid) && IsWindowVisible(h).as_bool() && GetWindowTextLengthW(h) > 0 {
+            f.found = h.0 as isize;
+            return false.into();
+        }
+        true.into()
+    }
+    unsafe {
+        let mut find = Find { pids: f.pids.clone(), found: 0 };
+        let _ = EnumWindows(Some(each), LPARAM(&mut find as *mut Find as isize));
+        if find.found != 0 {
+            let h = HWND(find.found as *mut _);
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+            return;
+        }
+    }
+    let _ = std::process::Command::new(&f.path).spawn();
 }
 
 #[derive(Clone)]
@@ -363,6 +510,9 @@ impl TrayList {
     pub fn rescan(&mut self) {
         let now = Instant::now();
         start_listening();
+        if let Ok(mut f) = FALLBACK.lock() {
+            *f = registry_icons();
+        }
         self.until = Some(now + LISTEN);
         self.last_scan = Some(now);
     }
@@ -379,8 +529,12 @@ impl TrayList {
         if self.until.is_some_and(|t| now >= t) {
             stop_listening();
             self.until = None;
-            let n = ICONS.lock().map_or(0, |a| a.len());
-            crate::log!("tray: {n} icons");
+            let hooked: Vec<String> =
+                ICONS.lock().map(|a| a.iter().map(|e| exe_name(e.hwnd).to_ascii_lowercase()).collect()).unwrap_or_default();
+            if let Ok(mut f) = FALLBACK.lock() {
+                f.retain(|x| !hooked.contains(&x.name));
+                crate::log!("tray: {} icons announced, {} more from the list of Windows", hooked.len(), f.len());
+            }
             return true;
         }
         false
@@ -400,6 +554,9 @@ impl TrayList {
         // forget icons whose app has gone
         if self.last_prune.elapsed() > Duration::from_secs(2) {
             self.last_prune = Instant::now();
+            if let Ok(mut f) = FALLBACK.lock() {
+                f.retain(|x| x.pids.iter().any(|&pid| unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map(|h| CloseHandle(h)).is_ok() }));
+            }
             if let Ok(mut all) = ICONS.lock() {
                 all.retain(|e| unsafe { GetWindowThreadProcessId(HWND(e.hwnd as *mut _), None) != 0 });
             }
@@ -419,24 +576,27 @@ impl TrayList {
             })
             .unwrap_or_default();
 
+        let fbs: Vec<Fb> = FALLBACK.lock().map(|f| f.clone()).unwrap_or_default();
+        let all: Vec<Tile> = list.iter().map(Tile::Live).chain(fbs.iter().map(Tile::Reg)).collect();
+
         let head = Rect::new(r.x, r.y, r.w, HEAD_H);
         let rb = Rect::new(head.right() - 30.0, head.cy() - 12.0, 24.0, 24.0);
         let area = Rect::new(r.x, head.bottom() + HEAD_GAP, r.w, AREA_H);
 
         let cols = (((area.w + GAP) / (TILE + GAP)).floor() as usize).max(1);
-        let rows = list.len().div_ceil(cols);
+        let rows = all.len().div_ceil(cols);
         let content_h = if rows == 0 { 0.0 } else { rows as f32 * (TILE + GAP) - GAP };
         scroll(ui, area, &mut self.off, content_h);
 
         let mut note: Option<String> = None;
         let mut hits: Vec<Rect> = Vec::new();
-        if list.is_empty() {
+        if all.is_empty() {
             ui.empty_state(area, Icon::Grid, if scanning { "Looking for tray icons..." } else { "No tray icons found" });
         } else {
-            let used = list.len().min(cols);
+            let used = all.len().min(cols);
             let x0 = area.x + (area.w - (used as f32 * (TILE + GAP) - GAP)) * 0.5;
             ui.p.push_clip(area);
-            for (k, e) in list.iter().enumerate() {
+            for (k, t) in all.iter().enumerate() {
                 let tile = Rect::new(x0 + (k % cols) as f32 * (TILE + GAP), area.y + (k / cols) as f32 * (TILE + GAP) - self.off, TILE, TILE);
                 if tile.bottom() < area.y || tile.y > area.bottom() {
                     continue;
@@ -446,18 +606,33 @@ impl TrayList {
                 if hover > 0.01 {
                     ui.hot = true;
                     ui.p.fill_rounded(tile, 13.0, Color::white(0.09 * hover));
-                    let name = if e.tip.trim().is_empty() { exe_name(e.hwnd) } else { e.tip.trim().to_string() };
+                    let name = match t {
+                        Tile::Live(e) if e.tip.trim().is_empty() => exe_name(e.hwnd),
+                        Tile::Live(e) => e.tip.trim().to_string(),
+                        Tile::Reg(f) if f.tip.trim().is_empty() => f.name.clone(),
+                        Tile::Reg(f) => f.tip.trim().to_string(),
+                    };
                     note = Some(name);
                 }
-                if let Some(img) = &e.img {
+                let img_of = match t {
+                    Tile::Live(e) => e.img.as_ref(),
+                    Tile::Reg(f) => f.img.as_ref(),
+                };
+                if let Some(img) = img_of {
                     let pad = 9.0 + press * 2.0;
                     ui.p.image(img, tile.inset(pad), 0.0, 1.0);
                 }
                 if ui.clicked(tile) {
-                    click(e, false);
+                    match t {
+                        Tile::Live(e) => click(e, false),
+                        Tile::Reg(f) => open_fb(f),
+                    }
                 }
                 if ui.right_clicked(tile) {
-                    click(e, true);
+                    match t {
+                        Tile::Live(e) => click(e, true),
+                        Tile::Reg(f) => open_fb(f),
+                    }
                 }
             }
             ui.p.pop_clip();
@@ -472,8 +647,8 @@ impl TrayList {
         let text = match (&note, scanning) {
             (Some(n), _) => truncate_chars(n, 44),
             (None, true) => "Looking for tray icons...".to_string(),
-            (None, false) if list.is_empty() => "Tray".to_string(),
-            (None, false) => format!("{} tray icons: click to open, right-click for the menu", list.len()),
+            (None, false) if all.is_empty() => "Tray".to_string(),
+            (None, false) => format!("{} tray icons: click to open", all.len()),
         };
         ui.p.text(&text, Rect::new(head.x + 28.0, head.y, (rb.x - head.x - 36.0).max(0.0), head.h), &TextStyle::new(13.0, palette::TEXT).medium());
         if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_DIM)) {
