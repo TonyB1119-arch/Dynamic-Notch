@@ -20,6 +20,7 @@ mod lowkeys;
 mod modules;
 mod pacer;
 mod procs;
+mod radial;
 mod refract;
 mod sys;
 mod taskbar;

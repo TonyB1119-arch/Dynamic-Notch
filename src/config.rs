@@ -40,6 +40,7 @@ pub struct Config {
     pub dock: DockCfg,
     pub launcher: LauncherCfg,
     pub combos: CombosCfg,
+    pub radial: RadialCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,6 +187,9 @@ pub struct Hotkeys {
     pub window_max: String,
     /// Close the window in front.
     pub window_close: String,
+    /// The radial menu of your apps around the pointer. Caught by a low-level hook, so Win+M works even
+    /// though Windows wants it.
+    pub radial: String,
 }
 
 impl Default for Hotkeys {
@@ -202,6 +206,7 @@ impl Default for Hotkeys {
             launcher_ai: "Win+G".into(),
             window_max: "Win+F".into(),
             window_close: "Win+Q".into(),
+            radial: "Win+M".into(),
         }
     }
 }
@@ -416,6 +421,46 @@ pub struct ShelfCfg {
 impl Default for ShelfCfg {
     fn default() -> Self {
         Self { remember: true }
+    }
+}
+
+/// The radial menu (hotkey: `[hotkeys] radial`): two rings of eight apps around the pointer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadialCfg {
+    pub enabled: bool,
+    /// Hide the Windows taskbar while Dynamic Notch runs (it comes back when you quit or turn this off).
+    pub hide_taskbar: bool,
+    /// 16 slots, "name|what to open" (an empty text is an empty slot): the first 8 are the inner ring and
+    /// the last 8 the outer ring, both clockwise from the top.
+    pub apps: Vec<String>,
+}
+
+impl Default for RadialCfg {
+    fn default() -> Self {
+        let mut apps: Vec<String> = [
+            "File Explorer|explorer.exe",
+            "Edge|%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe",
+            "Notepad|notepad.exe",
+            "Calculator|calc.exe",
+            "PowerShell|powershell.exe",
+            "Settings|ms-settings:",
+            "Task Manager|taskmgr.exe",
+            "Snipping Tool|snippingtool.exe",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        apps.resize(16, String::new());
+        Self { enabled: true, hide_taskbar: false, apps }
+    }
+}
+
+impl RadialCfg {
+    /// Always exactly 16 slots.
+    fn fix(&mut self) {
+        self.apps.truncate(16);
+        self.apps.resize(16, String::new());
     }
 }
 
@@ -970,6 +1015,7 @@ impl Config {
         self.dock.clamped();
         self.launcher.clamped();
         self.combos.items.truncate(24);
+        self.radial.fix();
         self.home.widgets.truncate(4);
         self.notch.widgets.truncate(3);
         self
@@ -1062,6 +1108,8 @@ launcher_ai = "Win+G"
 window_max = "Win+F"
 # Close the window in front. Leave empty to turn it off.
 window_close = "Win+Q"
+# The radial menu of your apps around the pointer (see [radial]). Leave empty to turn it off.
+radial = "Win+M"
 
 [modules]
 media = true
@@ -1269,6 +1317,15 @@ search_url = "https://www.google.com/search?q="
 # For example: items = ['Win+B|browser', 'Ctrl+Alt+N|notepad.exe']
 items = []
 
+[radial]
+# The round menu of your apps (hotkey: [hotkeys] radial), easiest to change in Settings (Radial tab).
+enabled = true
+# Hide the Windows taskbar while Dynamic Notch runs (it comes back when you quit or turn this off).
+hide_taskbar = false
+# 16 slots: the first 8 are the inner ring, the last 8 the outer ring, both clockwise from the top.
+# Each one is 'name|what to open'; an empty text '' is an empty slot.
+apps = ['File Explorer|explorer.exe', 'Edge|%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe', 'Notepad|notepad.exe', 'Calculator|calc.exe', 'PowerShell|powershell.exe', 'Settings|ms-settings:', 'Task Manager|taskmgr.exe', 'Snipping Tool|snippingtool.exe', '', '', '', '', '', '', '', '']
+
 [glass]
 # The Alcove glass edge (Settings → Glass). Sizes are in logical pixels; delete a line to get its default.
 edge_width = 76.0
@@ -1334,6 +1391,8 @@ mod tests {
         assert_eq!(c.hotkeys.launcher_ai, d.hotkeys.launcher_ai);
         assert_eq!(c.hotkeys.window_max, d.hotkeys.window_max);
         assert_eq!(c.hotkeys.window_close, d.hotkeys.window_close);
+        assert_eq!(c.hotkeys.radial, d.hotkeys.radial);
+        assert_eq!(c.radial.apps, d.radial.apps);
         assert_eq!(c.voice.model, d.voice.model);
         assert_eq!(c.voice.cleanup, d.voice.cleanup);
         assert_eq!(c.locks.caps, d.locks.caps);

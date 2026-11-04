@@ -27,6 +27,8 @@ pub enum Action {
     WindowMax,
     /// Close the window in front.
     WindowClose,
+    /// The radial menu of apps around the pointer.
+    Radial,
     /// One of the user's combos (its place in `[combos] items`).
     Combo(usize),
 }
@@ -158,6 +160,7 @@ const CLIP_ID: i32 = COMBO_BASE + 80;
 const AI_ID: i32 = COMBO_BASE + 81;
 const MAX_ID: i32 = COMBO_BASE + 82;
 const CLOSE_ID: i32 = COMBO_BASE + 83;
+const RADIAL_ID: i32 = COMBO_BASE + 84;
 
 /// Is this a key combination a combo may use? It needs Ctrl, Alt, Shift or Win (or be an F key), so a
 /// combo can't take over a plain letter.
@@ -186,7 +189,7 @@ pub fn split_item(item: &str) -> (&str, &str, &str) {
 /// Hand the user's combos to the keyboard hook (`lowkeys`), which sees every key before Windows does.
 /// Returns what can be used and what cannot.
 /// `own` are the keys of the built-in ones that need the hook: clipboard, Gemini, maximise, close.
-pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 4]) -> (Vec<Registered>, Vec<String>) {
+pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 5]) -> (Vec<Registered>, Vec<String>) {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
     let mut table = Vec::new();
@@ -196,6 +199,7 @@ pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 4]) -> (Vec<Reg
         (own[1], AI_ID, Action::LauncherAi),
         (own[2], MAX_ID, Action::WindowMax),
         (own[3], CLOSE_ID, Action::WindowClose),
+        (own[4], RADIAL_ID, Action::Radial),
     ] {
         let keys = keys.trim();
         if keys.is_empty() {

@@ -18,8 +18,9 @@ use crate::updater;
 use crate::util::{app_dir, palette, Color, Rect, SendHwnd};
 
 const ID: ModuleId = "settings";
-const TABS: [&str; 11] =
-    ["General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass", "Combos"];
+const TABS: [&str; 12] = [
+    "General", "Look", "Home", "Modules", "Weather", "Gemini", "Notch", "Tabs", "Dock", "Glass", "Combos", "Radial",
+];
 const ROW_H: f32 = 36.0;
 const ROW_GAP: f32 = 4.0;
 const TAB_H: f32 = 32.0;
@@ -134,6 +135,8 @@ pub struct Settings {
     combo_label: String,
     combo_path: String,
     picker: bool,
+    /// The slice of the radial menu the apps menu is choosing for.
+    radial_slot: Option<usize>,
     pick_scroll: f32,
     apps: std::sync::Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>,
     app_list: Vec<(String, String)>,
@@ -165,6 +168,7 @@ impl Settings {
             combo_label: String::new(),
             combo_path: String::new(),
             picker: false,
+            radial_slot: None,
             pick_scroll: 0.0,
             apps: std::sync::Arc::new(std::sync::Mutex::new(None)),
             app_list: Vec::new(),
@@ -291,6 +295,7 @@ fn tab_rows(tab: usize) -> f32 {
         7 => 5.9,
         8 => 20.0,
         10 => 14.0,
+        11 => 19.0,
         _ => 25.0,
     }
 }
@@ -472,6 +477,8 @@ impl Module for Settings {
             if hit && !on {
                 self.tab = i;
                 self.scroll = 0.0;
+                self.picker = false;
+                self.radial_slot = None;
                 if self.recording {
                     self.recording = false;
                     crate::lowkeys::cancel_capture();
@@ -508,7 +515,8 @@ impl Module for Settings {
             7 => self.tabs(ui, body),
             8 => self.dock(ui, body),
             9 => self.glass(ui, body),
-            _ => self.combos(ui, body),
+            10 => self.combos(ui, body),
+            _ => self.radial(ui, body),
         }
         if long {
             ui.p.pop_clip();
@@ -1402,6 +1410,7 @@ impl Settings {
             ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM),
         ) {
             self.picker = false;
+            self.radial_slot = None;
             self.focus = Focus::None;
             ui.fx.keyboard_focus = Some(false);
             return;
@@ -1449,6 +1458,20 @@ impl Settings {
         ui.p.pop_clip();
         ui.interactive = was_live;
         if let Some((name, path)) = chosen {
+            if let Some(slot) = self.radial_slot.take() {
+                // an app for a slice of the radial menu
+                let name = if path == "browser" { "Browser".to_string() } else { name.replace('|', " ") };
+                let mut apps = self.cfg.radial.apps.clone();
+                apps.resize(16, String::new());
+                if let Some(a) = apps.get_mut(slot) {
+                    *a = format!("{name}|{}", path.replace('|', " "));
+                }
+                put(ui, "radial", "apps", list_value(&apps));
+                self.picker = false;
+                self.focus = Focus::None;
+                ui.fx.keyboard_focus = Some(false);
+                return;
+            }
             self.combo_path = path.replace('|', " ");
             self.combo_label = if path == "browser" { String::new() } else { name };
             let shown = self.combo_path.clone();
@@ -1456,6 +1479,74 @@ impl Settings {
             self.picker = false;
             self.focus = Focus::None;
             ui.fx.keyboard_focus = Some(false);
+        }
+    }
+
+    /// Settings → Radial: the radial menu (Win+M): on or off, the taskbar option and the 16 apps.
+    fn radial(&mut self, ui: &mut Ui, body: Rect) {
+        let accent = ui.accent;
+        if self.apps_started && !self.apps_loaded {
+            match self.apps.lock().ok().and_then(|mut g| g.take()) {
+                Some(v) => {
+                    self.app_list = v;
+                    self.apps_loaded = true;
+                }
+                None => ui.animate(),
+            }
+        }
+        if self.picker && self.radial_slot.is_some() {
+            self.picker_menu(ui, body, accent);
+            return;
+        }
+        let r = self.cfg.radial.clone();
+        toggle_row(ui, row_rect(body, 0), "Radial menu (Win+M)", r.enabled, "radial", "enabled");
+        toggle_row(ui, row_rect(body, 1), "Hide the Windows taskbar", r.hide_taskbar, "radial", "hide_taskbar");
+        let row = row_rect(body, 2);
+        ui.p.text(
+            "Pick an app for each slice. The inner ring comes first; both run clockwise from the top.",
+            Rect::new(row.x + 2.0, row.y, row.w, row.h),
+            &TextStyle::new(11.5, palette::TEXT_DIM),
+        );
+        const POS: [&str; 8] =
+            ["top", "top right", "right", "bottom right", "bottom", "bottom left", "left", "top left"];
+        let mut apps = r.apps.clone();
+        apps.resize(16, String::new());
+        for i in 0..16 {
+            let row = row_rect(body, 3 + i);
+            label_row(ui, row, &format!("{} \u{b7} {}", if i < 8 { "Inner" } else { "Outer" }, POS[i % 8]));
+            let item = apps[i].trim();
+            let name = item.split_once('|').map_or(item, |(n, _)| n.trim());
+            let choose = Rect::new(row.right() - 36.0 - 8.0 - 96.0, row.y + 2.0, 96.0, row.h - 4.0);
+            let x = row.x + 190.0;
+            let (shown, color) = if item.is_empty() {
+                ("Empty", palette::TEXT_FAINT)
+            } else if name.is_empty() {
+                (item, palette::TEXT_DIM)
+            } else {
+                (name, palette::TEXT_DIM)
+            };
+            ui.p.text(
+                &crate::util::one_line(shown),
+                Rect::new(x, row.y, (choose.x - 8.0 - x).max(10.0), row.h),
+                &TextStyle::new(12.0, color),
+            );
+            if ui.pill_button(choose, "Choose", Some(Icon::Grid), ButtonStyle::filled(Color::white(0.10))) {
+                self.radial_slot = Some(i);
+                self.picker = true;
+                self.scroll = 0.0;
+                self.pick_scroll = 0.0;
+                self.focus = Focus::None;
+                ui.fx.keyboard_focus = Some(false);
+                self.load_apps();
+            }
+            if !item.is_empty() {
+                let rm = Rect::new(row.right() - 36.0, row.y + 4.0, 28.0, row.h - 8.0);
+                if ui.icon_button(rm, Icon::Close, ButtonStyle::filled(Color::white(0.08)).fg(palette::TEXT_DIM)) {
+                    let mut next = apps.clone();
+                    next[i].clear();
+                    put(ui, "radial", "apps", list_value(&next));
+                }
+            }
         }
     }
 

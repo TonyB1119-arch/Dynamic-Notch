@@ -531,6 +531,9 @@ pub struct App {
     trim_at: Option<Instant>,
     dock: Option<crate::dock::Dock>,
     launcher: Option<crate::launcher::Launcher>,
+    radial: Option<crate::radial::Radial>,
+    /// The radial menu's option hid the Windows taskbar.
+    radial_hid: bool,
     /// No spring is moving: the backdrop blur may be shown.
     settled: bool,
     region: Option<(i32, i32, i32, i32)>,
@@ -659,6 +662,8 @@ impl App {
             trim_at: None,
             dock: None,
             launcher: None,
+            radial: None,
+            radial_hid: false,
             settled: true,
             region: None,
             region_anim: None,
@@ -692,6 +697,7 @@ impl App {
     pub fn start(&mut self) {
         self.place();
         self.dock_apply();
+        self.sync_taskbar();
         self.tray = Some(Tray::new(self.hwnd));
         self.register_hotkeys();
         unsafe {
@@ -754,6 +760,10 @@ impl App {
             }
         }
         hotkeys::unregister_all(self.hwnd);
+        if self.radial_hid {
+            self.radial_hid = false;
+            crate::taskbar::recover_taskbar();
+        }
         unsafe {
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
         }
@@ -1880,6 +1890,7 @@ impl App {
             Action::Launcher => self.launcher_toggle(),
             Action::LauncherClip => self.launcher_clip_toggle(),
             Action::LauncherAi => self.launcher_ai_toggle(),
+            Action::Radial => self.radial_toggle(),
             Action::WindowMax => hotkeys::maximize_active(),
             Action::WindowClose => hotkeys::close_active(),
             Action::Combo(i) => {
@@ -2003,6 +2014,7 @@ impl App {
                 crate::ui::set_look(&self.cfg.appearance.look);
                 crate::ui::set_mono_icons(self.cfg.appearance.mono_icons);
                 self.dock_apply();
+                self.sync_taskbar();
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
                 }
@@ -2034,6 +2046,7 @@ impl App {
                 self.cfg.hotkeys.launcher_ai.as_str(),
                 self.cfg.hotkeys.window_max.as_str(),
                 self.cfg.hotkeys.window_close.as_str(),
+                self.cfg.hotkeys.radial.as_str(),
             ],
         );
         self.hotkeys = ok;
@@ -3790,6 +3803,52 @@ impl App {
         }
     }
 
+    /// Messages for the radial menu's own window.
+    pub fn radial_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let r = self.radial.as_mut()?;
+        r.handle(&self.gfx, msg, wp, lp)
+    }
+
+    /// The radial menu hotkey: the menu of apps around the pointer, or put it away again.
+    fn radial_toggle(&mut self) {
+        if !self.cfg.radial.enabled {
+            return;
+        }
+        if self.radial.is_none() {
+            match crate::radial::Radial::new(&self.gfx, self.host.compositor.clone()) {
+                Ok(r) => self.radial = Some(r),
+                Err(e) => {
+                    log!("radial menu failed to start: {e}");
+                    return;
+                }
+            }
+        }
+        // if Explorer brought the taskbar back in the meantime, it goes away again
+        if self.cfg.radial.hide_taskbar {
+            crate::taskbar::hide_taskbar();
+        }
+        let (cfg, url, scale) =
+            (self.cfg.radial.clone(), self.cfg.launcher.search_url.clone(), self.cfg.appearance.scale);
+        if let Some(r) = self.radial.as_mut() {
+            r.configure(cfg, url, scale);
+            r.toggle(&self.gfx);
+        }
+    }
+
+    /// The radial menu's taskbar option: hide the Windows taskbar, or give it back.
+    fn sync_taskbar(&mut self) {
+        if self.cfg.radial.enabled && self.cfg.radial.hide_taskbar {
+            crate::taskbar::hide_taskbar();
+            self.radial_hid = true;
+        } else if self.radial_hid {
+            self.radial_hid = false;
+            // the dock may still want it hidden
+            if !self.cfg.dock.hide_taskbar {
+                crate::taskbar::recover_taskbar();
+            }
+        }
+    }
+
     /// Messages for the dock's own window.
     pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hidden = self.fs_hidden;
@@ -3867,6 +3926,9 @@ impl App {
             }
             if let Some(l) = self.launcher.as_mut() {
                 l.recover(&self.gfx);
+            }
+            if let Some(r) = self.radial.as_mut() {
+                r.recover(&self.gfx);
             }
             self.snap_all = None;
             self.snap_pages = None;
