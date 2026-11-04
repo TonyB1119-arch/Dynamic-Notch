@@ -1007,7 +1007,7 @@ impl Launcher {
         self.last_tick = now;
         let snap = !self.cfg.animate;
         let open_to = if self.open { 1.0 } else { 0.0 };
-        let dur = if self.open { 0.12 } else { 0.10 };
+        let dur = if self.open { 0.17 } else { 0.14 };
         self.anim = if snap { open_to } else { logic::toward(self.anim, open_to, dt / dur) };
         let lt = self.list_target();
         self.lh = if snap { lt } else { logic::follow(self.lh, lt, dt, 15.0, 0.3) };
