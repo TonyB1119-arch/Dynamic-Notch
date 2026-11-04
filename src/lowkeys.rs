@@ -48,6 +48,8 @@ static CAPTURING: AtomicBool = AtomicBool::new(false);
 static DEADLINE: AtomicU64 = AtomicU64::new(0);
 /// The key that started a combo and has not been let go yet.
 static HELD: AtomicU32 = AtomicU32::new(0);
+/// A combo used Win or Alt: the do-nothing tap is sent again when that key is let go.
+static MASK: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -163,11 +165,18 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
             let vk = k.vkCode;
             match wp.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    if !is_modifier(vk) && on_down(vk) {
+                    if is_modifier(vk) {
+                        // a new chord starts: a key left over from the last one must not count as a repeat
+                        HELD.store(0, Relaxed);
+                    } else if on_down(vk) {
                         return LRESULT(1);
                     }
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
+                    // Win or Alt let go after a combo: the tap goes in first, so no Start menu or menu bar opens
+                    if matches!(vk, 0x5B | 0x5C | 0x12 | 0xA4 | 0xA5) && MASK.swap(false, Relaxed) {
+                        tap();
+                    }
                     if vk != 0 && vk == HELD.load(Relaxed) {
                         HELD.store(0, Relaxed);
                         return LRESULT(1);
@@ -218,10 +227,16 @@ fn swallow(vk: u32, mods: u32) {
     HELD.store(vk, Relaxed);
     if mods & (WIN | ALT) != 0 {
         // without this, letting go of Win (or Alt) would open the Start menu (or a menu bar)
-        let tap = [tap_input(false), tap_input(true)];
-        unsafe {
-            SendInput(&tap, std::mem::size_of::<INPUT>() as i32);
-        }
+        MASK.store(true, Relaxed);
+        tap();
+    }
+}
+
+/// A key press that does nothing, so Windows sees that something else happened while Win (or Alt) was down.
+fn tap() {
+    let keys = [tap_input(false), tap_input(true)];
+    unsafe {
+        SendInput(&keys, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
