@@ -22,7 +22,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::Graphics::Direct2D::ID2D1Geometry;
 use windows::UI::Composition::Compositor;
 
 use crate::config::RadialCfg;
@@ -186,41 +185,38 @@ mod geom {
     }
 }
 
-/// The colours of one look.
+/// The colours of one look (every one is see-through: the blur shows behind it).
 struct Pal {
-    slice: Color,
-    empty: Color,
+    /// The glass disc.
+    tint: Color,
+    rim: Color,
+    /// The round hollow in the middle.
     center: Color,
     /// The slice under the pointer.
     hl: Color,
     ink: Color,
-    /// Text over the slice under the pointer.
-    ink_hl: Color,
     pill: Color,
 }
 
-/// Classic: grey slices, a white slice under the pointer. Tuna: Tuna's dark mode, graphite panels with a
-/// dark blue selection.
+/// Classic: light frosted glass. Tuna: Tuna's dark mode, smoked glass with a dark blue selection.
 fn pal(tuna: bool) -> Pal {
     if tuna {
         Pal {
-            slice: Color::hex(0x151619),
-            empty: Color::hex(0x0F1012),
-            center: Color::hex(0x08090A),
-            hl: Color::hex(0x1F4562),
-            ink: Color::white(0.90),
-            ink_hl: Color::white(0.98),
-            pill: Color::hex(0x151619),
+            tint: Color::hex(0x0E1013).alpha(0.50),
+            rim: Color::white(0.10),
+            center: Color::hex(0x000000).alpha(0.30),
+            hl: Color::hex(0x2A6A9A).alpha(0.55),
+            ink: Color::white(0.92),
+            pill: Color::hex(0x000000).alpha(0.30),
         }
     } else {
         Pal {
-            slice: Color::hex(0x262628),
-            empty: Color::hex(0x171718),
-            center: Color::hex(0x000000),
-            hl: Color::hex(0xECECEE),
-            ink: Color::white(0.86),
-            ink_hl: Color::hex(0x161617),
-            pill: Color::hex(0x2A2A2C),
+            tint: Color::white(0.07),
+            rim: Color::white(0.22),
+            center: Color::hex(0x000000).alpha(0.20),
+            hl: Color::white(0.22),
+            ink: Color::white(0.92),
+            pill: Color::hex(0x000000).alpha(0.22),
         }
     }
 }
@@ -292,8 +288,6 @@ pub struct Radial {
     icons_loaded: bool,
     /// The apps, by slot.
     slots: Vec<Option<Slot>>,
-    /// The 16 slices as shapes (built once; they only change with the list of apps).
-    geo: Vec<ID2D1Geometry>,
 }
 
 impl Radial {
@@ -329,7 +323,6 @@ impl Radial {
             icons: Vec::new(),
             icons_loaded: false,
             slots: Vec::new(),
-            geo: Vec::new(),
         })
     }
 
@@ -337,7 +330,6 @@ impl Radial {
         if self.slots.len() != SLOTS || cfg.apps != self.cfg.apps {
             self.slots = (0..SLOTS).map(|i| cfg.apps.get(i).and_then(|s| make_slot(s))).collect();
             self.icons_loaded = false;
-            self.geo.clear();
         }
         self.cfg = cfg;
         self.search_url = search_url;
@@ -646,30 +638,16 @@ impl Radial {
         let hover_label = self.hover.and_then(|i| self.slots.get(i)).and_then(|s| s.as_ref()).map(|s| s.name.clone());
         {
             let scale = self.scale;
-            let Self { res, slots, icons, geo, hl, .. } = &mut *self;
+            let Self { res, slots, icons, hl, .. } = &mut *self;
             let mut p = Painter::new(dc, gfx, res, scale, 0.0, 0.0);
             p.clear();
             p.set_local(pop, c, c, 0.0, 0.0);
             p.alpha = fade;
 
-            // the slices (their shapes are built once)
-            if geo.len() != SLOTS {
-                geo.clear();
-                for i in 0..SLOTS {
-                    let (r0, r1) = slot_radii(i);
-                    match p.path(|b| sector(b, c, c, r0, r1, slot_angle(i), HW, 8.0)) {
-                        Some(g) => geo.push(g),
-                        None => break,
-                    }
-                }
-            }
-            if geo.len() == SLOTS {
-                for (i, g) in geo.iter().enumerate() {
-                    let fill = if slots[i].is_some() { pl.slice } else { pl.empty };
-                    p.fill_geometry(g, fill.alpha(0.8 * content.max(0.35)));
-                }
-            }
-            p.fill_circle(c, c, R_C, pl.center.alpha(0.55));
+            // one disc of glass with a thin rim, and the round hollow in the middle
+            p.fill_circle(c, c, OUT1, pl.tint.alpha(content.max(0.5)));
+            p.stroke_circle(c, c, OUT1 - 0.5, 1.0, pl.rim);
+            p.fill_circle(c, c, R_C, pl.center);
 
             // the slice that follows the pointer
             if hl.alpha > 0.01 {
@@ -678,20 +656,17 @@ impl Radial {
                 let k = (r1 - r0) * 0.35;
                 let sw = (HW * r0 * 0.9).min(k);
                 if let Some(g) = p.path(|b| sector(b, c, c, r0, r1, hl.a.x, HW, sw.min(10.0))) {
-                    p.fill_geometry(&g, pl.hl.alpha(0.97 * hl.alpha));
+                    p.fill_geometry(&g, pl.hl.alpha(hl.alpha));
                 }
             }
 
             // pictures and names: the picture and its name sit together in the middle of the slice
             p.alpha = fade * content;
-            let hl_mid = polar(c, c, (hl.r0.x + hl.r1.x) * 0.5, hl.a.x);
             for (i, slot) in slots.iter().enumerate() {
                 let Some(slot) = slot else { continue };
                 let (r0, r1) = slot_radii(i);
                 let (mx, my) = polar(c, c, (r0 + r1) * 0.5, slot_angle(i));
-                let d = ((mx - hl_mid.0).powi(2) + (my - hl_mid.1).powi(2)).sqrt();
-                let cover = ((1.0 - d / 46.0).clamp(0.0, 1.0)) * hl.alpha;
-                let ink = pl.ink.lerp(pl.ink_hl, cover);
+                let ink = pl.ink;
                 let size = if i < 8 { 40.0 } else { 44.0 };
                 let top = my - size * 0.5;
                 let ir = Rect::new(mx - size * 0.5, top, size, size);
