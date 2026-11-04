@@ -57,6 +57,8 @@ const T_FREE: usize = 4;
 const T_FLASH: usize = 5;
 /// Live blur: the screen behind is looked at again.
 const T_LIVE: usize = 6;
+/// Colour picker: the pixels around the pointer are looked at again.
+const T_PICK: usize = 7;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
 /// Gemini has sent more of the answer.
@@ -421,6 +423,36 @@ enum Focus {
     Action,
 }
 
+/// Pixels across the little magnifier of the colour picker (odd, so one is in the middle).
+const PICK_N: i32 = 11;
+
+/// The colour picker: what is under the pointer, live.
+struct Pick {
+    /// The pixels around the pointer (`PICK_N` x `PICK_N`, 0x00RRGGBB); the middle one is the pick.
+    cells: Vec<u32>,
+    /// Which way of writing it is chosen on the right: 0 HEX, 1 RGB, 2 HSL.
+    row: usize,
+}
+
+impl Pick {
+    fn rgb(&self) -> (u8, u8, u8) {
+        let v = self.cells.get(self.cells.len() / 2).copied().unwrap_or(0);
+        (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+    }
+
+    /// The colour written out the three ways: (what is shown, what is copied).
+    fn texts(&self) -> [(String, String); 3] {
+        let c = self.rgb();
+        let hex = conv::hex(c);
+        let (h, sa, l) = conv::hsl(c);
+        [
+            (hex.clone(), hex),
+            (format!("{}, {}, {}", c.0, c.1, c.2), format!("rgb({}, {}, {})", c.0, c.1, c.2)),
+            (format!("{h}\u{b0}, {sa}%, {l}%"), format!("hsl({h}, {sa}%, {l}%)")),
+        ]
+    }
+}
+
 type Slot = Arc<Mutex<Option<Vec<Entry>>>>;
 
 pub struct Launcher {
@@ -492,6 +524,8 @@ pub struct Launcher {
     pending: Option<(Act, Hit)>,
     /// A command that asked for a second Enter.
     armed: Option<String>,
+    /// The colour picker, while it is open.
+    pick: Option<Pick>,
     /// Quick notes (newest first) and how they are shown.
     notes: Vec<(u64, String)>,
     notes_text: String,
@@ -556,6 +590,7 @@ impl Launcher {
             live: false,
             pending: None,
             armed: None,
+            pick: None,
             notes: Vec::new(),
             notes_text: String::new(),
             texts: HashMap::new(),
@@ -659,6 +694,7 @@ impl Launcher {
         self.ai.q = Glide::new(Q_SIZES[0]);
         self.pending = None;
         self.armed = None;
+        self.stop_pick();
         if self.mode == Mode::Notes {
             self.notes = load_notes();
             self.notes_text = notes_text(&self.notes);
@@ -733,6 +769,7 @@ impl Launcher {
         }
         self.open = false;
         self.flashing = false;
+        self.stop_pick();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), T_ICON);
             let _ = KillTimer(Some(self.hwnd), T_FLASH);
@@ -1433,6 +1470,10 @@ impl Launcher {
             self.kick();
             return;
         }
+        if a == Act::Run && h.kind == Kind::System && h.idx == conv::PICK_COLOR {
+            self.start_pick();
+            return;
+        }
         if a == Act::Run {
             // putting the computer off asks twice
             if conv::SYSTEM.get(h.idx).is_some_and(|c| c.2) && self.armed.as_deref() != Some(h.path.as_str()) {
@@ -1539,6 +1580,10 @@ impl Launcher {
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let has_rows = !self.hits.is_empty();
+        if self.pick.is_some() {
+            self.pick_key(gfx, vk);
+            return;
+        }
         if VIRTUAL_KEY(vk) == VK_TAB {
             // Search -> clipboard -> Gemini (Shift+Tab goes back); Left and Right move between the two boxes
             self.mode = self.mode.cycle(shift);
@@ -1677,8 +1722,72 @@ impl Launcher {
         self.draw(gfx);
     }
 
+    /// The colour picker opens in place of the two boxes' contents: the pointer can go anywhere on the
+    /// screen and the boxes show what is under it; Enter copies it.
+    fn start_pick(&mut self) {
+        self.pick = Some(Pick { cells: vec![0; (PICK_N * PICK_N) as usize], row: 0 });
+        self.list_open = false;
+        self.sample();
+        self.sw = if self.cfg.animate { 0.0 } else { 1.0 };
+        self.sw_dir = 1.0;
+        unsafe {
+            SetTimer(Some(self.hwnd), T_PICK, 40, None);
+        }
+        self.kick();
+    }
+
+    fn stop_pick(&mut self) {
+        if self.pick.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_PICK);
+            }
+        }
+    }
+
+    /// Look at the pixels around the pointer again.
+    fn sample(&mut self) {
+        let Some(pk) = self.pick.as_mut() else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let half = PICK_N / 2;
+        if let Some(shot) = crate::refract::grab(pt.x - half, pt.y - half, PICK_N, PICK_N) {
+            if shot.px.len() == pk.cells.len() {
+                pk.cells.copy_from_slice(&shot.px);
+            }
+        }
+    }
+
+    /// Keys while the colour picker is open: Up and Down choose the way of writing, Enter copies it, Esc goes back.
+    fn pick_key(&mut self, gfx: &Gfx, vk: u16) {
+        match VIRTUAL_KEY(vk) {
+            VK_ESCAPE => self.stop_pick(),
+            VK_UP | VK_DOWN => {
+                if let Some(pk) = self.pick.as_mut() {
+                    pk.row = if VIRTUAL_KEY(vk) == VK_UP { (pk.row + 2) % 3 } else { (pk.row + 1) % 3 };
+                }
+            }
+            VK_RETURN => {
+                if let Some(pk) = &self.pick {
+                    let copy = pk.texts()[pk.row.min(2)].1.clone();
+                    clip::set_text(self.hwnd, &copy);
+                }
+                self.stop_pick();
+                self.hide();
+                return;
+            }
+            _ => return,
+        }
+        self.draw(gfx);
+    }
+
     fn typed(&mut self, gfx: &Gfx, c: char) {
-        if c.is_control() || (c == ' ' && self.query.is_empty()) || self.query.chars().count() >= self.query_limit() {
+        if self.pick.is_some()
+            || c.is_control()
+            || (c == ' ' && self.query.is_empty())
+            || self.query.chars().count() >= self.query_limit()
+        {
             return;
         }
         self.query.push(c);
@@ -1815,6 +1924,13 @@ impl Launcher {
                 }
                 if self.flashing {
                     self.hide();
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == T_PICK => {
+                if self.visible && self.pick.is_some() {
+                    self.sample();
+                    self.draw(gfx);
                 }
                 Some(LRESULT(0))
             }
@@ -2052,7 +2168,9 @@ impl Launcher {
             let keep = p.alpha;
             p.alpha = keep * (0.25 + 0.75 * sw);
             card_xf(&mut p, &ct);
-            if matches!(self.mode, Mode::Ai | Mode::Notes) {
+            if let Some(pk) = self.pick.as_ref() {
+                draw_pick(&mut p, sub, act, pk);
+            } else if matches!(self.mode, Mode::Ai | Mode::Notes) {
                 let notes = self.mode == Mode::Notes;
                 let qh = text_hash(&self.query);
                 if qh != self.ai.q.fit_for || self.query.is_empty() {
@@ -2141,7 +2259,7 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE] {
+            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK] {
                 let _ = KillTimer(Some(self.hwnd), t);
             }
             let _ = DestroyWindow(self.hwnd);
@@ -2556,6 +2674,63 @@ fn draw_ai(p: &mut Painter, sub: Rect, act: Rect, v: &AiView) -> f32 {
 }
 
 /// The glyph of a system command.
+/// The colour picker: a magnified look at the pixels around the pointer on the left (the one in the
+/// middle is the pick) with its hex code, and the colour written out three ways on the right.
+fn draw_pick(p: &mut Painter, sub: Rect, act: Rect, pk: &Pick) {
+    let n = PICK_N as usize;
+    let cell = 10.0;
+    let side = cell * n as f32;
+    let grid = Rect::new(sub.cx() - side * 0.5, sub.y + 12.0, side, side);
+    p.push_clip(grid);
+    for (i, &v) in pk.cells.iter().enumerate() {
+        let c = Color::rgba(
+            ((v >> 16) & 0xFF) as f32 / 255.0,
+            ((v >> 8) & 0xFF) as f32 / 255.0,
+            (v & 0xFF) as f32 / 255.0,
+            1.0,
+        );
+        p.fill_rect(Rect::new(grid.x + (i % n) as f32 * cell, grid.y + (i / n) as f32 * cell, cell, cell), c);
+    }
+    p.pop_clip();
+    p.stroke_rounded(grid.expand(1.0), 3.0, 2.0, white(0.35));
+    // the middle pixel is the pick: a frame in whichever of black and white shows on it
+    let (r, g, b) = pk.rgb();
+    let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    let mid = Rect::new(grid.x + (n / 2) as f32 * cell, grid.y + (n / 2) as f32 * cell, cell, cell);
+    p.stroke_rounded(
+        mid.expand(1.0),
+        1.5,
+        2.0,
+        if lum > 140.0 { Color::rgba(0.0, 0.0, 0.0, 0.85) } else { Color::white(0.95) },
+    );
+    let texts = pk.texts();
+    p.text(
+        &texts[0].0,
+        Rect::new(sub.x + 8.0, grid.y + side + 8.0, sub.w - 16.0, 28.0),
+        &TextStyle::new(20.0, white(0.95)).semibold().center(),
+    );
+    // the three ways of writing it
+    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    for (i, (label, (shown, _))) in ["HEX", "RGB", "HSL"].iter().zip(texts.iter()).enumerate() {
+        let row = Rect::new(act.x + 10.0, act.y + 12.0 + i as f32 * 46.0, act.w - 20.0, 42.0);
+        if i == pk.row {
+            p.fill_rounded(row, 12.0, sel_fill(light, 0.8));
+            p.stroke_rounded(row.inset(0.5), 11.5, 1.0, sel_rim(light).lerp(Color::rgba(0.0, 0.0, 0.0, 0.0), 0.6));
+        }
+        p.text(label, Rect::new(row.x + 12.0, row.y + 5.0, row.w - 24.0, 14.0), &TextStyle::new(10.5, white(0.55)));
+        p.text(
+            shown,
+            Rect::new(row.x + 12.0, row.y + 19.0, row.w - 24.0, 20.0),
+            &TextStyle::new(14.0, white(0.95)).semibold(),
+        );
+    }
+    p.text(
+        "Enter copies \u{b7} Esc back",
+        Rect::new(act.x + 10.0, act.y + 12.0 + 3.0 * 46.0, act.w - 20.0, 16.0),
+        &TextStyle::new(10.0, white(0.5)).center(),
+    );
+}
+
 fn sys_icon(i: usize) -> Icon {
     match i {
         0 => Icon::Lock,
@@ -2565,6 +2740,7 @@ fn sys_icon(i: usize) -> Icon {
         4 => Icon::Bolt,
         5 => Icon::Close,
         6 => Icon::Trash,
+        8 => Icon::Image,
         _ => Icon::Brightness,
     }
 }
@@ -3668,7 +3844,64 @@ mod conv {
         ("Sign out", "sign out|signout|log out|logout|log off|logoff", true),
         ("Empty Recycle Bin", "empty recycle bin|empty trash|recycle bin|recycle|trash|bin|empty bin", true),
         ("Toggle dark mode", "dark mode|light mode|toggle dark mode|toggle theme|theme", false),
+        (
+            "Pick a color",
+            "color pick|color picker|colour pick|colour picker|pick color|pick colour|eyedropper|eye dropper",
+            false,
+        ),
     ];
+
+    /// The place of the colour picker in `SYSTEM`: it opens inside the launcher instead of running.
+    pub const PICK_COLOR: usize = 8;
+
+    /// `#RRGGBB`.
+    pub fn hex(c: (u8, u8, u8)) -> String {
+        format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2)
+    }
+
+    /// Hue (degrees), saturation and lightness (percent), rounded.
+    pub fn hsl(c: (u8, u8, u8)) -> (u32, u32, u32) {
+        let (r, g, b) = (c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0);
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        let l = (mx + mn) * 0.5;
+        let d = mx - mn;
+        if d < 1e-6 {
+            return (0, 0, (l * 100.0).round() as u32);
+        }
+        let s = d / (1.0 - (2.0 * l - 1.0).abs());
+        let h = if mx == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if mx == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        (((h * 60.0).round() as u32) % 360, (s * 100.0).round() as u32, (l * 100.0).round() as u32)
+    }
+
+    #[cfg(test)]
+    mod colour_tests {
+        use super::*;
+
+        #[test]
+        fn colours_are_written_out() {
+            assert_eq!(hex((255, 136, 0)), "#FF8800");
+            assert_eq!(hex((0, 0, 0)), "#000000");
+            assert_eq!(hsl((255, 136, 0)), (32, 100, 50));
+            assert_eq!(hsl((0, 0, 255)), (240, 100, 50));
+            assert_eq!(hsl((255, 0, 0)), (0, 100, 50));
+            assert_eq!(hsl((128, 128, 128)), (0, 0, 50));
+            assert_eq!(hsl((255, 255, 255)), (0, 0, 100));
+            assert_eq!(hsl((0, 0, 0)), (0, 0, 0));
+            // a red with a touch of blue sits just below the top of the wheel; a hair more rounds to the top
+            assert_eq!(hsl((255, 0, 3)).0, 359);
+            assert_eq!(hsl((255, 0, 1)).0, 0);
+            assert_eq!(system("color pick"), vec![PICK_COLOR]);
+            assert_eq!(system("colo"), vec![PICK_COLOR]);
+            assert_eq!(system("eyedr"), vec![PICK_COLOR]);
+            assert!(system("co").is_empty());
+        }
+    }
 
     /// The commands the typed text asks for (at least three letters, the start of what they are called).
     pub fn system(q: &str) -> Vec<usize> {
