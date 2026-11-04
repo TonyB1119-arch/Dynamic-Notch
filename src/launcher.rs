@@ -449,7 +449,7 @@ enum Focus {
 }
 
 /// How long the old contents take to swell and shrink away when Tab changes the mode (seconds).
-const SWITCH_OUT: f32 = 0.20;
+const SWITCH_OUT: f32 = 0.11;
 
 /// A mode change in progress: the contents of both boxes swell a little and shrink away into the middle of
 /// their box (`t` runs 0 to 1); then `to` takes over and its contents grow back out of the middle.
@@ -916,6 +916,16 @@ impl Launcher {
         }
     }
 
+    /// How big the whole card is while it opens (from 85%, swinging a little past 100% on the way) or
+    /// closes (it drifts out to 102% as it fades).
+    fn open_scale(&self) -> f32 {
+        if self.open {
+            0.85 + 0.15 * logic::ease_spring(self.anim)
+        } else {
+            1.0 + 0.02 * (1.0 - logic::ease_out(self.anim))
+        }
+    }
+
     /// How tall the list wants to be.
     fn list_target(&self) -> f32 {
         let rows = self.rows_len();
@@ -957,19 +967,19 @@ impl Launcher {
         self.last_tick = now;
         let snap = !self.cfg.animate;
         let open_to = if self.open { 1.0 } else { 0.0 };
-        let dur = if self.open { 0.20 } else { 0.13 };
+        let dur = if self.open { 0.12 } else { 0.10 };
         self.anim = if snap { open_to } else { logic::toward(self.anim, open_to, dt / dur) };
         let lt = self.list_target();
         self.lh = if snap { lt } else { logic::follow(self.lh, lt, dt, 15.0, 0.3) };
         self.ul = if snap { 1.0 } else { logic::toward(self.ul, 1.0, dt / 0.32) };
-        self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.30) };
-        self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.30) };
-        self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.34) };
+        self.pop_s = if snap { 1.0 } else { logic::toward(self.pop_s, 1.0, dt / 0.13) };
+        self.pop_a = if snap { 1.0 } else { logic::toward(self.pop_a, 1.0, dt / 0.13) };
+        self.sw = if snap { 1.0 } else { logic::toward(self.sw, 1.0, dt / 0.16) };
         if let Some(sw) = self.switch.as_mut() {
             sw.t = if snap { 1.0 } else { (sw.t + dt / SWITCH_OUT).min(1.0) };
         }
         let kt = self.kw_target();
-        self.kw = if snap { kt } else { logic::follow(self.kw, kt, dt, 14.0, 0.004) };
+        self.kw = if snap { kt } else { logic::follow(self.kw, kt, dt, 24.0, 0.004) };
         let (gc, gr) = self.gauge_goal();
         self.cpu_s = if snap { gc } else { logic::follow(self.cpu_s, gc, dt, 8.0, 0.002) };
         self.ram_s = if snap { gr } else { logic::follow(self.ram_s, gr, dt, 8.0, 0.002) };
@@ -2407,6 +2417,7 @@ impl Launcher {
         let light = self.cfg.light;
         let sc = self.scale;
         let e = logic::ease_out(self.anim);
+        let open_s = self.open_scale();
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
         self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
@@ -2417,7 +2428,7 @@ impl Launcher {
         // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
         if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
-            let s0 = 0.95 + 0.05 * e;
+            let s0 = self.open_scale();
             let (ax, ay) = (W * 0.5, FRAME_H * 0.5);
             let map = |r: Rect| {
                 Rect::new(
@@ -2454,23 +2465,23 @@ impl Launcher {
             p.clear();
             p.alpha = e;
             // opening: appears where it is, fading in while growing from 95% around its middle; closing runs it backwards
-            let tr = Tr { s0: 0.95 + 0.05 * e, top: 0.0, dx: 0.0, k: 1.0, kx: 0.0, ky: 0.0 };
+            let tr = Tr { s0: open_s, top: 0.0, dx: 0.0, k: 1.0, kx: 0.0, ky: 0.0 };
             // changing the mode: the old contents swell a little, then shrink away into the middle of their
             // box; the new ones grow out of the middle (with a small overshoot)
             let (pop, fade) = match &self.switch {
                 Some(sw) => {
                     let t = sw.t.clamp(0.0, 1.0);
                     let k = if t < 0.25 {
-                        1.0 + 0.12 * logic::ease_out(t / 0.25)
+                        1.0 + 0.05 * logic::ease_out(t / 0.25)
                     } else {
                         let u = (t - 0.25) / 0.75;
-                        1.12 * (1.0 - u * u * u)
+                        1.05 * (1.0 - u * u * u)
                     };
                     (k, 1.0 - ((t - 0.5) / 0.5).clamp(0.0, 1.0))
                 }
                 None => {
                     let sw = self.sw.clamp(0.0, 1.0);
-                    (0.15 + 0.85 * logic::ease_back(sw), logic::ease_out((sw * 2.0).min(1.0)))
+                    (0.45 + 0.55 * logic::ease_out(sw), logic::ease_out((sw * 2.0).min(1.0)))
                 }
             };
             let ct = Tr { ..tr };
@@ -2983,7 +2994,7 @@ fn draw_subject(p: &mut Painter, r: Rect, v: &Look) {
     let a0 = p.alpha;
     // a new match pops in: the picture swells from 80% with a little overshoot, the words fade up
     let fade = logic::ease_out((v.pop * 1.6).min(1.0));
-    let k = 0.80 + 0.20 * logic::ease_back(v.pop);
+    let k = 0.50 + 0.50 * logic::ease_out(v.pop);
     let slide = (1.0 - fade) * 5.0;
     if h.kind == Kind::Weather {
         let icon = Rect::centered(cx, r.y + 44.0, 60.0, 60.0);
@@ -3261,7 +3272,7 @@ fn draw_target(p: &mut Painter, r: Rect, cur: Option<&Hit>, icon: Option<&ImageD
         return;
     };
     let fade = logic::ease_out((pop * 1.6).min(1.0));
-    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    let k = 0.50 + 0.50 * logic::ease_out(pop);
     let ir = Rect::centered(r.cx(), r.y + 62.0, 56.0, 56.0);
     pop_xf(p, tr, k, r.cx(), ir.cy());
     p.alpha = a0 * (0.3 + 0.7 * fade);
@@ -3284,7 +3295,7 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, armed: b
     let a = acts[act.min(acts.len() - 1)];
     let a0 = p.alpha;
     let fade = logic::ease_out((pop * 1.6).min(1.0));
-    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    let k = 0.50 + 0.50 * logic::ease_out(pop);
     let ir = Rect::centered(cx, r.y + 68.0, 56.0, 56.0);
     pop_xf(p, tr, k, cx, ir.cy());
     p.alpha = a0 * (0.3 + 0.7 * fade);
@@ -3355,7 +3366,7 @@ fn draw_proc(p: &mut Painter, r: Rect, h: &Hit, icons: &HashMap<String, Option<I
     let ir = Rect::centered(cx, r.y + 52.0, 56.0, 56.0);
     let a0 = p.alpha;
     let fade = logic::ease_out((pop * 1.6).min(1.0));
-    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    let k = 0.50 + 0.50 * logic::ease_out(pop);
     pop_xf(p, tr, k, cx, ir.cy());
     p.alpha = a0 * (0.3 + 0.7 * fade);
     draw_thumb(p, ir, h, icons.get(&h.path).and_then(|o| o.as_ref()), None);
@@ -3386,7 +3397,7 @@ fn draw_kill(p: &mut Painter, b: [Rect; 3], v: &KillView, only: Option<Rect>, tr
         let r = b[0];
         let cx = r.cx();
         let ir = Rect::centered(cx, r.y + 68.0, 56.0, 56.0);
-        let k = 0.80 + 0.20 * logic::ease_back(v.pop_a);
+        let k = 0.50 + 0.50 * logic::ease_out(v.pop_a);
         pop_xf(p, tr, k, cx, ir.cy());
         p.icon(Icon::Stop, ir, white(0.92));
         card_xf(p, tr);
@@ -5463,6 +5474,12 @@ mod logic {
     }
 
     /// Like `ease_out`, but swings a little past 1 before settling.
+    pub fn ease_spring(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0) - 1.0;
+        1.0 + 4.0 * t * t * t + 3.0 * t * t
+    }
+
+    #[allow(dead_code)]
     pub fn ease_back(t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0) - 1.0;
         1.0 + 2.70158 * t * t * t + 1.70158 * t * t
