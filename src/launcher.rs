@@ -3617,7 +3617,7 @@ fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
 /// Start something with administrator rights. Windows asks for confirmation in its own window; this
 /// goes through a helper process so the notch is not held up while that question is open.
 /// The screen behind the window (`w` x `h` pixels at `x`, `y`), blurred as much as `blur` (0 - 1) says.
-fn capture_blur(x: i32, y: i32, w: i32, h: i32, blur: f32) -> Option<ImageData> {
+pub fn capture_blur(x: i32, y: i32, w: i32, h: i32, blur: f32) -> Option<ImageData> {
     let shot = crate::refract::grab(x, y, w, h)?;
     // shrunk 4 times first: the blur works on a sixteenth of the pixels and still looks the same
     let (k, r) = if blur < 0.02 { (1, 0) } else { (4, (1.0 + blur * 7.0).round() as usize) };
