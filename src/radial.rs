@@ -427,7 +427,7 @@ impl Radial {
             let disc = if self.single { SINGLE1 + 2.0 } else { OUT1 };
             let d = (disc * 2.0 * self.scale).ceil() as i32;
             let (x, y, side, _) = self.win_px;
-            self.blur_img = crate::launcher::capture_blur(x + (side - d) / 2, y + (side - d) / 2, d, d, 1.6);
+            self.blur_img = crate::launcher::capture_blur(x + (side - d) / 2, y + (side - d) / 2, d, d, self.cfg.blur);
         }
         unsafe {
             if !again {
