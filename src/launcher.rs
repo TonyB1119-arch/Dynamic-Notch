@@ -2286,7 +2286,8 @@ fn sel_fill(light: bool, k: f32) -> Color {
     if light {
         Color::rgba(0.50, 0.74, 1.0, 0.62 * k)
     } else {
-        Color::rgba(0.34, 0.62, 1.0, 0.60 * k)
+        // #15334b, nearly opaque so it shows as that colour
+        Color::rgba(0.082, 0.200, 0.294, 0.88 * k)
     }
 }
 
@@ -2295,7 +2296,7 @@ fn sel_rim(light: bool) -> Color {
     if light {
         Color::rgba(0.70, 0.86, 1.0, 0.95)
     } else {
-        Color::rgba(0.68, 0.84, 1.0, 0.85)
+        Color::rgba(0.36, 0.56, 0.78, 0.80)
     }
 }
 
