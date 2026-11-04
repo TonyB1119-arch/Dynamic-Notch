@@ -19,6 +19,7 @@ mod launcher;
 mod lowkeys;
 mod modules;
 mod pacer;
+mod procs;
 mod refract;
 mod sys;
 mod taskbar;

@@ -45,6 +45,7 @@ use windows::UI::Composition::Compositor;
 use crate::config::{GeminiCfg, LauncherCfg};
 use crate::gfx::{Gfx, Icon, ImageData, Painter, Res, TextStyle};
 use crate::host::Host;
+use crate::procs;
 use crate::modules::weather::Brief;
 use crate::sys::{self, clip, dragdrop};
 use crate::util::{app_dir, Color, Rect, SendHwnd};
@@ -67,12 +68,18 @@ const WM_INDEX: u32 = WM_APP + 31;
 const WM_AI: u32 = WM_APP + 32;
 /// Today's exchange rates have arrived.
 const WM_RATES: u32 = WM_APP + 33;
+/// The programs have been looked at again (Kill mode).
+const WM_PROCS: u32 = WM_APP + 34;
 
 // -- layout (dips) -------------------------------------------------------------------------------------
 const PAD: f32 = 14.0;
 const BOX: f32 = 172.0;
 const GAP: f32 = 10.0;
 const W: f32 = PAD * 2.0 + BOX * 2.0 + GAP;
+/// The Kill mode has a third box: the card grows by this much on each side.
+const E: f32 = (BOX + GAP) * 0.5;
+/// The window is as wide as the card with three boxes; the card is narrower in the other modes.
+const W3: f32 = W + BOX + GAP;
 const FRAME_H: f32 = BOX + PAD * 2.0;
 const HEAD: f32 = 30.0;
 const ROW: f32 = 46.0;
@@ -110,6 +117,8 @@ enum Kind {
     System,
     /// An emoji or symbol (its `path` is the character).
     Emoji,
+    /// A running program (its `path` is where it lives, or just its file name).
+    Process,
 }
 
 impl Kind {
@@ -126,10 +135,11 @@ impl Kind {
             Kind::Clip => "Clipboard",
             Kind::System => "System",
             Kind::Emoji => "Emoji",
+            Kind::Process => "Program",
         }
     }
     fn has_icon(self) -> bool {
-        matches!(self, Kind::App | Kind::Folder | Kind::File)
+        matches!(self, Kind::App | Kind::Folder | Kind::File | Kind::Process)
     }
 }
 
@@ -159,6 +169,8 @@ enum Act {
     Uninstall,
     PasteEmoji,
     CopyEmoji,
+    /// End the program.
+    Kill,
 }
 
 impl Act {
@@ -185,6 +197,7 @@ impl Act {
             Act::Uninstall => "Uninstall",
             Act::PasteEmoji => "Paste",
             Act::CopyEmoji => "Copy",
+            Act::Kill => "Kill",
         }
     }
     fn icon(self) -> Icon {
@@ -208,6 +221,7 @@ impl Act {
             Act::Run => Icon::Bolt,
             Act::Uninstall => Icon::Trash,
             Act::PasteEmoji => Icon::Clipboard,
+            Act::Kill => Icon::Stop,
         }
     }
 }
@@ -225,6 +239,7 @@ fn actions(h: &Hit) -> &'static [Act] {
         Kind::Clip => &[Act::Paste, Act::CopyClip, Act::DeleteClip],
         Kind::System => &[Act::Run],
         Kind::Emoji => &[Act::PasteEmoji, Act::CopyEmoji],
+        Kind::Process => &[Act::Kill],
     }
 }
 
@@ -268,14 +283,16 @@ enum Mode {
     Ai,
     Notes,
     Emoji,
+    /// Ending programs.
+    Kill,
 }
 
 impl Mode {
     /// The next mode (or the one before) when Tab (Shift+Tab) is pressed.
     fn cycle(self, back: bool) -> Mode {
-        const ORDER: [Mode; 5] = [Mode::Search, Mode::Clip, Mode::Ai, Mode::Notes, Mode::Emoji];
+        const ORDER: [Mode; 6] = [Mode::Search, Mode::Clip, Mode::Ai, Mode::Kill, Mode::Emoji, Mode::Notes];
         let i = ORDER.iter().position(|m| *m == self).unwrap_or(0);
-        ORDER[(i + if back { 4 } else { 1 }) % 5]
+        ORDER[(i + if back { 5 } else { 1 }) % 6]
     }
 }
 
@@ -491,6 +508,17 @@ pub struct Launcher {
     scale: f32,
     win_px: (i32, i32, i32, i32),
     region_h: i32,
+    region_x: i32,
+    // the Kill mode: the programs as last looked at, and the numbers the gauges glide to
+    sampler: Option<procs::Sampler>,
+    snap: Option<procs::Snap>,
+    procs_slot: procs::Slot,
+    /// How far the card has grown to three boxes (0 to 1).
+    kw: f32,
+    cpu_s: f32,
+    ram_s: f32,
+    /// How far the Kill box has turned red (asked once).
+    arm_t: f32,
     // what can be found
     apps: Vec<Entry>,
     files: Vec<Entry>,
@@ -575,6 +603,14 @@ impl Launcher {
             scale: 1.0,
             win_px: (0, 0, 0, 0),
             region_h: -1,
+            region_x: 0,
+            sampler: None,
+            snap: None,
+            procs_slot: Arc::new(Mutex::new(None)),
+            kw: 0.0,
+            cpu_s: 0.0,
+            ram_s: 0.0,
+            arm_t: 0.0,
             apps: Vec::new(),
             files: Vec::new(),
             apps_ready: false,
@@ -727,6 +763,7 @@ impl Launcher {
             self.notes_text = notes_text(&self.notes);
         }
         // nothing typed yet: the apps used most are what the Down arrow lists (a combo shows its own thing)
+        self.sync_procs();
         if let Some(h) = self.pinned.take() {
             self.hits.push(h);
         } else {
@@ -811,6 +848,12 @@ impl Launcher {
         self.visible = false;
         self.pending = None;
         self.armed = None;
+        self.sampler = None;
+        self.snap = None;
+        self.kw = 0.0;
+        self.cpu_s = 0.0;
+        self.ram_s = 0.0;
+        self.arm_t = 0.0;
         if self.live {
             self.live = false;
             unsafe {
@@ -857,6 +900,26 @@ impl Launcher {
         }
     }
 
+    /// The card has three boxes in the Kill mode.
+    fn kw_target(&self) -> f32 {
+        if self.mode == Mode::Kill {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// What the processor and memory gauges are heading for (0 to 1).
+    fn gauge_goal(&self) -> (f32, f32) {
+        match &self.snap {
+            Some(s) if self.mode == Mode::Kill => {
+                let ram = if s.ram_total > 0 { s.ram_used as f32 / s.ram_total as f32 } else { 0.0 };
+                (s.cpu, ram)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
     /// How tall the list wants to be.
     fn list_target(&self) -> f32 {
         let rows = self.rows_len();
@@ -881,6 +944,11 @@ impl Launcher {
             || self.pop_a < 1.0
             || self.sw < 1.0
             || self.switch.is_some()
+            || (self.kw - self.kw_target()).abs() > 0.004
+            || (self.mode == Mode::Kill
+                && ((self.cpu_s - self.gauge_goal().0).abs() > 0.002
+                    || (self.ram_s - self.gauge_goal().1).abs() > 0.002
+                    || (self.arm_t - if self.armed.is_some() { 1.0 } else { 0.0 }).abs() > 0.01))
             || (matches!(self.mode, Mode::Ai | Mode::Notes) && self.ai.moving())
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
@@ -904,6 +972,13 @@ impl Launcher {
         if let Some(sw) = self.switch.as_mut() {
             sw.t = if snap { 1.0 } else { (sw.t + dt / SWITCH_OUT).min(1.0) };
         }
+        let kt = self.kw_target();
+        self.kw = if snap { kt } else { logic::follow(self.kw, kt, dt, 14.0, 0.004) };
+        let (gc, gr) = self.gauge_goal();
+        self.cpu_s = if snap { gc } else { logic::follow(self.cpu_s, gc, dt, 8.0, 0.002) };
+        self.ram_s = if snap { gr } else { logic::follow(self.ram_s, gr, dt, 8.0, 0.002) };
+        let at = if self.armed.is_some() { 1.0 } else { 0.0 };
+        self.arm_t = if snap { at } else { logic::follow(self.arm_t, at, dt, 16.0, 0.01) };
         self.ai.glide(dt, snap);
         let ft = if self.focus == Focus::Action { 1.0 } else { 0.0 };
         self.focus_t = if snap { ft } else { logic::follow(self.focus_t, ft, dt, 18.0, 0.01) };
@@ -931,7 +1006,7 @@ impl Launcher {
             let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             let scale = dx as f32 / 96.0 * ui_scale;
             let work = mi.rcWork;
-            let (wpx, hpx) = ((W * scale).ceil() as i32, (FULL_H * scale).ceil() as i32);
+            let (wpx, hpx) = ((W3 * scale).ceil() as i32, (FULL_H * scale).ceil() as i32);
             let x = (work.left + work.right) / 2 - wpx / 2;
             // the two boxes sit in the middle of the screen (a bit above the exact middle); the list drops below them
             let mid = work.top + ((work.bottom - work.top) as f32 * 0.40) as i32;
@@ -953,16 +1028,21 @@ impl Launcher {
 
     /// Only the glass takes clicks (the boxes and, while it shows, the list below them); the rest of the
     /// window is empty. `list_h` is how tall the floating list is (0 = none).
-    fn set_region(&mut self, list_h: f32) {
+    fn set_region(&mut self, list_h: f32, wide: f32) {
         let (_, _, wpx, hpx) = self.win_px;
         let bottom = if list_h > 0.5 { LIST_Y + list_h } else { FRAME_H };
         let h = ((bottom * self.scale).ceil() as i32).min(hpx);
-        if h == self.region_h || wpx == 0 {
+        // the card sits in the middle of the window; with three boxes it reaches both edges
+        let grown = E * wide.clamp(0.0, 1.0);
+        let l = (((E - grown) * self.scale).floor() as i32).max(0);
+        let r = (((E + W + grown) * self.scale).ceil() as i32).min(wpx);
+        if (h == self.region_h && l == self.region_x) || wpx == 0 {
             return;
         }
         self.region_h = h;
+        self.region_x = l;
         unsafe {
-            let rgn = CreateRectRgn(0, 0, wpx, h);
+            let rgn = CreateRectRgn(l, 0, r, h);
             SetWindowRgn(self.hwnd, Some(rgn), false);
         }
     }
@@ -1023,6 +1103,10 @@ impl Launcher {
                     idx: i,
                 });
             }
+            return;
+        }
+        if self.mode == Mode::Kill {
+            self.kill_search();
             return;
         }
         if self.mode == Mode::Clip {
@@ -1173,6 +1257,99 @@ impl Launcher {
     }
 
     /// Clipboard mode: what was copied (the letters typed narrow it down).
+    /// The Kill mode looks at the programs only while it is showing.
+    fn sync_procs(&mut self) {
+        if self.mode == Mode::Kill {
+            if self.sampler.is_none() {
+                if let Ok(mut g) = self.procs_slot.lock() {
+                    *g = None;
+                }
+                let (s, first) = procs::start(self.procs_slot.clone(), SendHwnd::new(self.hwnd), WM_PROCS);
+                self.sampler = Some(s);
+                self.snap = Some(first);
+            }
+        } else if self.sampler.take().is_some() {
+            self.snap = None;
+        }
+    }
+
+    /// The programs that fit what was typed (with nothing typed: the ones using the most memory).
+    fn kill_search(&mut self) {
+        self.hits.clear();
+        self.wx = None;
+        let Some(snap) = self.snap.as_ref() else { return };
+        for i in procs::rank(&snap.procs, &self.query).into_iter().take(KEEP) {
+            let p = &snap.procs[i];
+            self.hits.push(Hit {
+                name: procs::title(&p.name),
+                detail: format!("{} \u{b7} {} CPU", procs::mem_text(p.mem), procs::cpu_text(p.cpu)),
+                path: if p.path.is_empty() { p.name.clone() } else { p.path.clone() },
+                kind: Kind::Process,
+                spans: Vec::new(),
+                idx: p.count as usize,
+            });
+        }
+    }
+
+    /// New numbers have arrived: the programs are listed again, and the selection stays on its program.
+    fn refresh_procs(&mut self) {
+        let keep = self.hits.get(self.sel).map(|h| h.path.clone());
+        self.kill_search();
+        if let Some(k) = keep {
+            if let Some(i) = self.hits.iter().position(|h| h.path == k) {
+                self.sel = i;
+            }
+        }
+        self.sel = self.sel.min(self.hits.len().saturating_sub(1));
+        self.top = self.top.min(self.hits.len().saturating_sub(VIS));
+        if self.hits.is_empty() {
+            self.list_open = false;
+        }
+        let gone = self.armed.as_ref().is_some_and(|a| !self.hits.iter().any(|h| &h.path == a));
+        if gone {
+            self.armed = None;
+        }
+    }
+
+    /// Enter in the Kill mode: the first press asks, the second ends the program.
+    fn kill_enter(&mut self) {
+        let Some(h) = self.cur().cloned() else { return };
+        if h.kind != Kind::Process {
+            return;
+        }
+        let exe = h.path.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+        if exe.is_empty() || procs::protected(&exe) {
+            self.armed = None;
+            return;
+        }
+        if self.armed.as_deref() != Some(h.path.as_str()) {
+            self.armed = Some(h.path.clone());
+            self.pop_a = 0.0;
+            self.kick();
+            return;
+        }
+        self.armed = None;
+        let name = exe.clone();
+        let _ = std::thread::Builder::new().name("launcher-kill".into()).spawn(move || {
+            taskkill(&name, true);
+        });
+        // it is gone from the boxes and the list at once
+        if let Some(s) = self.snap.as_mut() {
+            s.procs.retain(|p| !p.name.eq_ignore_ascii_case(&exe));
+        }
+        let at = self.sel;
+        self.kill_search();
+        self.sel = at.min(self.hits.len().saturating_sub(1));
+        self.top = self.top.min(self.hits.len().saturating_sub(VIS));
+        if self.hits.is_empty() {
+            self.list_open = false;
+        }
+        self.ul = 0.0;
+        self.pop_s = 0.0;
+        self.pop_a = 0.0;
+        self.kick();
+    }
+
     fn clip_search(&mut self) {
         self.hits.clear();
         self.wx = None;
@@ -1265,6 +1442,7 @@ impl Launcher {
             Focus::Subject => {
                 if i != self.sel {
                     self.sel = i;
+                    self.armed = None;
                     self.act = 0;
                     self.ul = 0.0;
                     self.pop_s = 0.0;
@@ -1567,7 +1745,7 @@ impl Launcher {
                     }
                 }
             }
-            Act::DeleteClip | Act::OpenWith | Act::MoveTo | Act::CopyTo | Act::Run | Act::Uninstall => {}
+            Act::DeleteClip | Act::OpenWith | Act::MoveTo | Act::CopyTo | Act::Run | Act::Uninstall | Act::Kill => {}
             Act::PasteEmoji | Act::CopyEmoji => {
                 clip::set_text(hwnd, &h.path);
                 if a == Act::PasteEmoji {
@@ -1664,6 +1842,27 @@ impl Launcher {
             self.draw(gfx);
             return;
         }
+        if self.mode == Mode::Kill {
+            match VIRTUAL_KEY(vk) {
+                VK_RETURN => {
+                    self.kill_enter();
+                    self.draw(gfx);
+                    return;
+                }
+                // between the two programs the boxes show
+                VK_LEFT | VK_RIGHT => {
+                    if !self.hits.is_empty() && !self.query.trim().is_empty() && !self.list_open {
+                        let page = self.sel & !1;
+                        let to =
+                            if VIRTUAL_KEY(vk) == VK_RIGHT { (page + 1).min(self.hits.len() - 1) } else { page };
+                        self.set_cursor(to);
+                        self.draw(gfx);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match VIRTUAL_KEY(vk) {
             VK_ESCAPE => {
                 if self.pending.is_some() {
@@ -1674,7 +1873,7 @@ impl Launcher {
                     self.ul = 0.0;
                     self.pop_s = 0.0;
                     self.pop_a = 0.0;
-                } else if self.list_open && self.mode == Mode::Search {
+                } else if self.list_open && matches!(self.mode, Mode::Search | Mode::Kill) {
                     self.list_open = false;
                 } else {
                     self.hide();
@@ -1719,7 +1918,7 @@ impl Launcher {
             }
             VK_UP => {
                 if self.list_open {
-                    if self.cursor() == 0 && self.mode == Mode::Search {
+                    if self.cursor() == 0 && matches!(self.mode, Mode::Search | Mode::Kill) {
                         self.list_open = false;
                     } else {
                         self.step(-1);
@@ -1871,7 +2070,8 @@ impl Launcher {
     fn pt(&self, lp: LPARAM) -> (f32, f32) {
         let x = (lp.0 & 0xFFFF) as u16 as i16 as f32;
         let y = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
-        (x / self.scale, y / self.scale)
+        // the card sits `E` in from the left edge of the window
+        (x / self.scale - E, y / self.scale)
     }
 
     fn row_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -1930,6 +2130,29 @@ impl Launcher {
                         self.draw(gfx);
                     }
                 }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP if self.open && self.mode == Mode::Kill && self.pick.is_none() => {
+                let (x, y) = self.pt(lp);
+                let typing = !self.query.trim().is_empty();
+                if let Some(i) = self.row_at(x, y) {
+                    // a program of the list: it is chosen; Enter twice ends it
+                    self.set_cursor(i);
+                    if typing {
+                        self.list_open = false;
+                    }
+                } else {
+                    let bx = |i: f32| Rect::new(PAD - E + i * (BOX + GAP), PAD, BOX, BOX);
+                    let page = self.sel & !1;
+                    if bx(0.0).contains(x, y) {
+                        self.kill_enter();
+                    } else if typing && bx(1.0).contains(x, y) && page < self.hits.len() {
+                        self.set_cursor(page);
+                    } else if typing && bx(2.0).contains(x, y) && page + 1 < self.hits.len() {
+                        self.set_cursor(page + 1);
+                    }
+                }
+                self.draw(gfx);
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP if self.open => {
@@ -2061,6 +2284,18 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_PROCS => {
+                if let Some(v) = self.procs_slot.lock().ok().and_then(|mut g| g.take()) {
+                    if self.sampler.is_some() {
+                        self.snap = Some(v);
+                    }
+                }
+                if self.open && self.mode == Mode::Kill && self.sampler.is_some() {
+                    self.refresh_procs();
+                    self.draw(gfx);
+                }
+                Some(LRESULT(0))
+            }
             WM_RATES => {
                 if self.open && self.mode == Mode::Search && self.pending.is_none() {
                     let (sel, top) = (self.sel, self.top);
@@ -2119,6 +2354,11 @@ impl Launcher {
                 want.push(h.path.clone());
             }
         }
+        if self.mode == Mode::Kill && !self.query.trim().is_empty() {
+            for h in self.hits.iter().skip(self.sel & !1).take(2) {
+                want.push(h.path.clone());
+            }
+        }
         if self.list_open && self.focus == Focus::Subject {
             for h in self.hits.iter().skip(self.top).take(VIS) {
                 if h.kind.has_icon() {
@@ -2169,7 +2409,7 @@ impl Launcher {
         let e = logic::ease_out(self.anim);
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        self.set_region(self.lh.max(self.list_target()));
+        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
@@ -2186,7 +2426,7 @@ impl Launcher {
             }
         };
         {
-            let mut p = Painter::new(dc, gfx, &mut self.res, sc, 0.0, 0.0);
+            let mut p = Painter::new(dc, gfx, &mut self.res, sc, E * sc, 0.0);
             p.clear();
             p.alpha = e;
             // opening: appears where it is, fading in while growing from 95% around its middle; closing runs it backwards
@@ -2211,14 +2451,16 @@ impl Launcher {
             };
             let ct = Tr { ..tr };
             card_xf(&mut p, &tr);
-            let card = Rect::new(0.0, 0.0, W, FRAME_H);
+            // with three boxes the card is wider than the two-box card, by the same amount on each side
+            let grown = E * self.kw.clamp(0.0, 1.0);
+            let card = Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H);
             // the list is a second piece of glass that floats below the boxes
             let panel = Rect::new(0.0, LIST_Y, W, self.lh.max(0.0));
             let dark = self.cfg.dark;
             let glass = self.cfg.glass;
             let gl = Glass {
                 img: self.blur_img.as_ref().filter(|_| glass),
-                whole: Rect::new(0.0, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc),
+                whole: Rect::new(-E, 0.0, self.win_px.2 as f32 / sc, self.win_px.3 as f32 / sc),
                 light,
                 dark,
                 tint: self.cfg.tint,
@@ -2230,11 +2472,36 @@ impl Launcher {
             if panel.h > 8.0 {
                 draw_glass(&mut p, &gl, panel, LIST_R.min(panel.h * 0.5));
             }
-            let sub = Rect::new(PAD, PAD, BOX, BOX);
-            let act = Rect::new(PAD + BOX + GAP, PAD, BOX, BOX);
+            let sub = Rect::new(PAD - grown, PAD, BOX, BOX);
+            let act = Rect::new(PAD + BOX + GAP - grown, PAD, BOX, BOX);
+            // the third box (Kill mode) comes in on the right as the card grows
+            let third = Rect::new(PAD + 2.0 * (BOX + GAP) - grown, PAD, BOX, BOX);
             // the focus glides from one box to the other
             let ft = self.focus_t;
-            for (r, on) in [(sub, 1.0 - ft), (act, ft)] {
+            let kill = self.mode == Mode::Kill;
+            let found = kill && !self.query.trim().is_empty() && !self.hits.is_empty();
+            let ons = if kill {
+                [
+                    self.arm_t,
+                    if found && self.sel % 2 == 0 { 1.0 } else { 0.0 },
+                    if found && self.sel % 2 == 1 { 1.0 } else { 0.0 },
+                ]
+            } else {
+                [1.0 - ft, ft, 0.0]
+            };
+            let n_boxes = if self.kw > 0.01 { 3 } else { 2 };
+            let keep_a = p.alpha;
+            for (i, (r, on)) in [(sub, ons[0]), (act, ons[1]), (third, ons[2])].into_iter().enumerate().take(n_boxes) {
+                if i == 2 {
+                    p.alpha = keep_a * self.kw.clamp(0.0, 1.0);
+                    p.push_clip(card);
+                }
+                // the Kill box turns red when Enter was pressed once
+                let (hot, hot_rim) = if kill && i == 0 {
+                    (Color::rgba(0.50, 0.12, 0.13, 0.90), Color::rgba(0.95, 0.45, 0.45, 0.85))
+                } else {
+                    (sel_fill(light, 1.0), sel_rim(light))
+                };
                 let w = 1.0 + 0.6 * on;
                 // the boxes are more solid than the clearer glass around them; the focus turns them blue
                 let (calm, calm_rim) = if light {
@@ -2242,12 +2509,16 @@ impl Launcher {
                 } else {
                     (Color::rgba(0.03, 0.04, 0.07, 0.28 + 0.30 * dark), Color::white(0.15))
                 };
-                p.fill_rounded(r, BOX_R, calm.lerp(sel_fill(light, 1.0), on));
+                p.fill_rounded(r, BOX_R, calm.lerp(hot, on));
                 if !light {
                     // a faint sheen on the calm box
                     p.fill_rounded(r, BOX_R, Color::white(0.06 * (1.0 - on)));
                 }
-                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, calm_rim.lerp(sel_rim(light), on));
+                p.stroke_rounded(r.inset(w * 0.5), BOX_R - w * 0.5, w, calm_rim.lerp(hot_rim, on));
+                if i == 2 {
+                    p.pop_clip();
+                    p.alpha = keep_a;
+                }
             }
             // choosing a target: the left box keeps the thing the action is for
             let subj = self.pending.as_ref().map(|(_, h)| h).or(cur.as_ref());
@@ -2263,8 +2534,31 @@ impl Launcher {
             let keep = p.alpha;
             p.alpha = keep * fade;
             let popping = (pop - 1.0).abs() > 0.001;
-            let (both, one) = ([Some(sub), Some(act)], [None]);
-            let passes: &[Option<Rect>] = if popping { &both } else { &one };
+            let kill_ui = kill && self.pick.is_none();
+            let kv = KillView {
+                cpu: self.cpu_s,
+                ram: self.ram_s,
+                ram_used: self.snap.as_ref().map_or(0, |s| s.ram_used),
+                ram_total: self.snap.as_ref().map_or(0, |s| s.ram_total),
+                ready: self.snap.is_some(),
+                typing: !self.query.trim().is_empty(),
+                page: [self.hits.get(self.sel & !1), self.hits.get((self.sel & !1) + 1)],
+                icons: &self.icons,
+                armed: cur
+                    .as_ref()
+                    .filter(|h| self.armed.as_deref() == Some(h.path.as_str()))
+                    .map(|h| h.name.as_str()),
+                pop: self.pop_s,
+                pop_a: self.pop_a,
+            };
+            let (both, both3, one) = ([Some(sub), Some(act)], [Some(sub), Some(act), Some(third)], [None]);
+            let passes: &[Option<Rect>] = if !popping {
+                &one
+            } else if kill_ui {
+                &both3
+            } else {
+                &both
+            };
             for &only in passes {
                 let ctb = match only {
                     Some(r) => Tr { k: pop, kx: r.cx(), ky: r.cy(), ..ct },
@@ -2287,6 +2581,8 @@ impl Launcher {
                 }
                 if let Some(pk) = self.pick.as_ref() {
                     draw_pick(&mut p, sub, act, pk);
+                } else if kill_ui {
+                    draw_kill(&mut p, [sub, act, third], &kv, only, &ctb);
                 } else if matches!(self.mode, Mode::Ai | Mode::Notes) {
                     let notes = self.mode == Mode::Notes;
                     let qh = text_hash(&self.query);
@@ -2355,6 +2651,7 @@ impl Launcher {
                     ul: self.ul,
                     wx: wx.as_deref(),
                     clip: self.mode == Mode::Clip,
+                    kill: self.mode == Mode::Kill,
                 };
                 draw_list(&mut p, &view);
                 p.pop_clip();
@@ -2970,6 +3267,128 @@ fn draw_action(p: &mut Painter, r: Rect, cur: Option<&Hit>, act: usize, armed: b
     p.alpha = a0;
 }
 
+/// What the three boxes of the Kill mode show.
+struct KillView<'a> {
+    /// Processor and memory use of the computer, as the gauges show them (0 to 1).
+    cpu: f32,
+    ram: f32,
+    ram_used: u64,
+    ram_total: u64,
+    /// The programs have been looked at.
+    ready: bool,
+    /// Something is typed: the middle and right boxes show the programs that fit it.
+    typing: bool,
+    /// The two programs the middle and right box show.
+    page: [Option<&'a Hit>; 2],
+    icons: &'a HashMap<String, Option<ImageData>>,
+    /// The selected program, when Enter was pressed once for it (its name).
+    armed: Option<&'a str>,
+    pop: f32,
+    pop_a: f32,
+}
+
+/// The accent of the gauge bars.
+fn gauge_color(frac: f32) -> Color {
+    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    let calm = if light { Color::rgba(0.20, 0.45, 0.85, 0.95) } else { Color::rgba(0.45, 0.70, 1.0, 0.95) };
+    // nearly full: the bar turns red
+    calm.lerp(Color::rgba(0.95, 0.35, 0.32, 0.95), ((frac - 0.75) / 0.2).clamp(0.0, 1.0))
+}
+
+/// A gauge box: what it measures, the big number, a line of small print and a bar.
+fn draw_gauge(p: &mut Painter, r: Rect, name: &str, frac: f32, line: &str) {
+    p.text(name, Rect::new(r.x + 8.0, r.y + 16.0, r.w - 16.0, 20.0), &TextStyle::new(12.0, white(0.62)).semibold().center());
+    let pct = format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0);
+    p.text(&pct, Rect::new(r.x + 8.0, r.y + 46.0, r.w - 16.0, 60.0), &TextStyle::new(44.0, white(0.96)).semibold().center());
+    p.text(line, Rect::new(r.x + 8.0, r.y + 108.0, r.w - 16.0, 18.0), &TextStyle::new(11.5, white(0.62)).center());
+    let track = Rect::new(r.x + 24.0, r.y + r.h - 34.0, r.w - 48.0, 8.0);
+    p.fill_rounded(track, 4.0, white(0.16));
+    let w = (track.w * frac.clamp(0.0, 1.0)).max(if frac > 0.004 { 8.0 } else { 0.0 });
+    if w > 0.0 {
+        p.fill_rounded(Rect::new(track.x, track.y, w, track.h), 4.0, gauge_color(frac));
+    }
+}
+
+/// A program in one of the boxes: its icon, its name, and what it uses.
+fn draw_proc(p: &mut Painter, r: Rect, h: &Hit, icons: &HashMap<String, Option<ImageData>>, pop: f32, tr: &Tr) {
+    let cx = r.cx();
+    let ir = Rect::centered(cx, r.y + 52.0, 56.0, 56.0);
+    let a0 = p.alpha;
+    let fade = logic::ease_out((pop * 1.6).min(1.0));
+    let k = 0.80 + 0.20 * logic::ease_back(pop);
+    pop_xf(p, tr, k, cx, ir.cy());
+    p.alpha = a0 * (0.3 + 0.7 * fade);
+    draw_thumb(p, ir, h, icons.get(&h.path).and_then(|o| o.as_ref()), None);
+    card_xf(p, tr);
+    p.alpha = a0 * (0.35 + 0.65 * fade);
+    p.text(
+        &logic::mid(&h.name, 16),
+        Rect::new(r.x + 8.0, r.y + 90.0, r.w - 16.0, 24.0),
+        &TextStyle::new(16.0, white(0.96)).semibold().center(),
+    );
+    p.text(&h.detail, Rect::new(r.x + 8.0, r.y + 116.0, r.w - 16.0, 18.0), &TextStyle::new(12.0, white(0.78)).center());
+    if h.idx > 1 {
+        p.text(
+            &format!("{} processes", h.idx),
+            Rect::new(r.x + 8.0, r.y + 136.0, r.w - 16.0, 16.0),
+            &TextStyle::new(10.5, white(0.50)).center(),
+        );
+    }
+    p.alpha = a0;
+}
+
+/// The three boxes of the Kill mode: Kill, then memory and processor use; with something typed, the
+/// two programs that fit it. `only` draws just the box with that rectangle (while the contents pop).
+fn draw_kill(p: &mut Painter, b: [Rect; 3], v: &KillView, only: Option<Rect>, tr: &Tr) {
+    let wanted = |i: usize| only.map_or(true, |o| (o.x - b[i].x).abs() < 0.01);
+    let a0 = p.alpha;
+    if wanted(0) {
+        let r = b[0];
+        let cx = r.cx();
+        let ir = Rect::centered(cx, r.y + 68.0, 56.0, 56.0);
+        let k = 0.80 + 0.20 * logic::ease_back(v.pop_a);
+        pop_xf(p, tr, k, cx, ir.cy());
+        p.icon(Icon::Stop, ir, white(0.92));
+        card_xf(p, tr);
+        let (head, small) = match v.armed {
+            Some(n) => ("Press Enter again".to_string(), format!("to end {}", logic::mid(n, 18))),
+            None if v.typing => ("Kill".to_string(), "Enter twice to end it".to_string()),
+            None => ("Kill".to_string(), "Type a program\u{2019}s name".to_string()),
+        };
+        let size = if v.armed.is_some() { 14.5 } else { 18.0 };
+        p.text(&head, Rect::new(r.x + 8.0, r.y + 112.0, r.w - 16.0, 24.0), &TextStyle::new(size, white(0.95)).semibold().center());
+        p.text(&small, Rect::new(r.x + 8.0, r.y + 138.0, r.w - 16.0, 18.0), &TextStyle::new(11.0, white(0.62)).center());
+    }
+    for i in 1..3 {
+        if !wanted(i) {
+            continue;
+        }
+        let r = b[i];
+        if v.typing {
+            match v.page[i - 1] {
+                Some(h) => draw_proc(p, r, h, v.icons, v.pop, tr),
+                None if i == 1 => p.text(
+                    "No program found",
+                    Rect::new(r.x + 10.0, r.y + 60.0, r.w - 20.0, 24.0),
+                    &TextStyle::new(12.5, white(0.70)).semibold().center(),
+                ),
+                None => {}
+            }
+        } else if i == 1 {
+            let line = if v.ready && v.ram_total > 0 {
+                format!("{} of {}", procs::mem_text(v.ram_used), procs::mem_text(v.ram_total))
+            } else {
+                "\u{2026}".to_string()
+            };
+            draw_gauge(p, r, "Memory", v.ram, &line);
+        } else {
+            let line = if v.ready { "All cores together" } else { "\u{2026}" };
+            draw_gauge(p, r, "Processor", v.cpu, line);
+        }
+    }
+    p.alpha = a0;
+}
+
 /// Everything the dropped-down list needs.
 struct ListView<'a> {
     hits: &'a [Hit],
@@ -2987,6 +3406,7 @@ struct ListView<'a> {
     ul: f32,
     wx: Option<&'a Brief>,
     clip: bool,
+    kill: bool,
 }
 
 /// The list drops down: the card grows, each row fades and slides in as the edge passes it, and the
@@ -3010,6 +3430,15 @@ fn draw_list(p: &mut Painter, v: &ListView) {
                 format!("Clipboard  ·  {count}")
             } else {
                 format!("{count}  ·  “{}”", logic::mid(v.query.trim(), 24))
+            }
+        }
+        Focus::Subject if v.kill => {
+            if v.query.trim().is_empty() {
+                "Using the most memory".to_string()
+            } else {
+                let n = v.hits.len();
+                let count = if n == 1 { "1 program".to_string() } else { format!("{n} programs") };
+                format!("{count}  \u{b7}  \u{201c}{}\u{201d}", logic::mid(v.query.trim(), 24))
             }
         }
         Focus::Subject if v.query.trim().is_empty() => "Used most".to_string(),
