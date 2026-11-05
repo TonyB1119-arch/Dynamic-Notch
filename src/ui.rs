@@ -112,9 +112,9 @@ pub fn look_nothing() -> bool {
     LOOK.load(std::sync::atomic::Ordering::Relaxed) == 3
 }
 
-/// True in the Bloom look: soft capsule gauges, bordered translucent cards, a clear blue accent.
+/// True where Bloom's soft capsule gauges are drawn (only Alcove: Tuna has gauges of its own).
 pub fn look_bloom() -> bool {
-    matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 4..=6)
+    matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 4 | 5)
 }
 
 /// True in the Alcove look: Bloom's capsule gauges inside Alcove's island layouts.
@@ -136,8 +136,8 @@ pub fn bloom_blue() -> Color {
     }
 }
 
-/// True in the Tuna look: the Bloom layouts (capsule gauges, control center) on liquid glass, dressed like the
-/// launcher (deep blue for whatever is chosen).
+/// True in the Tuna look: its own layout (a row of glass boxes over a floating glass panel) and its own gauges
+/// (glowing liquid in glass tubes), dressed like the launcher (deep blue for whatever is chosen).
 pub fn look_tuna() -> bool {
     LOOK.load(std::sync::atomic::Ordering::Relaxed) == 6
 }
@@ -151,6 +151,9 @@ pub fn tuna_sel() -> Color {
 pub fn tuna_rim() -> Color {
     Color::hex(0x5C8FC7).with_a(0.85)
 }
+
+/// The blue liquid of the Tuna gauges.
+pub const TUNA_BLUE: Color = Color::hex(0x4DA3FF);
 
 /// Monochrome icons (`[appearance] mono_icons`): any coloured icon is drawn white.
 static MONO_ICONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -667,7 +670,7 @@ impl<'p, 'a> Ui<'p, 'a> {
     /// Run `f` with the beam look switched on (it is on everywhere by default; the non-beam looks
     /// below are kept for a future "beams: data only" option).
     pub fn beams<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        if look_minimal() || look_nothing() || look_bloom() {
+        if look_minimal() || look_nothing() || look_bloom() || look_tuna() {
             return f(self);
         }
         let old = BEAMS.with(|b| b.replace(true));
@@ -772,6 +775,80 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.fx.animate = true;
     }
 
+    // ---- Tuna look: glowing blue liquid in glass tubes ----
+
+    /// The liquid of a Tuna gauge (the callers' colours only carry opacity).
+    fn tube_liquid(c: Color) -> Color {
+        TUNA_BLUE.with_a(c.a.clamp(0.0, 1.0))
+    }
+
+    /// The empty glass tube of a bar: dark and clear with a bright rim.
+    fn tube_glass(&mut self, r: Rect) -> Rect {
+        let t = (r.h * 0.7).clamp(8.0, 12.0);
+        let track = Rect::new(r.x, r.cy() - t * 0.5, r.w, t);
+        self.p.fill_rounded_live(track, t * 0.5, Color::black(0.3));
+        self.p.stroke_rounded(track.inset(0.5), t * 0.5 - 0.5, 1.0, Color::white(0.18));
+        track
+    }
+
+    /// Liquid inside a tube: a soft glow round it and a thin highlight along its top.
+    fn tube_fill(&mut self, track: Rect, x0: f32, w: f32, c: Color) {
+        let t = track.h;
+        let liquid = Rect::new(x0, track.y + 1.5, w, t - 3.0);
+        self.p.fill_rounded_live(liquid.inset(-2.5), t * 0.5 + 1.0, c.with_a(c.a * 0.22));
+        self.p.fill_rounded_live(liquid, liquid.h * 0.5, c);
+        if w > t {
+            let shine = Rect::new(x0 + t * 0.4, liquid.y + 1.2, w - t * 0.8, 1.6);
+            self.p.fill_rounded_live(shine, 0.8, Color::white(0.5 * c.a));
+        }
+    }
+
+    /// `from`..`to` (0..1) of a glass tube filled with liquid.
+    fn tube_bar(&mut self, r: Rect, from: f32, to: f32, color: Color) {
+        let track = self.tube_glass(r);
+        let (x0, x1) = (r.x + r.w * from.clamp(0.0, 1.0), r.x + r.w * to.clamp(0.0, 1.0));
+        if x1 - x0 > 0.5 {
+            let w = (x1 - x0).max(track.h.min(r.w));
+            self.tube_fill(track, x0, w, Self::tube_liquid(color));
+        }
+    }
+
+    /// "Working on it": a bubble of liquid sloshing to and fro in the tube.
+    fn tube_sweep(&mut self, r: Rect) {
+        let track = self.tube_glass(r);
+        let seg = (r.w * 0.3).max(track.h * 2.0).min(r.w);
+        let ping = 0.5 - 0.5 * ((epoch_secs() % 1.8) / 1.8 * std::f32::consts::TAU).cos();
+        self.tube_fill(track, r.x + ping * (r.w - seg), seg, Self::tube_liquid(Color::white(1.0)));
+        self.fx.animate = true;
+    }
+
+    /// A ring of glass filling clockwise from 12 o'clock, with a bright bead at the leading end.
+    fn tube_ring(&mut self, cx: f32, cy: f32, diameter: f32, frac: f32, color: Color) {
+        let w = (diameter * 0.16).clamp(3.0, 6.0);
+        let rad = (diameter * 0.5 - w * 0.5 - 1.0).max(1.0);
+        self.p.stroke_circle(cx, cy, rad, w + 2.0, Color::black(0.3));
+        self.p.stroke_circle(cx, cy, rad, w, Color::white(0.1));
+        if frac > 0.004 {
+            let c = Self::tube_liquid(color);
+            let sweep = (std::f32::consts::TAU * frac.clamp(0.0, 1.0)).min(std::f32::consts::TAU - 0.002);
+            self.p.arc(cx, cy, rad, 0.0, sweep, w + 4.0, c.with_a(c.a * 0.2));
+            self.p.arc(cx, cy, rad, 0.0, sweep, w, c);
+            self.p.fill_circle(cx + rad * sweep.sin(), cy - rad * sweep.cos(), w * 0.3, Color::white(0.85 * c.a));
+        }
+    }
+
+    /// A glass ring with a glowing stretch of liquid circling in it.
+    fn tube_ring_spin(&mut self, cx: f32, cy: f32, diameter: f32) {
+        let w = (diameter * 0.16).clamp(3.0, 6.0);
+        let rad = (diameter * 0.5 - w * 0.5 - 1.0).max(1.0);
+        self.p.stroke_circle(cx, cy, rad, w + 2.0, Color::black(0.3));
+        self.p.stroke_circle(cx, cy, rad, w, Color::white(0.1));
+        let start = (epoch_secs() * 0.8).fract() * std::f32::consts::TAU;
+        self.p.arc(cx, cy, rad, start, 1.5, w + 4.0, TUNA_BLUE.with_a(0.2));
+        self.p.arc(cx, cy, rad, start, 1.5, w, TUNA_BLUE);
+        self.fx.animate = true;
+    }
+
     // ---- Nothing look: dot-matrix "glyph" lights, white on black with one red accent ----
 
     /// A row of LED dots. `from`..`to` (0..1) are lit white; the leading dot is red.
@@ -867,6 +944,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_minimal() {
             return self.min_bar(r, 0.0, frac, color);
         }
+        if look_tuna() {
+            return self.tube_bar(r, 0.0, frac, color);
+        }
         if look_bloom() {
             return self.bloom_bar(r, 0.0, frac, color);
         }
@@ -955,6 +1035,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_minimal() {
             return self.min_sweep(r);
         }
+        if look_tuna() {
+            return self.tube_sweep(r);
+        }
         if look_bloom() {
             return self.bloom_sweep(r);
         }
@@ -1004,6 +1087,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_minimal() {
             return self.min_bar(r, from, to, color);
         }
+        if look_tuna() {
+            return self.tube_bar(r, from, to, color);
+        }
         if look_bloom() {
             return self.bloom_bar(r, from, to, color);
         }
@@ -1018,6 +1104,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         }
         if look_minimal() {
             return self.min_ring(cx, cy, diameter, frac, color);
+        }
+        if look_tuna() {
+            return self.tube_ring(cx, cy, diameter, frac, color);
         }
         if look_bloom() {
             return self.bloom_ring(cx, cy, diameter, frac, color);
@@ -1052,6 +1141,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         }
         if look_minimal() {
             return self.min_ring_spin(cx, cy, diameter);
+        }
+        if look_tuna() {
+            return self.tube_ring_spin(cx, cy, diameter);
         }
         if look_bloom() {
             return self.bloom_ring_spin(cx, cy, diameter);
@@ -1213,6 +1305,23 @@ impl<'p, 'a> Ui<'p, 'a> {
             }
             return;
         }
+        if look_tuna() {
+            // upright glass tubes, filling with liquid; the newest sample is the brightest
+            let n = values.len().max(1);
+            let step = r.w / n as f32;
+            let w = (step * 0.62).max(2.0);
+            let blue = Self::tube_liquid(color);
+            for (i, v) in values.iter().enumerate() {
+                let v = self.glide(rect_key(r, "graph") ^ gkey("g", i), v.clamp(0.0, 1.0));
+                let x = r.x + i as f32 * step + (step - w) * 0.5;
+                self.p.fill_rounded(Rect::new(x, r.y, w, r.h), w * 0.5, Color::white(0.06));
+                let h = (v * r.h).max(w);
+                let age = (i + 1) as f32 / n as f32;
+                let c = blue.with_a(blue.a * (0.35 + 0.65 * age));
+                self.p.fill_rounded(Rect::new(x, r.bottom() - h, w, h), w * 0.5, c);
+            }
+            return;
+        }
         if look_bloom() {
             let n = values.len().max(1);
             let step = r.w / n as f32;
@@ -1289,6 +1398,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_minimal() && !beams_on() {
             return self.min_sweep(r);
         }
+        if look_tuna() {
+            return self.tube_sweep(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0));
+        }
         if look_bloom() {
             return self.bloom_sweep(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0));
         }
@@ -1364,6 +1476,17 @@ impl<'p, 'a> Ui<'p, 'a> {
             }
             return;
         }
+        if look_tuna() {
+            let frac = self.glide(rect_key(r, "scrub"), frac.clamp(0.0, 1.0));
+            let grow = self.glide(rect_key(r, "scrub-hover"), if hover { 1.0 } else { 0.0 });
+            self.tube_bar(Rect::new(r.x, r.cy() - 5.0, r.w, 10.0), 0.0, frac, Color::white(1.0));
+            // a glass bead on the liquid
+            let px = r.x + (r.w * frac).clamp(0.0, r.w);
+            let k = 5.0 + 2.5 * grow;
+            self.p.fill_circle(px, r.cy(), k + 3.0, TUNA_BLUE.with_a(0.25 + 0.25 * grow));
+            self.p.fill_circle(px, r.cy(), k, Color::white(0.96));
+            return;
+        }
         if look_bloom() {
             let frac = self.glide(rect_key(r, "scrub"), frac.clamp(0.0, 1.0));
             let grow = self.glide(rect_key(r, "scrub-hover"), if hover { 1.0 } else { 0.0 });
@@ -1399,6 +1522,13 @@ impl<'p, 'a> Ui<'p, 'a> {
             self.p.fill_rounded(r, 20.0, Color::white(if hover { 0.11 } else { 0.07 }));
             return interactive && self.clicked(r);
         }
+        if look_tuna() {
+            // a pane of glass: dark and clear with a bright rim
+            self.p.fill_rounded(r, 22.0, Color::rgba(0.03, 0.04, 0.07, if hover { 0.4 } else { 0.3 }));
+            self.p.fill_rounded(r, 22.0, Color::white(if hover { 0.08 } else { 0.04 }));
+            self.p.stroke_rounded(r.inset(0.5), 21.5, 1.0, Color::white(if hover { 0.26 } else { 0.15 }));
+            return interactive && self.clicked(r);
+        }
         if look_bloom() {
             // a bordered, translucent group card
             self.p.fill_rounded(r, 18.0, Color::white(if hover { 0.08 } else { 0.04 }));
@@ -1421,6 +1551,19 @@ impl<'p, 'a> Ui<'p, 'a> {
                 None => Color::white(if hover { 0.11 } else { 0.07 }),
             };
             self.p.fill_rounded(row, 14.0, fill);
+            return;
+        }
+        if look_tuna() {
+            match tint {
+                Some(_) => {
+                    self.p.fill_rounded(row, 16.0, tuna_sel());
+                    self.p.stroke_rounded(row.inset(0.5), 15.5, 1.0, tuna_rim());
+                }
+                None => {
+                    self.p.fill_rounded(row, 16.0, Color::white(if hover { 0.08 } else { 0.04 }));
+                    self.p.stroke_rounded(row.inset(0.5), 15.5, 1.0, Color::white(if hover { 0.18 } else { 0.1 }));
+                }
+            }
             return;
         }
         if look_bloom() {

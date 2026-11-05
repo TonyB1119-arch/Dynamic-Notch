@@ -23,6 +23,7 @@ mod procs;
 mod radial;
 mod refract;
 mod switcher;
+mod tuna;
 mod sys;
 mod taskbar;
 mod tray;

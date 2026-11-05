@@ -58,6 +58,8 @@ const HEADER_H: f32 = 54.0;
 fn top_h() -> f32 {
     if crate::ui::look_alcove() {
         crate::alcove::TOP
+    } else if crate::ui::look_tuna() {
+        crate::tuna::TOP_H
     } else if crate::ui::look_bloom() {
         crate::bloom::TOP_H
     } else {
@@ -69,6 +71,8 @@ fn top_h() -> f32 {
 fn side_pad() -> f32 {
     if crate::ui::look_alcove() {
         crate::alcove::LEFT
+    } else if crate::ui::look_tuna() {
+        crate::tuna::PAD
     } else if crate::ui::look_bloom() {
         crate::bloom::SIDE
     } else {
@@ -88,6 +92,8 @@ fn right_pad() -> f32 {
 fn bottom_pad() -> f32 {
     if crate::ui::look_alcove() {
         crate::alcove::BOTTOM
+    } else if crate::ui::look_tuna() {
+        crate::tuna::BOTTOM
     } else if crate::ui::look_bloom() {
         crate::bloom::BOTTOM
     } else {
@@ -255,6 +261,8 @@ fn page_width_of(cfg: &Config, id: ModuleId) -> f32 {
 fn page_content_h(cfg: &Config, modules: &[Box<dyn Module>], started: &[bool], id: ModuleId, content_w: f32) -> f32 {
     if id == HOME && crate::ui::look_alcove() {
         crate::alcove::HOME_H
+    } else if id == HOME && crate::ui::look_tuna() {
+        crate::tuna::HOME_H
     } else if id == HOME && crate::ui::look_bloom() {
         crate::bloom::HOME_H
     } else if id == HOME {
@@ -1274,6 +1282,8 @@ impl App {
                 })
                 .unwrap_or(if crate::ui::look_nothing() {
                     crate::ui::NOTHING_RED
+                } else if crate::ui::look_tuna() {
+                    crate::ui::TUNA_BLUE
                 } else if crate::ui::look_bloom() {
                     crate::ui::bloom_blue()
                 } else {
@@ -2374,7 +2384,7 @@ impl App {
         let minimal = crate::ui::look_minimal();
         let nothing = crate::ui::look_nothing();
         let alcove = crate::ui::look_alcove();
-        let bloom = crate::ui::look_bloom() && !alcove;
+        let bloom = (crate::ui::look_bloom() && !alcove) || crate::ui::look_tuna();
         // Bloom settles like a smooth ease-out: almost no overshoot
         let bounce = if minimal || nothing {
             0.0
@@ -4938,12 +4948,14 @@ fn draw_expanded(
     indicators: &[Indicator],
     snaps: Option<(&Snapshot, &Snapshot)>,
 ) {
-    if !crate::ui::look_alcove() {
+    if !(crate::ui::look_alcove() || crate::ui::look_tuna()) {
         return draw_expanded_core(ui, full, modules, started, tabs, page, trans, indicators, snaps);
     }
     crate::ui::reset_wheel_taken();
     draw_expanded_core(ui, full, modules, started, tabs, page, trans, indicators, snaps);
-    crate::alcove::rail(ui, view, tabs, page);
+    if crate::ui::look_alcove() {
+        crate::alcove::rail(ui, view, tabs, page);
+    }
 
     // anywhere on the notch: a swipe sideways, or the wheel where nothing scrolls, turns the page
     if tabs.is_empty() || !ui.hovered(full) {
@@ -4996,6 +5008,9 @@ fn draw_expanded_core(
 ) {
     if crate::ui::look_alcove() {
         // no header: the page dots on the right edge do the navigating
+    } else if crate::ui::look_tuna() {
+        crate::tuna::panel(ui, full);
+        crate::tuna::row(ui, full, modules, started, tabs, page, indicators);
     } else if crate::ui::look_bloom() {
         crate::bloom::header(ui, full, modules, tabs, page, indicators);
     } else {
@@ -5198,6 +5213,10 @@ fn snapshot_motion(ui: &mut Ui, s: &Snapshot, dx: f32, dy: f32, blur: f32) {
 fn draw_body(ui: &mut Ui, content: Rect, modules: &mut [Box<dyn Module>], started: &[bool], page: ModuleId) {
     if page == HOME && crate::ui::look_alcove() {
         crate::alcove::home(ui, content, modules);
+    } else if page == HOME && crate::ui::look_tuna() {
+        let large = (0..modules.len()).find(|&i| started[i] && modules[i].card() == Some(CardSize::Large));
+        let tiles = home_tiles(modules, started, ui.cfg);
+        crate::tuna::home(ui, content, modules, large, &tiles);
     } else if page == HOME && crate::ui::look_bloom() {
         crate::bloom::control_center(ui, content, modules, started);
     } else if page == HOME {
