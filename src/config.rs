@@ -1076,7 +1076,8 @@ bounce = 0.3
 animation_speed = 1.0
 # "alcove" (island layouts, clock and weather home, page dots), "beams" (beams everywhere),
 # "calm" (beams only on volume, brightness and battery), "minimal" (thin plain lines and quiet motion),
-# "nothing" (dot-matrix glyph lights, red accent) or "bloom" (capsule gauges, control center)
+# "nothing" (dot-matrix glyph lights, red accent), "bloom" (capsule gauges, control center) or
+# "tuna" (the Alcove layouts dressed like the launcher: deep blue selection, dark glass tiles)
 look = "alcove"
 # false = blue beams with a hint of white, true = white beams with a hint of blue
 white_beams = false

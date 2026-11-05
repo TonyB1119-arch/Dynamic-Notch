@@ -787,12 +787,14 @@ impl Settings {
             "nothing" => 3,
             "bloom" => 4,
             "alcove" => 5,
+            "tuna" => 6,
             _ => 0,
         };
-        let seg = Rect::new(row.right() - 520.0, row.y + 3.0, 512.0, row.h - 6.0);
-        let labels = ["Beams", "Calm", "Minimal", "Nothing", "Bloom", "Alcove"];
+        let seg = Rect::new(row.right() - 600.0, row.y + 3.0, 592.0, row.h - 6.0);
+        let labels = ["Beams", "Calm", "Minimal", "Nothing", "Bloom", "Alcove", "Tuna"];
         if let Some(i) = segmented(ui, seg, &labels, Some(sel), accent) {
-            put(ui, "appearance", "look", toml_str(["beams", "calm", "minimal", "nothing", "bloom", "alcove"][i]));
+            let looks = ["beams", "calm", "minimal", "nothing", "bloom", "alcove", "tuna"];
+            put(ui, "appearance", "look", toml_str(looks[i]));
         }
         toggle_row(ui, row_rect(body, 9), "White beams (a hint of blue)", a.white_beams, "appearance", "white_beams");
 

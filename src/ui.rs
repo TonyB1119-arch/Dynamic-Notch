@@ -88,7 +88,7 @@ thread_local! {
     static BEAMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Overall look: 0 = beams everywhere, 1 = calm, 2 = minimal, 3 = nothing, 4 = bloom, 5 = alcove.
+/// Overall look: 0 = beams everywhere, 1 = calm, 2 = minimal, 3 = nothing, 4 = bloom, 5 = alcove, 6 = tuna.
 static LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Applies `[appearance] look`. Called when the settings load or change.
@@ -99,6 +99,7 @@ pub fn set_look(name: &str) {
         "nothing" => 3,
         "bloom" => 4,
         "alcove" => 5,
+        "tuna" => 6,
         _ => 0,
     };
     LOOK.store(v, std::sync::atomic::Ordering::Relaxed);
@@ -116,12 +117,28 @@ pub fn look_nothing() -> bool {
 
 /// True in the Bloom look: soft capsule gauges, bordered translucent cards, a clear blue accent.
 pub fn look_bloom() -> bool {
-    matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 4 | 5)
+    matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 4..=6)
 }
 
-/// True in the Alcove look: Bloom's capsule gauges inside Alcove's island layouts.
+/// True in the Alcove look (and in Tuna, which keeps its layouts): Bloom's capsule gauges inside Alcove's island layouts.
 pub fn look_alcove() -> bool {
-    LOOK.load(std::sync::atomic::Ordering::Relaxed) == 5
+    matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 5 | 6)
+}
+
+/// True in the Tuna look: Alcove's layouts dressed like the launcher (deep blue for whatever is chosen,
+/// dark glass tiles with a soft rim).
+pub fn look_tuna() -> bool {
+    LOOK.load(std::sync::atomic::Ordering::Relaxed) == 6
+}
+
+/// The fill of whatever is chosen in the Tuna look (the launcher's blue).
+pub fn tuna_sel() -> Color {
+    Color::hex(0x15334B).with_a(0.92)
+}
+
+/// The edge of whatever is chosen in the Tuna look.
+pub fn tuna_rim() -> Color {
+    Color::hex(0x5C8FC7).with_a(0.85)
 }
 
 /// Monochrome icons (`[appearance] mono_icons`): any coloured icon is drawn white.
