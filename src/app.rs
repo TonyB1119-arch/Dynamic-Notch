@@ -5010,7 +5010,7 @@ fn draw_expanded_core(
         // no header: the page dots on the right edge do the navigating
     } else if crate::ui::look_tuna() {
         crate::tuna::panel(ui, full);
-        crate::tuna::row(ui, full, modules, started, tabs, page, indicators);
+        crate::tuna::strip(ui, full, modules, started, tabs, page);
     } else if crate::ui::look_bloom() {
         crate::bloom::header(ui, full, modules, tabs, page, indicators);
     } else {
