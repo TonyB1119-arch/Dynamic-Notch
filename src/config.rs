@@ -150,7 +150,7 @@ impl Default for Appearance {
             bounce: 0.3,
             animation_speed: 1.0,
             accent: "auto".into(),
-            look: "alcove".into(),
+            look: "tuna".into(),
             white_beams: false,
             clock_style: "roll".into(),
             motion_cache: true,
@@ -1074,11 +1074,9 @@ shadow = false
 # 0 = no overshoot ... 1 = very bouncy
 bounce = 0.3
 animation_speed = 1.0
-# "alcove" (island layouts, clock and weather home, page dots), "beams" (beams everywhere),
-# "calm" (beams only on volume, brightness and battery), "minimal" (thin plain lines and quiet motion),
-# "nothing" (dot-matrix glyph lights, red accent), "bloom" (capsule gauges, control center) or
-# "tuna" (the Alcove layouts dressed like the launcher: deep blue selection, dark glass tiles)
-look = "alcove"
+# "tuna" (liquid glass, capsule gauges, control center, the launcher's deep blue), "alcove" (island layouts,
+# clock and weather home, page dots) or "nothing" (dot-matrix glyph lights, red accent)
+look = "tuna"
 # false = blue beams with a hint of white, true = white beams with a hint of blue
 white_beams = false
 # "roll" (digits slide up, the next one rises in) or "flip" (flip-clock tiles)

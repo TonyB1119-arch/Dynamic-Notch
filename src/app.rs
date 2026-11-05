@@ -1275,7 +1275,7 @@ impl App {
                 .unwrap_or(if crate::ui::look_nothing() {
                     crate::ui::NOTHING_RED
                 } else if crate::ui::look_bloom() {
-                    crate::ui::BLOOM_BLUE
+                    crate::ui::bloom_blue()
                 } else {
                     Color::white(0.92)
                 }),
@@ -2752,7 +2752,7 @@ impl App {
     /// let go a moment after the notch closes. Once the notch has settled, the rim is worked out
     /// from that copy and uploaded as one small picture; that is redone only if the size changes.
     fn prepare_rim(&mut self, now: Instant) {
-        if !(self.cfg.appearance.glass_look && crate::ui::look_alcove()) || self.mode == Mode::Idle {
+        if !(self.cfg.appearance.glass_look && crate::ui::look_glass()) || self.mode == Mode::Idle {
             // nothing is kept while the notch is closed: the next opening takes a fresh copy
             self.refr_shot = None;
             self.refr_rim = None;
@@ -3301,7 +3301,7 @@ impl App {
         };
         let settled = self.settled;
         let see_through = ap.expanded_opacity < 0.97 || ap.collapsed_opacity < 0.97;
-        let glass = ap.glass_look && crate::ui::look_alcove();
+        let glass = ap.glass_look && crate::ui::look_glass();
         let a_glass = self.anim.glass.value;
         // the rim fades in over about a quarter of a second and out twice as fast
         let rim_to = if self.rim_ok { 1.0 } else { 0.0 };

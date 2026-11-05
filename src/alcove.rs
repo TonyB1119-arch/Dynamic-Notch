@@ -178,8 +178,7 @@ pub fn rail(ui: &mut Ui, view: Rect, tabs: &[(ModuleId, Icon, String)], page: Mo
     }
     let py = zone.y + 14.0 + pitch * (cp - fo + 0.5);
     let hh = (7.5 + 3.0 * (cur as f32 - cp).abs().min(1.0)) * grow;
-    let pill = if crate::ui::look_tuna() { Color::hex(0x7FB2F0) } else { Color::white(0.96) };
-    ui.p.fill_rounded(Rect::new(x - 3.0 * grow, py - hh, 6.0 * grow, hh * 2.0), 3.0 * grow, pill);
+    ui.p.fill_rounded(Rect::new(x - 3.0 * grow, py - hh, 6.0 * grow, hh * 2.0), 3.0 * grow, Color::white(0.96));
     if over {
         ui.hot = true;
     }
@@ -465,9 +464,6 @@ thread_local! {
 pub fn tile(ui: &mut Ui, r: Rect, radius: f32, hover: bool) {
     let h = ui.glide(crate::ui::rect_key(r, "alcove-tile"), hover as u8 as f32);
     ui.p.fill_rounded(r, radius, Color::white(0.07 + 0.05 * h));
-    if crate::ui::look_tuna() {
-        ui.p.stroke_rounded(r.inset(0.5), radius - 0.5, 1.0, Color::white(0.10 + 0.05 * h));
-    }
 }
 
 /// How far a page title (icon, name and note) reaches, so chips can start after it.
@@ -496,12 +492,6 @@ pub fn icon_chip(ui: &mut Ui, c: Rect, key: usize) {
 /// badge, a rounded square or the end of a capsule alike, and come from the realization cache.
 fn chip_body(ui: &mut Ui, c: Rect, radius: f32, h: f32, k: f32) {
     let radius = radius.min(c.w * 0.5).min(c.h * 0.5);
-    if crate::ui::look_tuna() {
-        // dark glass with a soft rim, no corner lights
-        ui.p.fill_rounded(c, radius, Color::white((0.06 + 0.05 * h) * k));
-        ui.p.stroke_rounded(c.inset(0.5), radius - 0.5, 1.0, Color::white((0.14 + 0.06 * h) * k));
-        return;
-    }
     ui.p.fill_rounded(c, radius, Color::white((0.07 + 0.05 * h) * k));
     ui.p.stroke_rounded(c.inset(0.5), radius - 0.5, 1.0, Color::white((0.045 + 0.05 * h) * k));
     let peak = (0.11 + 0.06 * h) * k;
@@ -535,12 +525,7 @@ pub fn tab_chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool)
         ui.p.fill_rounded(rr, rr.h * 0.5, Color::white(0.05 * h * (1.0 - a)));
     }
     if a > 0.01 {
-        if crate::ui::look_tuna() {
-            ui.p.fill_rounded(rr, rr.h * 0.5, crate::ui::tuna_sel().with_a(0.92 * a));
-            ui.p.stroke_rounded(rr.inset(0.5), rr.h * 0.5 - 0.5, 1.0, crate::ui::tuna_rim().with_a(0.85 * a));
-        } else {
-            ui.p.fill_rounded(rr, rr.h * 0.5, Color::white((0.10 + 0.04 * h) * a));
-        }
+        ui.p.fill_rounded(rr, rr.h * 0.5, Color::white((0.10 + 0.04 * h) * a));
     }
     let fg = Color::white(0.52 + 0.14 * h * (1.0 - a)).lerp(Color::white(0.97), a);
     let st = TextStyle::new(12.5, fg).semibold();
@@ -585,18 +570,12 @@ pub fn chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool) -> 
     let (h, p) = ui.touch(r, "alcove-chip-touch");
     // the white fill eases in and out when the chosen chip changes
     let a = ui.glide(crate::ui::rect_key(r, "alcove-chip"), if on { 1.0 } else { 0.0 });
-    let tuna = crate::ui::look_tuna();
     let idle = Color::white(0.10 + 0.07 * h);
-    let bg = if tuna { idle.lerp(crate::ui::tuna_sel(), a) } else { idle.lerp(Color::white(0.94), a) };
+    let bg = idle.lerp(Color::white(0.94), a);
     // a press squeezes the chip a touch
     let rr = r.inset(1.2 * p);
     ui.p.fill_rounded(rr, rr.h * 0.5, bg);
-    if tuna {
-        let rim = Color::white(0.12 + 0.05 * h).lerp(crate::ui::tuna_rim(), a);
-        ui.p.stroke_rounded(rr.inset(0.5), rr.h * 0.5 - 0.5, 1.0, rim);
-    }
-    let fg =
-        if tuna { Color::white(0.92).lerp(Color::white(1.0), a) } else { Color::white(0.92).lerp(palette::INK, a) };
+    let fg = Color::white(0.92).lerp(palette::INK, a);
     let st = TextStyle::new(12.5, fg).semibold();
     let mut x = r.x + 13.0;
     if let Some(i) = icon {
@@ -614,18 +593,10 @@ pub fn chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool) -> 
 /// A round icon button.
 pub fn round_button(ui: &mut Ui, r: Rect, icon: Icon, filled: bool) -> bool {
     let (h, p) = ui.touch(r, "alcove-round");
-    let tuna = crate::ui::look_tuna();
-    let bg = match (filled, tuna) {
-        (true, true) => crate::ui::tuna_sel(),
-        (true, false) => Color::white(0.94 + 0.06 * h),
-        _ => Color::white(0.10 + 0.08 * h),
-    };
+    let bg = if filled { Color::white(0.94 + 0.06 * h) } else { Color::white(0.10 + 0.08 * h) };
     let d = r.w.min(r.h) * (1.0 + 0.03 * h - 0.07 * p);
     ui.p.fill_circle(r.cx(), r.cy(), d * 0.5, bg);
-    if filled && tuna {
-        ui.p.stroke_circle(r.cx(), r.cy(), d * 0.5 - 0.5, 1.0, crate::ui::tuna_rim());
-    }
-    let fg = if filled && !tuna { palette::INK } else { Color::white(0.92 + 0.08 * filled as u8 as f32) };
+    let fg = if filled { palette::INK } else { Color::white(0.92) };
     ui.p.icon(icon, r.center_square(d * 0.5), fg);
     ui.clicked(r)
 }

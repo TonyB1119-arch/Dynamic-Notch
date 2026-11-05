@@ -778,23 +778,17 @@ impl Settings {
             x += 26.0;
         }
 
-        // overall look: beams everywhere, calm (beams only where a level matters) or minimal
+        // overall look: Tuna, Alcove or Nothing
         let row = row_rect(body, 8);
         label(ui, row, "Look");
         let sel = match a.look.trim().to_ascii_lowercase().as_str() {
-            "calm" => 1,
-            "minimal" => 2,
-            "nothing" => 3,
-            "bloom" => 4,
-            "alcove" => 5,
-            "tuna" => 6,
+            "alcove" => 1,
+            "nothing" => 2,
             _ => 0,
         };
-        let seg = Rect::new(row.right() - 600.0, row.y + 3.0, 592.0, row.h - 6.0);
-        let labels = ["Beams", "Calm", "Minimal", "Nothing", "Bloom", "Alcove", "Tuna"];
-        if let Some(i) = segmented(ui, seg, &labels, Some(sel), accent) {
-            let looks = ["beams", "calm", "minimal", "nothing", "bloom", "alcove", "tuna"];
-            put(ui, "appearance", "look", toml_str(looks[i]));
+        let seg = Rect::new(row.right() - 296.0, row.y + 3.0, 288.0, row.h - 6.0);
+        if let Some(i) = segmented(ui, seg, &["Tuna", "Alcove", "Nothing"], Some(sel), accent) {
+            put(ui, "appearance", "look", toml_str(["tuna", "alcove", "nothing"][i]));
         }
         toggle_row(ui, row_rect(body, 9), "White beams (a hint of blue)", a.white_beams, "appearance", "white_beams");
 

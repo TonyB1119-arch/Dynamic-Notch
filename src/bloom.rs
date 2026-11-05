@@ -194,12 +194,16 @@ fn tab_strip(ui: &mut Ui, strip: Rect, modules: &[Box<dyn Module>], tabs: &[(Mod
             ui.hot = true;
         }
         let on = ui.glide(gkey(id, 71), if sel { 1.0 } else { 0.0 });
-        let bg = Color::white(if hover { 0.11 } else { 0.06 }).lerp(Color::white(0.96), on);
+        let (sel_bg, sel_rim, sel_fg) = chosen();
+        let bg = Color::white(if hover { 0.11 } else { 0.06 }).lerp(sel_bg, on);
         ui.p.fill_rounded(r, r.h * 0.5, bg);
         if on < 0.99 {
             ui.p.stroke_rounded(r.inset(0.5), r.h * 0.5, 1.0, Color::white(0.09 * (1.0 - on)));
         }
-        let fg = Color::white(if hover { 0.95 } else { 0.78 }).lerp(INK, on);
+        if sel_rim.a > 0.0 && on > 0.01 {
+            ui.p.stroke_rounded(r.inset(0.5), r.h * 0.5 - 0.5, 1.0, sel_rim.with_a(sel_rim.a * on));
+        }
+        let fg = Color::white(if hover { 0.95 } else { 0.78 }).lerp(sel_fg, on);
         ui.p.icon(*icon, Rect::new(r.x + 14.0, r.cy() - 8.0, 16.0, 16.0), fg);
         ui.p.text(title, Rect::new(r.x + 14.0 + 16.0 + 7.0, r.y, r.w, r.h), &st.color(fg));
         if !sel && ui.clicked(r) && ui.hovered(strip) {
@@ -336,6 +340,16 @@ pub fn control_center(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], sta
     }
 }
 
+/// What a chosen control is filled with, the colour of its edge and the colour of what is written on it: white
+/// with dark ink, or in Tuna the launcher's deep blue with white.
+fn chosen() -> (Color, Color, Color) {
+    if crate::ui::look_tuna() {
+        (crate::ui::tuna_sel(), crate::ui::tuna_rim(), Color::white(1.0))
+    } else {
+        (Color::white(0.96), Color::white(0.0), INK)
+    }
+}
+
 /// A rounded control with an icon, a title and a status line. `on` fills it white.
 fn pill(ui: &mut Ui, r: Rect, icon: Icon, title: &str, status: &str, on: bool, chevron: bool) -> bool {
     let hover = ui.hovered(r);
@@ -344,13 +358,18 @@ fn pill(ui: &mut Ui, r: Rect, icon: Icon, title: &str, status: &str, on: bool, c
     }
     let t = ui.glide(rect_key(r, "bloom-pill"), if on { 1.0 } else { 0.0 });
     let h = ui.glide(rect_key(r, "bloom-pill-h"), if hover { 1.0 } else { 0.0 });
-    let bg = Color::white(0.035 + 0.045 * h).lerp(Color::white(0.97 - 0.05 * h), t);
+    let (sel_bg, sel_rim, sel_fg) = chosen();
+    let tuna = crate::ui::look_tuna();
+    let bg = Color::white(0.035 + 0.045 * h).lerp(if tuna { sel_bg } else { Color::white(0.97 - 0.05 * h) }, t);
     ui.p.fill_rounded(r, 18.0, bg);
     if t < 0.99 {
         ui.p.stroke_rounded(r.inset(0.5), 18.0, 1.0, Color::white(0.1 * (1.0 - t)));
     }
-    let fg = Color::white(0.97).lerp(INK, t);
-    let sub = Color::white(0.55).lerp(Color::black(0.55), t);
+    if sel_rim.a > 0.0 && t > 0.01 {
+        ui.p.stroke_rounded(r.inset(0.5), 17.5, 1.0, sel_rim.with_a(sel_rim.a * t));
+    }
+    let fg = Color::white(0.97).lerp(sel_fg, t);
+    let sub = Color::white(0.55).lerp(if tuna { Color::white(0.72) } else { Color::black(0.55) }, t);
     ui.p.icon(icon, Rect::new(r.x + 18.0, r.cy() - 10.0, 20.0, 20.0), fg);
     let tx = r.x + 52.0;
     let tw = (r.w - 52.0 - if chevron { 34.0 } else { 14.0 }).max(10.0);
@@ -372,12 +391,16 @@ fn circle(ui: &mut Ui, r: Rect, icon: Icon, on: bool) -> bool {
     }
     let t = ui.glide(rect_key(r, "bloom-circle"), if on { 1.0 } else { 0.0 });
     let h = ui.glide(rect_key(r, "bloom-circle-h"), if hover { 1.0 } else { 0.0 });
-    let bg = Color::white(0.03 + 0.06 * h).lerp(Color::white(0.97), t);
+    let (sel_bg, sel_rim, sel_fg) = chosen();
+    let bg = Color::white(0.03 + 0.06 * h).lerp(sel_bg, t);
     ui.p.fill_circle(r.cx(), r.cy(), r.w * 0.5, bg);
     if t < 0.99 {
         ui.p.stroke_circle(r.cx(), r.cy(), r.w * 0.5 - 0.5, 1.0, Color::white(0.1 * (1.0 - t)));
     }
-    let fg = Color::white(0.95).lerp(INK, t);
+    if sel_rim.a > 0.0 && t > 0.01 {
+        ui.p.stroke_circle(r.cx(), r.cy(), r.w * 0.5 - 0.5, 1.0, sel_rim.with_a(sel_rim.a * t));
+    }
+    let fg = Color::white(0.95).lerp(sel_fg, t);
     ui.p.icon(icon, r.center_square(22.0), fg);
     ui.clicked(r)
 }
@@ -413,7 +436,13 @@ fn slider_row(ui: &mut Ui, row: Rect, icon: Icon, name: &str, value: Option<f32>
     let t = 10.0 + 2.0 * grow;
     let tr = Rect::new(track.x, track.cy() - t * 0.5, track.w, t);
     ui.p.fill_rounded(tr, t * 0.5, Color::white(0.11));
-    let fill = if known { Color::white(0.97) } else { Color::white(0.25) };
+    let fill = if !known {
+        Color::white(0.25)
+    } else if crate::ui::look_tuna() {
+        crate::ui::bloom_blue()
+    } else {
+        Color::white(0.97)
+    };
     ui.p.fill_rounded(Rect::new(tr.x, tr.y, (tr.w * shown).max(t.min(tr.w)), t), t * 0.5, fill);
     let pct = if known { format!("{:.0}%", shown * 100.0) } else { "--".to_string() };
     ui.p.text(

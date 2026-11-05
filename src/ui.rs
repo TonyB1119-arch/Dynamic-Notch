@@ -88,19 +88,16 @@ thread_local! {
     static BEAMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Overall look: 0 = beams everywhere, 1 = calm, 2 = minimal, 3 = nothing, 4 = bloom, 5 = alcove, 6 = tuna.
-static LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Overall look: 3 = nothing, 5 = alcove, 6 = tuna (the default; the other numbers are the retired looks).
+static LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(6);
 
 /// Applies `[appearance] look`. Called when the settings load or change.
 pub fn set_look(name: &str) {
     let v = match name.trim().to_ascii_lowercase().as_str() {
-        "calm" => 1,
-        "minimal" => 2,
         "nothing" => 3,
-        "bloom" => 4,
         "alcove" => 5,
-        "tuna" => 6,
-        _ => 0,
+        // tuna, and the retired beams, calm, minimal and bloom
+        _ => 6,
     };
     LOOK.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -120,13 +117,27 @@ pub fn look_bloom() -> bool {
     matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 4..=6)
 }
 
-/// True in the Alcove look (and in Tuna, which keeps its layouts): Bloom's capsule gauges inside Alcove's island layouts.
+/// True in the Alcove look: Bloom's capsule gauges inside Alcove's island layouts.
 pub fn look_alcove() -> bool {
+    LOOK.load(std::sync::atomic::Ordering::Relaxed) == 5
+}
+
+/// True where the liquid glass edge is drawn (Alcove and Tuna).
+pub fn look_glass() -> bool {
     matches!(LOOK.load(std::sync::atomic::Ordering::Relaxed), 5 | 6)
 }
 
-/// True in the Tuna look: Alcove's layouts dressed like the launcher (deep blue for whatever is chosen,
-/// dark glass tiles with a soft rim).
+/// The accent of the Bloom layouts: iOS blue, or a lighter launcher blue in Tuna.
+pub fn bloom_blue() -> Color {
+    if look_tuna() {
+        Color::hex(0x6FA8E8)
+    } else {
+        BLOOM_BLUE
+    }
+}
+
+/// True in the Tuna look: the Bloom layouts (capsule gauges, control center) on liquid glass, dressed like the
+/// launcher (deep blue for whatever is chosen).
 pub fn look_tuna() -> bool {
     LOOK.load(std::sync::atomic::Ordering::Relaxed) == 6
 }
