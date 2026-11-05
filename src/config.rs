@@ -1323,8 +1323,8 @@ animate = true
 light = false
 # Liquid glass: the edge bends what is behind it and catches the light (false = a plain solid card)
 glass = true
-# Live blur: the picture behind the glass is renewed while the launcher is open, so a playing video keeps moving
-# behind it (false = one picture from when it opened). The launcher then cannot be seen in screenshots.
+# Live blur: the glass blurs with Windows' own live backdrop, so anything moving behind it (a playing video)
+# keeps moving (false = one picture from when it opened).
 live = true
 # How big the launcher is (0.5 = half, 1.0 = the original size)
 size = 0.8

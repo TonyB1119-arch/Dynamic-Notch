@@ -950,12 +950,10 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // live blur, only while media is playing: the window is hidden from screen copies, so the picture
-            // behind it can be renewed while it is open. Otherwise (and when that is not possible) the picture
-            // stays as it was when it opened, and the launcher shows up in screenshots and recordings
-            // while media plays the glass blurs with Windows' own live backdrop (nothing is copied, so there is
-            // nothing to renew and the window stays in screenshots); otherwise it is the picture taken now
-            self.live = self.cfg.glass && self.cfg.live && self.cfg.media_playing;
+            // the glass blurs with Windows' own live backdrop, always (nothing is copied, so a playing video or
+            // anything else behind it keeps moving and the window stays in screenshots); with `live = false`
+            // it is one picture taken now
+            self.live = self.cfg.glass && self.cfg.live;
             self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
             self.lh = 0.0;
