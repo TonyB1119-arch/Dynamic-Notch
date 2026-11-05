@@ -62,6 +62,8 @@ const T_LIVE: usize = 6;
 const T_PICK: usize = 7;
 /// The apps are looked for again a while after one was uninstalled.
 const T_RESCAN: usize = 8;
+/// Window switcher: while Alt is held it is looked at, so letting go of it opens the chosen window.
+const T_ALT: usize = 9;
 /// A background scan has finished.
 const WM_INDEX: u32 = WM_APP + 31;
 /// Gemini has sent more of the answer.
@@ -70,6 +72,8 @@ const WM_AI: u32 = WM_APP + 32;
 const WM_RATES: u32 = WM_APP + 33;
 /// The programs have been looked at again (Kill mode).
 const WM_PROCS: u32 = WM_APP + 34;
+/// A picture of a window (window switcher) is ready.
+const WM_PREVIEW: u32 = WM_APP + 35;
 
 // -- layout (dips) -------------------------------------------------------------------------------------
 const PAD: f32 = 14.0;
@@ -94,6 +98,12 @@ const FULL_H: f32 = LIST_Y + HEAD + VIS_MAX as f32 * ROW + 10.0;
 const CARD_R: f32 = 34.0;
 const LIST_R: f32 = 28.0;
 const BOX_R: f32 = 24.0;
+/// The window switcher's cards: size, space between them, and how many show at once.
+const SW_CW: f32 = 168.0;
+const SW_CH: f32 = 160.0;
+const SW_GAP: f32 = 10.0;
+const SW_R: f32 = 20.0;
+const SW_VIS: usize = 3;
 
 /// Matches kept per search.
 const KEEP: usize = 40;
@@ -291,6 +301,8 @@ enum Mode {
     Kill,
     /// The Run box (Win+R): one wide box, never reached with Tab.
     Run,
+    /// The window switcher (Alt+Tab): a row of the open windows, never reached with Tab.
+    Windows,
 }
 
 impl Mode {
@@ -495,6 +507,8 @@ impl Pick {
 }
 
 type Slot = Arc<Mutex<Option<Vec<Entry>>>>;
+/// Pictures of windows, handed over by the thread that takes them.
+type PrevSlot = Arc<Mutex<Vec<(isize, ImageData)>>>;
 
 pub struct Launcher {
     hwnd: HWND,
@@ -592,6 +606,15 @@ pub struct Launcher {
     run_err: bool,
     /// How much of the card is the one Run box (0 = two boxes, 1 = one box).
     rw: f32,
+    /// The window switcher: the windows, the chosen one, how far the row is scrolled (in cards), their
+    /// pictures, where those arrive, and how often Tab (or an arrow) was pressed while Alt was held.
+    wn: Vec<crate::switcher::Win>,
+    wn_sel: usize,
+    wn_x: f32,
+    wn_prev: HashMap<isize, ImageData>,
+    wn_slot: PrevSlot,
+    wn_cancel: Arc<AtomicBool>,
+    wn_tabs: u32,
 }
 
 impl Launcher {
@@ -667,6 +690,13 @@ impl Launcher {
             run_hist: Vec::new(),
             run_err: false,
             rw: 0.0,
+            wn: Vec::new(),
+            wn_sel: 0,
+            wn_x: 0.0,
+            wn_prev: HashMap::new(),
+            wn_slot: Arc::new(Mutex::new(Vec::new())),
+            wn_cancel: Arc::new(AtomicBool::new(false)),
+            wn_tabs: 0,
         })
     }
 
@@ -724,6 +754,109 @@ impl Launcher {
             self.mode = Mode::Run;
             self.show(gfx, ui_scale, true);
         }
+    }
+
+    /// The switcher hotkey (Alt+Tab): the launcher as a row of the open windows. Pressed again while it is open
+    /// it steps to the next window (Alt+Shift+Tab: the one before).
+    pub fn windows_step(&mut self, gfx: &Gfx, ui_scale: f32, back: bool) {
+        if self.open && self.mode == Mode::Windows {
+            self.windows_move(gfx, if back { -1 } else { 1 });
+            return;
+        }
+        self.mode = Mode::Windows;
+        self.show(gfx, ui_scale, true);
+    }
+
+    /// The open windows are listed (the one in front first; the choice starts on the one before it) and their
+    /// pictures are taken in the background, the ones next to the choice first.
+    fn windows_open(&mut self) {
+        self.windows_close();
+        self.wn = crate::switcher::list();
+        self.wn_sel = if self.wn.len() > 1 { 1 } else { 0 };
+        self.wn_x = self.wn_target();
+        self.wn_tabs = 0;
+        let sel = self.wn_sel;
+        let mut order: Vec<(usize, isize, bool)> =
+            self.wn.iter().enumerate().map(|(i, w)| (i.abs_diff(sel), w.hwnd, w.minimized)).collect();
+        order.sort_by_key(|o| o.0);
+        let order: Vec<(isize, bool)> = order.into_iter().map(|o| (o.1, o.2)).collect();
+        self.wn_cancel = Arc::new(AtomicBool::new(false));
+        spawn_previews(order, self.wn_slot.clone(), self.wn_cancel.clone(), SendHwnd::new(self.hwnd));
+        // Alt still held (Alt+Tab): letting go of it opens the chosen window, once Tab was pressed again
+        if alt_down() {
+            unsafe {
+                SetTimer(Some(self.hwnd), T_ALT, 30, None);
+            }
+        }
+    }
+
+    /// Stop fetching pictures and let go of the windows and their pictures.
+    fn windows_close(&mut self) {
+        self.wn_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_ALT);
+        }
+        for (_, img) in self.wn_prev.drain() {
+            self.res.forget(img.id);
+        }
+        if let Ok(mut g) = self.wn_slot.lock() {
+            g.clear();
+        }
+        self.wn.clear();
+    }
+
+    /// Where the row of cards wants to be scrolled to: the chosen card is in the middle when it can be.
+    fn wn_target(&self) -> f32 {
+        let n = self.wn.len();
+        if n <= SW_VIS {
+            0.0
+        } else {
+            (self.wn_sel as f32 - 1.0).clamp(0.0, (n - SW_VIS) as f32)
+        }
+    }
+
+    /// Choose the next (`d` = 1) or the previous (`d` = -1) window; after the last comes the first.
+    fn windows_move(&mut self, gfx: &Gfx, d: i32) {
+        let n = self.wn.len() as i32;
+        if n == 0 {
+            return;
+        }
+        self.wn_tabs += 1;
+        self.wn_sel = (self.wn_sel as i32 + d).rem_euclid(n) as usize;
+        self.kick();
+        self.draw(gfx);
+    }
+
+    /// Bring the chosen window to the front and put the switcher away.
+    fn windows_commit(&mut self) {
+        let Some(h) = self.wn.get(self.wn_sel).map(|w| w.hwnd) else { return };
+        self.hide();
+        sys::activate_window(h);
+    }
+
+    fn windows_key(&mut self, gfx: &Gfx, vk: u16, shift: bool) {
+        match VIRTUAL_KEY(vk) {
+            VK_TAB => self.windows_move(gfx, if shift { -1 } else { 1 }),
+            VK_RIGHT | VK_DOWN => self.windows_move(gfx, 1),
+            VK_LEFT | VK_UP => self.windows_move(gfx, -1),
+            VK_HOME | VK_END => {
+                self.wn_sel = if VIRTUAL_KEY(vk) == VK_HOME { 0 } else { self.wn.len().saturating_sub(1) };
+                self.kick();
+                self.draw(gfx);
+            }
+            VK_RETURN => self.windows_commit(),
+            VK_ESCAPE => self.hide(),
+            _ => {}
+        }
+    }
+
+    /// The card under the pointer.
+    fn window_at(&self, x: f32, y: f32) -> Option<usize> {
+        let n = self.wn.len();
+        if x < -E || x > W + E {
+            return None;
+        }
+        (0..n).find(|&i| sw_rect(i, n, self.wn_x).contains(x, y))
     }
 
     /// A combo fired: show what is being opened for a moment (0.7 s) without taking the focus away
@@ -786,6 +919,9 @@ impl Launcher {
         }
         if self.mode == Mode::Run {
             self.run_hist = load_run_history();
+        }
+        if self.mode == Mode::Windows {
+            self.windows_open();
         }
         if self.mode == Mode::Notes {
             self.notes = load_notes();
@@ -880,6 +1016,7 @@ impl Launcher {
         self.cpu_s = 0.0;
         self.ram_s = 0.0;
         self.arm_t = 0.0;
+        self.windows_close();
         if self.live {
             self.live = false;
             unsafe {
@@ -928,7 +1065,7 @@ impl Launcher {
 
     /// The card has three boxes in the Kill mode.
     fn kw_target(&self) -> f32 {
-        if self.mode == Mode::Kill {
+        if matches!(self.mode, Mode::Kill | Mode::Windows) {
             1.0
         } else {
             0.0
@@ -996,6 +1133,7 @@ impl Launcher {
                     || (self.arm_t - if self.armed.is_some() { 1.0 } else { 0.0 }).abs() > 0.01))
             || (matches!(self.mode, Mode::Ai | Mode::Notes | Mode::Run) && self.ai.moving())
             || (self.rw - self.rw_target()).abs() > 0.004
+            || (self.mode == Mode::Windows && (self.wn_x - self.wn_target()).abs() > 0.004)
             || (self.focus_t - focus_to).abs() > 0.01
             || (self.sel_y - self.sel_target()).abs() > 0.01
     }
@@ -1022,6 +1160,8 @@ impl Launcher {
         self.kw = if snap { kt } else { logic::follow(self.kw, kt, dt, 24.0, 0.004) };
         let rt = self.rw_target();
         self.rw = if snap { rt } else { logic::follow(self.rw, rt, dt, 22.0, 0.004) };
+        let wt = self.wn_target();
+        self.wn_x = if snap { wt } else { logic::follow(self.wn_x, wt, dt, 16.0, 0.004) };
         let (gc, gr) = self.gauge_goal();
         self.cpu_s = if snap { gc } else { logic::follow(self.cpu_s, gc, dt, 8.0, 0.002) };
         self.ram_s = if snap { gr } else { logic::follow(self.ram_s, gr, dt, 8.0, 0.002) };
@@ -1131,6 +1271,11 @@ impl Launcher {
     }
 
     fn search_inner(&mut self) {
+        if self.mode == Mode::Windows {
+            self.hits.clear();
+            self.wx = None;
+            return;
+        }
         if self.mode == Mode::Run {
             self.hits.clear();
             self.wx = None;
@@ -1913,6 +2058,10 @@ impl Launcher {
             self.pick_key(gfx, vk);
             return;
         }
+        if self.mode == Mode::Windows {
+            self.windows_key(gfx, vk, shift);
+            return;
+        }
         if VIRTUAL_KEY(vk) == VK_TAB {
             // the Run box is only reached with its own hotkey
             if self.mode == Mode::Run {
@@ -2186,6 +2335,7 @@ impl Launcher {
 
     fn typed(&mut self, gfx: &Gfx, c: char) {
         if self.pick.is_some()
+            || self.mode == Mode::Windows
             || c.is_control()
             || (c == ' ' && self.query.is_empty())
             || self.query.chars().count() >= self.query_limit()
@@ -2262,6 +2412,14 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_LBUTTONUP if self.open && self.mode == Mode::Windows => {
+                let (x, y) = self.pt(lp);
+                if let Some(i) = self.window_at(x, y) {
+                    self.wn_sel = i;
+                    self.windows_commit();
+                }
+                Some(LRESULT(0))
+            }
             WM_LBUTTONUP if self.open && self.mode == Mode::Kill && self.pick.is_none() => {
                 let (x, y) = self.pt(lp);
                 let typing = !self.query.trim().is_empty();
@@ -2316,6 +2474,11 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_MOUSEWHEEL if self.open && self.mode == Mode::Windows => {
+                let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 / 120;
+                self.windows_move(gfx, if d > 0 { -1 } else { 1 });
+                Some(LRESULT(0))
+            }
             WM_MOUSEWHEEL if self.open => {
                 if matches!(self.mode, Mode::Ai | Mode::Notes) {
                     let d = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 / 120;
@@ -2349,6 +2512,18 @@ impl Launcher {
                     self.finish_hide();
                 } else {
                     self.draw(gfx);
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == T_ALT => {
+                // Alt let go: the window chosen with Tab opens (with no Tab, the switcher stays for the arrows)
+                if !alt_down() {
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), T_ALT);
+                    }
+                    if self.open && self.mode == Mode::Windows && self.wn_tabs > 0 {
+                        self.windows_commit();
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -2442,6 +2617,23 @@ impl Launcher {
                 }
                 Some(LRESULT(0))
             }
+            WM_PREVIEW => {
+                let got: Vec<(isize, ImageData)> =
+                    self.wn_slot.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+                for (h, img) in got {
+                    if self.wn.iter().any(|w| w.hwnd == h) {
+                        if let Some(old) = self.wn_prev.insert(h, img) {
+                            self.res.forget(old.id);
+                        }
+                    } else {
+                        self.res.forget(img.id);
+                    }
+                }
+                if self.open && self.mode == Mode::Windows {
+                    self.draw(gfx);
+                }
+                Some(LRESULT(0))
+            }
             WM_INDEX => {
                 if let Some(v) = self.apps_slot.lock().ok().and_then(|mut g| g.take()) {
                     self.apps = v;
@@ -2487,6 +2679,13 @@ impl Launcher {
         if self.mode == Mode::Kill && !self.query.trim().is_empty() {
             for h in self.hits.iter().skip(self.sel & !1).take(2) {
                 want.push(h.path.clone());
+            }
+        }
+        if self.mode == Mode::Windows {
+            for w in self.wn.iter().skip(self.wn_x as usize).take(SW_VIS + 2) {
+                if !w.exe.is_empty() {
+                    want.push(w.exe.clone());
+                }
             }
         }
         if self.list_open && self.focus == Focus::Subject {
@@ -2649,7 +2848,13 @@ impl Launcher {
             } else {
                 [1.0 - ft, ft, 0.0]
             };
-            let n_boxes = if self.kw > 0.01 { 3 } else { 2 };
+            let n_boxes = if self.mode == Mode::Windows {
+                0
+            } else if self.kw > 0.01 {
+                3
+            } else {
+                2
+            };
             let keep_a = p.alpha;
             for (i, (r, on)) in
                 [(sub_box, ons[0]), (act, ons[1]), (third, ons[2])].into_iter().enumerate().take(n_boxes)
@@ -2752,6 +2957,16 @@ impl Launcher {
                     draw_pick(&mut p, sub, act, pk);
                 } else if kill_ui {
                     draw_kill(&mut p, [sub, act, third], &kv, only, &ctb);
+                } else if self.mode == Mode::Windows {
+                    let view = WinView {
+                        wins: &self.wn,
+                        prev: &self.wn_prev,
+                        icons: &self.icons,
+                        sel: self.wn_sel,
+                        scroll: self.wn_x,
+                        pop: self.pop_s,
+                    };
+                    draw_windows(&mut p, card, &view);
                 } else if self.mode == Mode::Run {
                     // the command, centred and sized like a question to Gemini
                     let qh = text_hash(&self.query);
@@ -2864,7 +3079,7 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK, T_RESCAN] {
+            for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK, T_RESCAN, T_ALT] {
                 let _ = KillTimer(Some(self.hwnd), t);
             }
             let _ = DestroyWindow(self.hwnd);
@@ -3250,6 +3465,118 @@ struct AiView<'a> {
     /// Size, top edge and centring of the question and of the answer (they glide).
     q: (f32, f32, bool),
     a: (f32, f32, bool),
+}
+
+struct WinView<'a> {
+    wins: &'a [crate::switcher::Win],
+    prev: &'a HashMap<isize, ImageData>,
+    icons: &'a HashMap<String, Option<ImageData>>,
+    sel: usize,
+    /// How far the row is scrolled, in cards.
+    scroll: f32,
+    pop: f32,
+}
+
+/// Is the Alt key down right now?
+fn alt_down() -> bool {
+    let state = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) };
+    state as u16 & 0x8000 != 0
+}
+
+/// Where card `i` of `n` sits (the row is `scroll` cards along; with fewer cards than fit they are centred).
+fn sw_rect(i: usize, n: usize, scroll: f32) -> Rect {
+    let shown = n.clamp(1, SW_VIS) as f32;
+    let span = shown * SW_CW + (shown - 1.0) * SW_GAP;
+    let x0 = -E + (W3 - span) * 0.5;
+    Rect::new(x0 + (i as f32 - scroll) * (SW_CW + SW_GAP), PAD, SW_CW, SW_CH)
+}
+
+/// The pictures of windows are taken on a thread of their own, the ones in `order` one after the other; each
+/// is handed over with `WM_PREVIEW`.
+fn spawn_previews(order: Vec<(isize, bool)>, slot: PrevSlot, cancel: Arc<AtomicBool>, hwnd: SendHwnd) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = std::thread::Builder::new().name("launcher-previews".into()).spawn(move || {
+        for (h, minimized) in order {
+            if cancel.load(Relaxed) {
+                return;
+            }
+            if minimized {
+                continue;
+            }
+            if let Some(img) = crate::switcher::capture(h, 360) {
+                if cancel.load(Relaxed) {
+                    return;
+                }
+                if let Ok(mut g) = slot.lock() {
+                    g.push((h, img));
+                }
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd.hwnd()), WM_PREVIEW, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    });
+}
+
+/// The window switcher: a row of cards, each with a picture of the window, its title and its program.
+fn draw_windows(p: &mut Painter, card: Rect, v: &WinView) {
+    let a0 = p.alpha;
+    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    p.alpha = a0 * (0.35 + 0.65 * logic::ease_out((v.pop * 1.6).min(1.0)));
+    let n = v.wins.len();
+    if n == 0 {
+        p.icon(Icon::Grid, Rect::centered(card.cx(), card.y + 74.0, 52.0, 52.0), white(0.62));
+        let hint = TextStyle::new(11.5, white(0.80)).semibold().center();
+        p.text("No open windows", Rect::new(card.x + 10.0, card.y + 112.0, card.w - 20.0, 20.0), &hint);
+        p.alpha = a0;
+        return;
+    }
+    let (calm, calm_rim) = if light {
+        (Color::white(0.42), Color::white(0.55))
+    } else {
+        (Color::rgba(0.03, 0.04, 0.07, 0.50), Color::white(0.15))
+    };
+    p.push_clip(card);
+    for (i, w) in v.wins.iter().enumerate() {
+        let r = sw_rect(i, n, v.scroll);
+        if r.right() < card.x || r.x > card.right() {
+            continue;
+        }
+        let on = i == v.sel;
+        let lw = if on { 1.6 } else { 1.0 };
+        p.fill_rounded(r, SW_R, if on { sel_fill(light, 1.0) } else { calm });
+        p.stroke_rounded(r.inset(lw * 0.5), SW_R - lw * 0.5, lw, if on { sel_rim(light) } else { calm_rim });
+        // the picture of the window, whole, on a darker ground
+        let view = Rect::new(r.x + 10.0, r.y + 10.0, r.w - 20.0, 88.0);
+        p.fill_rounded(view, 12.0, Color::rgba(0.0, 0.0, 0.0, if light { 0.10 } else { 0.28 }));
+        let icon = v.icons.get(&w.exe).and_then(|o| o.as_ref());
+        match v.prev.get(&w.hwnd) {
+            Some(img) => {
+                let k = (view.w / img.width as f32).min(view.h / img.height as f32);
+                let fit = Rect::centered(view.cx(), view.cy(), img.width as f32 * k, img.height as f32 * k);
+                p.image(img, fit, 8.0, 1.0);
+            }
+            None => {
+                if let Some(ic) = icon {
+                    p.image(ic, Rect::centered(view.cx(), view.cy(), 44.0, 44.0), 0.0, 0.85);
+                }
+            }
+        }
+        if let Some(ic) = icon {
+            p.image(ic, Rect::new(r.x + 12.0, r.y + 106.0, 20.0, 20.0), 0.0, 1.0);
+        }
+        let tx = r.x + 38.0;
+        let tw = r.right() - tx - 12.0;
+        let title = if w.title.is_empty() { "(no title)" } else { w.title.as_str() };
+        p.text(title, Rect::new(tx, r.y + 104.0, tw, 18.0), &TextStyle::new(12.0, white(0.95)).semibold());
+        let sub = if w.minimized { format!("{} \u{b7} minimised", w.app()) } else { w.app() };
+        p.text(&sub, Rect::new(tx, r.y + 122.0, tw, 16.0), &TextStyle::new(10.5, white(0.55)));
+    }
+    p.pop_clip();
+    let note = format!("{} of {}  \u{b7}  Tab or \u{2190} \u{2192} choose  \u{b7}  Enter opens", v.sel + 1, n);
+    let foot = Rect::new(card.x + 10.0, card.bottom() - 24.0, card.w - 20.0, 16.0);
+    p.text(&note, foot, &TextStyle::new(10.5, white(0.45)).center());
+    p.alpha = a0;
 }
 
 struct RunView<'a> {

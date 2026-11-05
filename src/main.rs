@@ -22,6 +22,7 @@ mod pacer;
 mod procs;
 mod radial;
 mod refract;
+mod switcher;
 mod sys;
 mod taskbar;
 mod tray;

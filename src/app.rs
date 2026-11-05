@@ -1900,6 +1900,8 @@ impl App {
             Action::LauncherClip => self.launcher_clip_toggle(),
             Action::LauncherAi => self.launcher_ai_toggle(),
             Action::LauncherRun => self.launcher_run_toggle(),
+            Action::LauncherSwitch => self.launcher_switch(false),
+            Action::LauncherSwitchBack => self.launcher_switch(true),
             Action::Radial => self.radial_toggle(),
             Action::WindowMax => hotkeys::maximize_active(),
             Action::WindowClose => hotkeys::close_active(),
@@ -2058,6 +2060,7 @@ impl App {
                 self.cfg.hotkeys.window_close.as_str(),
                 self.cfg.hotkeys.radial.as_str(),
                 self.cfg.hotkeys.launcher_run.as_str(),
+                self.cfg.hotkeys.launcher_switch.as_str(),
             ],
         );
         self.hotkeys = ok;
@@ -3773,6 +3776,14 @@ impl App {
         let cfg = self.launcher_cfg();
         self.launcher.as_mut()?.configure(cfg);
         Some(self.cfg.appearance.scale)
+    }
+
+    /// The switcher hotkey (Alt+Tab): the launcher as a row of the open windows; pressed again it steps on.
+    fn launcher_switch(&mut self, back: bool) {
+        let Some(scale) = self.launcher_ready() else { return };
+        if let Some(l) = self.launcher.as_mut() {
+            l.windows_step(&self.gfx, scale, back);
+        }
     }
 
     /// The Run hotkey (Win+R): the launcher as one Run box, or put it away again.

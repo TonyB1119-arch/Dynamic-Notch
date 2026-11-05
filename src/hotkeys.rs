@@ -25,6 +25,10 @@ pub enum Action {
     LauncherAi,
     /// The launcher as a Run box.
     LauncherRun,
+    /// The window switcher (Alt+Tab), forwards.
+    LauncherSwitch,
+    /// The window switcher, backwards (Alt+Shift+Tab).
+    LauncherSwitchBack,
     /// Maximise the window in front, or put it back.
     WindowMax,
     /// Close the window in front.
@@ -164,6 +168,8 @@ const MAX_ID: i32 = COMBO_BASE + 82;
 const CLOSE_ID: i32 = COMBO_BASE + 83;
 const RADIAL_ID: i32 = COMBO_BASE + 84;
 const RUN_ID: i32 = COMBO_BASE + 85;
+const SWITCH_ID: i32 = COMBO_BASE + 86;
+const SWITCH_BACK_ID: i32 = COMBO_BASE + 87;
 
 /// Is this a key combination a combo may use? It needs Ctrl, Alt, Shift or Win (or be an F key), so a
 /// combo can't take over a plain letter.
@@ -191,8 +197,8 @@ pub fn split_item(item: &str) -> (&str, &str, &str) {
 
 /// Hand the user's combos to the keyboard hook (`lowkeys`), which sees every key before Windows does.
 /// Returns what can be used and what cannot.
-/// `own` are the keys of the built-in ones that need the hook: clipboard, Gemini, maximise, close, radial, run.
-pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 6]) -> (Vec<Registered>, Vec<String>) {
+/// `own` are the keys of the built-in ones that need the hook: clipboard, Gemini, maximise, close, radial, run, switcher.
+pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 7]) -> (Vec<Registered>, Vec<String>) {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
     let mut table = Vec::new();
@@ -204,6 +210,7 @@ pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 6]) -> (Vec<Reg
         (own[3], CLOSE_ID, Action::WindowClose),
         (own[4], RADIAL_ID, Action::Radial),
         (own[5], RUN_ID, Action::LauncherRun),
+        (own[6], SWITCH_ID, Action::LauncherSwitch),
     ] {
         let keys = keys.trim();
         if keys.is_empty() {
@@ -214,6 +221,11 @@ pub fn register_combos(hwnd: HWND, items: &[String], own: [&str; 6]) -> (Vec<Reg
                 if let Some((mods, vk)) = parse(keys) {
                     table.push((mods.0 & 0xF, vk, id));
                     ok.push(Registered { id, action });
+                    if id == SWITCH_ID {
+                        // the same keys with Shift go the other way round
+                        table.push(((mods.0 & 0xF) | MOD_SHIFT.0, vk, SWITCH_BACK_ID));
+                        ok.push(Registered { id: SWITCH_BACK_ID, action: Action::LauncherSwitchBack });
+                    }
                 }
             }
             Err(e) => errors.push(format!("{keys}: {e}")),

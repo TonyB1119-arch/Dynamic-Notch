@@ -1219,7 +1219,7 @@ fn running_apps(hide: &[String]) -> Vec<(String, isize)> {
     out
 }
 
-unsafe fn is_app_window(h: HWND) -> bool {
+pub(crate) unsafe fn is_app_window(h: HWND) -> bool {
     if !IsWindowVisible(h).as_bool() {
         return false;
     }
@@ -1243,7 +1243,7 @@ unsafe fn is_app_window(h: HWND) -> bool {
     !matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
 }
 
-fn exe_of(pid: u32) -> String {
+pub(crate) fn exe_of(pid: u32) -> String {
     if pid <= 4 {
         return String::new();
     }
