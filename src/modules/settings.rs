@@ -293,7 +293,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 20.0,
+        8 => 21.0,
         9 => 34.0,
         10 => 14.0,
         11 => 22.0,
@@ -1106,6 +1106,7 @@ impl Settings {
         toggle_row(ui, row_rect(body, 16), "Liquid glass: dock", d.glass, "dock", "glass");
         toggle_row(ui, row_rect(body, 17), "Liquid glass: launcher", l.glass, "launcher", "glass");
         toggle_row(ui, row_rect(body, 18), "Launcher: live blur (hides it from screenshots)", l.live, "launcher", "live");
+        toggle_row(ui, row_rect(body, 20), "Launcher: one box (off = two boxes)", l.single_box, "launcher", "single_box");
         slider_row(
             ui,
             row_rect(body, 19),

@@ -1080,9 +1080,16 @@ impl Launcher {
         }
     }
 
-    /// The card is one wide box in the Run mode.
+    /// The card is one wide box in the Run mode, and in the others until the box with the things to do
+    /// with the match is asked for (Right arrow, Ctrl+K, a click on it, a choice or a confirmation).
     fn rw_target(&self) -> f32 {
-        if self.mode == Mode::Run || self.one_box {
+        let alone = self.cfg.single_box
+            && matches!(self.mode, Mode::Search | Mode::Clip | Mode::Emoji)
+            && self.focus == Focus::Subject
+            && self.pending.is_none()
+            && self.armed.is_none()
+            && self.pick.is_none();
+        if self.mode == Mode::Run || self.one_box || alone {
             1.0
         } else {
             0.0
@@ -2458,7 +2465,11 @@ impl Launcher {
                     self.run();
                     return Some(LRESULT(0));
                 }
-                let (sub, act) = (Rect::new(PAD, PAD, BOX, BOX), Rect::new(PAD + BOX + GAP, PAD, BOX, BOX));
+                let (sub, act) = if self.rw_target() > 0.5 {
+                    (Rect::new(PAD, PAD, W - 2.0 * PAD, BOX), Rect::new(0.0, 0.0, 0.0, 0.0))
+                } else {
+                    (Rect::new(PAD, PAD, BOX, BOX), Rect::new(PAD + BOX + GAP, PAD, BOX, BOX))
+                };
                 let want = if sub.contains(x, y) {
                     Some(Focus::Subject)
                 } else if act.contains(x, y) {
@@ -2939,7 +2950,7 @@ impl Launcher {
                 pop: self.pop_s,
                 pop_a: self.pop_a,
             };
-            let (both, both3, one) = ([Some(sub), Some(act)], [Some(sub), Some(act), Some(third)], [None]);
+            let (both, both3, one) = ([Some(sub_box), Some(act)], [Some(sub_box), Some(act), Some(third)], [None]);
             let passes: &[Option<Rect>] = if !popping {
                 &one
             } else if kill_ui {
@@ -3020,29 +3031,51 @@ impl Launcher {
                         a: (self.ai.a.sz, self.ai.a.y, self.ai.a.center),
                     };
                     ai_max = draw_ai(&mut p, sub, act, &view);
-                } else if self.one_box && self.mode == Mode::Search && self.pending.is_none() {
-                    // a combo's flash: the app's picture and name in one box
-                    draw_subject(&mut p, sub_box, &subject);
                 } else {
-                    draw_subject(&mut p, sub, &subject);
-                    match &self.pending {
-                        Some((a, _)) => {
-                            let target_icon =
-                                cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
-                            draw_target(
-                                &mut p,
-                                act,
-                                cur.as_ref(),
-                                target_icon,
-                                a.label().trim_end_matches('\u{2026}'),
-                                self.pop_a,
-                                &ctb,
-                            );
+                    // the right box (what to do with the match) is only there when asked for: until then the
+                    // left box is the whole card, with a line saying what Enter does
+                    draw_subject(&mut p, sub_box, &subject);
+                    if rw > 0.5 && !self.one_box && self.pending.is_none() && peek.is_none() {
+                        if let Some(h) =
+                            cur.as_ref().filter(|h| !matches!(h.kind, Kind::Clip | Kind::Weather | Kind::Day))
+                        {
+                            let acts = actions(h);
+                            let line = if acts.len() > 1 {
+                                format!("Enter  {}    \u{b7}    Ctrl+K  more", acts[0].label())
+                            } else {
+                                format!("Enter  {}", acts[0].label())
+                            };
+                            let a_in = p.alpha;
+                            p.alpha = a_in * ((rw - 0.5) * 2.0);
+                            let hint = Rect::new(sub_box.x + 10.0, sub_box.bottom() - 26.0, sub_box.w - 20.0, 16.0);
+                            p.text(&line, hint, &TextStyle::new(10.5, white(0.50)).center());
+                            p.alpha = a_in;
                         }
-                        None => {
-                            let armed = cur.as_ref().is_some_and(|h| self.armed.as_deref() == Some(h.path.as_str()));
-                            draw_action(&mut p, act, cur.as_ref(), self.act, armed, self.pop_a, &ctb);
+                    }
+                    if rw < 0.995 {
+                        let a_in = p.alpha;
+                        p.alpha = a_in * (1.0 - rw);
+                        match &self.pending {
+                            Some((a, _)) => {
+                                let target_icon =
+                                    cur.as_ref().and_then(|h| self.icons.get(&h.path)).and_then(|o| o.as_ref());
+                                draw_target(
+                                    &mut p,
+                                    act,
+                                    cur.as_ref(),
+                                    target_icon,
+                                    a.label().trim_end_matches('\u{2026}'),
+                                    self.pop_a,
+                                    &ctb,
+                                );
+                            }
+                            None => {
+                                let armed =
+                                    cur.as_ref().is_some_and(|h| self.armed.as_deref() == Some(h.path.as_str()));
+                                draw_action(&mut p, act, cur.as_ref(), self.act, armed, self.pop_a, &ctb);
+                            }
                         }
+                        p.alpha = a_in;
                     }
                 }
                 if only.is_some() {
