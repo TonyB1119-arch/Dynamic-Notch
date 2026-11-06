@@ -82,8 +82,10 @@ struct Glow {
 }
 
 /// Seconds for the light to come up, and for it to ease away after the release.
-const GLOW_RAMP: f32 = 0.08;
-const GLOW_FADE: f32 = 0.34;
+const GLOW_RAMP: f32 = 0.14;
+const GLOW_FADE: f32 = 0.6;
+/// Seconds for the light to spread out to its full size.
+const GLOW_SPREAD: f32 = 0.7;
 
 static GLOW_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// The glow's strength (0 - 1) as `f32` bits; 0.5 to begin with.
@@ -404,16 +406,20 @@ impl<'p, 'a> Ui<'p, 'a> {
             };
             let e = &g[i];
             let age = now.saturating_duration_since(e.t0).as_secs_f32();
-            Some((e.x, e.y, level, age, e.rel.is_some() || age < GLOW_RAMP))
+            Some((e.x, e.y, level, age, e.rel.is_some() || age < GLOW_SPREAD))
         });
         let Some((x, y, level, age, changing)) = live else { return };
         let a = amt * level;
-        if a > 0.003 {
-            // the light spreads from the pointer a little further each frame, easing out
-            let s = (age / 0.38).min(1.0);
-            let spread = (r.w.max(r.h) * (0.35 + 0.75 * s * (2.0 - s))).max(24.0);
+        if a > 0.002 {
+            // a small light that opens slowly from the pointer, easing out, and is dimmer the further
+            // from the pointer it is, down to nothing at its edge
+            let s = (age / GLOW_SPREAD).min(1.0);
+            let ease = 1.0 - (1.0 - s) * (1.0 - s) * (1.0 - s);
+            let reach = (r.h.min(r.w) * 1.1 + r.w.max(r.h) * 0.2).clamp(28.0, 90.0);
             let white = |k: f32| Color::white(k * a);
-            self.p.glow_rounded(r, radius, x, y, spread, &[(0.0, white(0.55)), (0.5, white(0.22)), (1.0, white(0.06))]);
+            let stops =
+                [(0.0, white(0.42)), (0.25, white(0.23)), (0.5, white(0.09)), (0.75, white(0.02)), (1.0, white(0.0))];
+            self.p.glow_rounded(r, radius, x, y, reach * (0.3 + 0.7 * ease), &stops);
         }
         if changing {
             self.fx.animate = true;

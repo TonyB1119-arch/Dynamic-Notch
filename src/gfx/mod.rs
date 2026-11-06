@@ -688,13 +688,13 @@ impl<'a> Painter<'a> {
     }
 
     /// A rounded rectangle filled with a radial gradient centred on (`cx`, `cy`) and reaching `spread`
-    /// pixels out; `stops` are (position 0..1, color), at most four. Made for short-lived light (the press
+    /// pixels out; `stops` are (position 0..1, color), at most six. Made for short-lived light (the press
     /// glow), so nothing is cached.
     pub fn glow_rounded(&self, r: Rect, radius: f32, cx: f32, cy: f32, spread: f32, stops: &[(f32, Color)]) {
         if stops.len() < 2 || spread < 0.5 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
-        let mut buf = [D2D1_GRADIENT_STOP::default(); 4];
+        let mut buf = [D2D1_GRADIENT_STOP::default(); 6];
         let n = stops.len().min(buf.len());
         for (slot, (pos, c)) in buf.iter_mut().zip(stops) {
             *slot = D2D1_GRADIENT_STOP { position: *pos, color: d2c(c.alpha(self.alpha)) };
