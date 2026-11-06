@@ -30,13 +30,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
-    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_BLURREGION, DWM_BB_ENABLE,
-    DWM_BLURBEHIND,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_HOSTBACKDROPBRUSH,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, GetStockObject, MonitorFromPoint,
-    SetWindowRgn, BLACK_BRUSH, HBRUSH, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
+    CreateRectRgn, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -53,7 +51,6 @@ use crate::sys::{self, clip, dragdrop};
 use crate::util::{app_dir, Color, Rect, SendHwnd};
 
 const CLASS: PCWSTR = w!("DynamicNotch.Launcher");
-const BLUR_CLASS: PCWSTR = w!("DynamicNotch.LauncherBlur");
 const T_ANIM: usize = 1;
 const T_ICON: usize = 2;
 const T_TRIM: usize = 3;
@@ -532,11 +529,6 @@ pub struct Launcher {
     win_px: (i32, i32, i32, i32),
     region_h: i32,
     region_x: i32,
-    /// The window that carries Windows' own blur behind the glass (made the first time it is needed).
-    blur_win: Option<HWND>,
-    blur_shown: bool,
-    /// Where that window and its shape were last put (see `blur_follow`).
-    live_key: [i32; 14],
     // the Kill mode: the programs as last looked at, and the numbers the gauges glide to
     sampler: Option<procs::Sampler>,
     snap: Option<procs::Snap>,
@@ -647,9 +639,6 @@ impl Launcher {
             win_px: (0, 0, 0, 0),
             region_h: -1,
             region_x: 0,
-            blur_win: None,
-            blur_shown: false,
-            live_key: [i32::MIN; 14],
             sampler: None,
             snap: None,
             procs_slot: Arc::new(Mutex::new(None)),
@@ -1026,7 +1015,6 @@ impl Launcher {
         self.ram_s = 0.0;
         self.arm_t = 0.0;
         self.windows_close();
-        self.blur_follow(None);
         if self.live {
             self.live = false;
             unsafe {
@@ -1243,91 +1231,6 @@ impl Launcher {
             let rgn = CreateRectRgn(l, 0, r, h);
             SetWindowRgn(self.hwnd, Some(rgn), false);
         }
-    }
-
-    /// Puts the blur window right behind the glass: the card and the list (window pixels, with their
-    /// corner radii) cut out of a window with Windows' own acrylic blur, or hides it with `None`. The
-    /// window and its shape are only touched when something moves a pixel.
-    fn blur_follow(&mut self, shape: Option<(Rect, f32, Option<(Rect, f32)>)>) {
-        let Some((card, card_r, list)) = shape else {
-            if self.blur_shown {
-                self.blur_shown = false;
-                if let Some(h) = self.blur_win {
-                    unsafe {
-                        let _ = ShowWindow(h, SW_HIDE);
-                    }
-                }
-            }
-            self.live_key = [i32::MIN; 14];
-            return;
-        };
-        if self.blur_win.is_none() {
-            self.blur_win = create_blur_window();
-        }
-        let Some(blur) = self.blur_win else { return };
-        let px = |v: f32| v.round() as i32;
-        let (lr, lrad) = list.unwrap_or((Rect::new(0.0, 0.0, 0.0, 0.0), 0.0));
-        let (left, top) = (px(card.x.min(if list.is_some() { lr.x } else { card.x })), px(card.y));
-        let right = px((card.x + card.w).max(if list.is_some() { lr.x + lr.w } else { 0.0 }));
-        let bottom = px((card.y + card.h).max(if list.is_some() { lr.y + lr.h } else { 0.0 }));
-        let key = [
-            left,
-            top,
-            right,
-            bottom,
-            px(card.x),
-            px(card.y),
-            px(card.w),
-            px(card.h),
-            px(card_r),
-            px(lr.x),
-            px(lr.y),
-            px(lr.w),
-            px(lr.h),
-            px(lrad),
-        ];
-        if key == self.live_key && self.blur_shown {
-            return;
-        }
-        self.live_key = key;
-        let (wx, wy, _, _) = self.win_px;
-        unsafe {
-            let round = |r: Rect, rad: f32| {
-                CreateRoundRectRgn(
-                    px(r.x) - left,
-                    px(r.y) - top,
-                    px(r.x + r.w) - left + 1,
-                    px(r.y + r.h) - top + 1,
-                    px(rad * 2.0),
-                    px(rad * 2.0),
-                )
-            };
-            let shape = || {
-                let rgn = round(card, card_r);
-                if list.is_some() {
-                    let second = round(lr, lrad);
-                    CombineRgn(Some(rgn), Some(rgn), Some(second), RGN_OR);
-                    let _ = DeleteObject(second.into());
-                }
-                rgn
-            };
-            // the window is cut to the glass, and Windows blurs only inside that same shape
-            SetWindowRgn(blur, Some(shape()), false);
-            let area = shape();
-            blur_behind(blur, area);
-            let _ = DeleteObject(area.into());
-            // just below the launcher itself
-            let _ = SetWindowPos(
-                blur,
-                Some(self.hwnd),
-                wx + left,
-                wy + top,
-                (right - left).max(1),
-                (bottom - top).max(1),
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-        }
-        self.blur_shown = true;
     }
 
     // -- search -----------------------------------------------------------------------------------------
@@ -2839,8 +2742,8 @@ impl Launcher {
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
-        // live blur: Windows' own blur sits in a window of its own right behind this one, cut to the glass
-        if self.live && self.open && self.anim >= 0.25 {
+        // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
+        if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
             let s0 = self.open_scale();
             let (ax, ay) = (W * 0.5, FRAME_H * 0.5);
@@ -2853,16 +2756,18 @@ impl Launcher {
                 )
             };
             let grown = E * self.kw.clamp(0.0, 1.0);
-            let card = map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H));
+            self.host.set_backdrop_rounded(map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H)), CARD_R * s0 * sc, e);
             let lh = self.lh.max(0.0);
-            let list = (lh > 8.0).then(|| (map(Rect::new(0.0, LIST_Y, W, lh)), LIST_R.min(lh * 0.5) * s0 * sc));
-            self.blur_follow(Some((card, CARD_R * s0 * sc, list)));
+            if lh > 8.0 {
+                let r = LIST_R.min(lh * 0.5) * s0 * sc;
+                self.host.set_backdrop2_rounded(map(Rect::new(0.0, LIST_Y, W, lh)), r, e);
+            } else {
+                self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            }
         } else {
-            self.blur_follow(None);
+            self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         }
-        // the composition backdrop is not used by the launcher
-        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
-        self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         let mut ai_goal = None;
         let mut ai_agoal = None;
         let (dc, _) = match self.host.begin_draw() {
@@ -3255,14 +3160,16 @@ fn draw_glass(p: &mut Painter, g: &Glass, r: Rect, radius: f32) {
         // Windows' own blur behind: only the tint is drawn here, never less than a clear body so the glass
         // never turns see-through (even where the blur is switched off in Windows)
         None if g.native => {
+            // Windows' blur is already smoky by itself, so the tints here are much lighter than over the
+            // plain screen picture (stacked, they made the glass look solid)
             let tint = if g.light {
-                Color::rgba(0.95, 0.97, 1.0, (0.12 + 0.40 * g.dark).max(0.34))
+                Color::rgba(0.95, 0.97, 1.0, (0.12 + 0.40 * g.dark) * 0.5)
             } else {
-                Color::rgba(0.03, 0.03, 0.05, (0.62 * g.dark).max(0.30))
+                Color::rgba(0.03, 0.03, 0.05, 0.62 * g.dark * 0.4)
             };
             p.fill_rounded(r, radius, tint);
             if !g.light && g.tint > 0.005 {
-                p.fill_rounded(r, radius, Color::rgba(0.07, 0.07, 0.08, g.tint));
+                p.fill_rounded(r, radius, Color::rgba(0.07, 0.07, 0.08, g.tint * 0.4));
             }
         }
         // glass off, or no picture of the screen: a solid piece
@@ -4180,56 +4087,6 @@ fn draw_list(p: &mut Painter, v: &ListView) {
 }
 
 // -- window and background work --------------------------------------------------------------------------
-
-extern "system" fn blur_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
-}
-
-/// The window behind the glass that carries Windows' own blur: plain, click-through, never active.
-fn create_blur_window() -> Option<HWND> {
-    unsafe {
-        let hinst = GetModuleHandleW(None).ok()?;
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(blur_proc),
-            hInstance: hinst.into(),
-            lpszClassName: BLUR_CLASS,
-            // black is what the blur shows through
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            BLUR_CLASS,
-            w!(""),
-            WS_POPUP,
-            0,
-            0,
-            1,
-            1,
-            None,
-            None,
-            Some(hinst.into()),
-            None,
-        )
-        .ok()
-    }
-}
-
-/// Windows' own blur behind the part of a window inside `area` (the glass shape), so the corners and the
-/// gap between the card and the list stay clear.
-fn blur_behind(hwnd: HWND, area: HRGN) {
-    let bb = DWM_BLURBEHIND {
-        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-        fEnable: BOOL(1),
-        hRgnBlur: area,
-        fTransitionOnMaximized: BOOL(0),
-    };
-    unsafe {
-        let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
-    }
-}
 
 fn create_window() -> windows::core::Result<HWND> {
     unsafe {
