@@ -30,13 +30,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_HOSTBACKDROPBRUSH,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
+    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -529,6 +531,8 @@ pub struct Launcher {
     win_px: (i32, i32, i32, i32),
     region_h: i32,
     region_x: i32,
+    /// The rounded outline last given to the window while Windows' own blur is on (see `live_region`).
+    live_key: [i32; 10],
     // the Kill mode: the programs as last looked at, and the numbers the gauges glide to
     sampler: Option<procs::Sampler>,
     snap: Option<procs::Snap>,
@@ -639,6 +643,7 @@ impl Launcher {
             win_px: (0, 0, 0, 0),
             region_h: -1,
             region_x: 0,
+            live_key: [i32::MIN; 10],
             sampler: None,
             snap: None,
             procs_slot: Arc::new(Mutex::new(None)),
@@ -950,10 +955,11 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // the glass blurs with Windows' own live backdrop, always (nothing is copied, so a playing video or
-            // anything else behind it keeps moving and the window stays in screenshots); with `live = false`
-            // it is one picture taken now
-            self.live = self.cfg.glass && self.cfg.live;
+            // live: Windows' own acrylic blur behind the card (nothing is copied, so a playing video or
+            // anything else behind it keeps moving and the window stays in screenshots). Where Windows
+            // cannot do that (before Windows 11 22H2) or with `live = false`, it is one picture taken now
+            self.live = self.cfg.glass && self.cfg.live && native_blur(self.hwnd, true);
+            self.live_key = [i32::MIN; 10];
             self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
             self.lh = 0.0;
@@ -1019,8 +1025,10 @@ impl Launcher {
             self.live = false;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_LIVE);
-                let _ = SetWindowDisplayAffinity(self.hwnd, WDA_NONE);
+                native_blur(self.hwnd, false);
             }
+            // the next time, the plain region is made again
+            self.region_h = -1;
         }
         self.sw = 1.0;
         self.query.clear();
@@ -1229,6 +1237,43 @@ impl Launcher {
         self.region_x = l;
         unsafe {
             let rgn = CreateRectRgn(l, 0, r, h);
+            SetWindowRgn(self.hwnd, Some(rgn), false);
+        }
+    }
+
+    /// With Windows' own blur the window's shape is the glass: the card (and the list under it) as rounded
+    /// outlines, so the blur never shows outside them. Remade only when an outline moves a pixel.
+    fn live_region(&mut self, card: Rect, card_r: f32, list: Option<(Rect, f32)>) {
+        let px = |v: f32| v.round() as i32;
+        let l = list.unwrap_or((Rect::new(0.0, 0.0, 0.0, 0.0), 0.0));
+        let key = [
+            px(card.x),
+            px(card.y),
+            px(card.w),
+            px(card.h),
+            px(card_r),
+            px(l.0.x),
+            px(l.0.y),
+            px(l.0.w),
+            px(l.0.h),
+            px(l.1),
+        ];
+        if key == self.live_key {
+            return;
+        }
+        self.live_key = key;
+        let round = |r: Rect, rad: f32| unsafe {
+            CreateRoundRectRgn(px(r.x), px(r.y), px(r.x + r.w) + 1, px(r.y + r.h) + 1, px(rad * 2.0), px(rad * 2.0))
+        };
+        let rgn = round(card, card_r);
+        if list.is_some() {
+            let second = round(l.0, l.1);
+            unsafe {
+                CombineRgn(Some(rgn), Some(rgn), Some(second), RGN_OR);
+                let _ = DeleteObject(second.into());
+            }
+        }
+        unsafe {
             SetWindowRgn(self.hwnd, Some(rgn), false);
         }
     }
@@ -2737,12 +2782,14 @@ impl Launcher {
         let open_s = self.open_scale();
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
+        if !self.live {
+            self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
+        }
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
-        // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
+        // Windows blurs what is behind the window, shaped by the window's region: that follows the glass
         if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
             let s0 = self.open_scale();
@@ -2756,18 +2803,14 @@ impl Launcher {
                 )
             };
             let grown = E * self.kw.clamp(0.0, 1.0);
-            self.host.set_backdrop_rounded(map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H)), CARD_R * s0 * sc, e);
+            let card = map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H));
             let lh = self.lh.max(0.0);
-            if lh > 8.0 {
-                let r = LIST_R.min(lh * 0.5) * s0 * sc;
-                self.host.set_backdrop2_rounded(map(Rect::new(0.0, LIST_Y, W, lh)), r, e);
-            } else {
-                self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
-            }
-        } else {
-            self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
-            self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            let list = (lh > 8.0).then(|| (map(Rect::new(0.0, LIST_Y, W, lh)), LIST_R.min(lh * 0.5) * s0 * sc));
+            self.live_region(card, CARD_R * s0 * sc, list);
         }
+        // the composition backdrop is not used by the launcher
+        self.host.set_backdrop_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+        self.host.set_backdrop2_rounded(Rect::new(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
         let mut ai_goal = None;
         let mut ai_agoal = None;
         let (dc, _) = match self.host.begin_draw() {
@@ -4085,6 +4128,20 @@ fn draw_list(p: &mut Painter, v: &ListView) {
 }
 
 // -- window and background work --------------------------------------------------------------------------
+
+/// Turns Windows' own acrylic blur behind the whole window on or off (the window's region shapes it).
+/// False where Windows cannot do it (before Windows 11 22H2).
+fn native_blur(hwnd: HWND, on: bool) -> bool {
+    unsafe {
+        if on {
+            let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        }
+        // DWMWA_SYSTEMBACKDROP_TYPE: 3 = acrylic for short-lived windows, 1 = none
+        let kind: i32 = if on { 3 } else { 1 };
+        DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(38), &kind as *const _ as _, 4).is_ok()
+    }
+}
 
 fn create_window() -> windows::core::Result<HWND> {
     unsafe {

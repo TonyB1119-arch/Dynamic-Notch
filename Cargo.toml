@@ -1,6 +1,6 @@
 [package]
 name = "dynamic-notch"
-version = "3.0.184"
+version = "3.0.185"
 edition = "2021"
 description = "A MacBook-style dynamic notch / desktop island for Windows"
 license = "MIT"
@@ -95,6 +95,7 @@ features = [
     "Win32_System_WinRT_Composition",
     "Win32_System_Wmi",
     "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
