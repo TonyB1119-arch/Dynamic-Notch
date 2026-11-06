@@ -36,6 +36,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
+use windows::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenuEx, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CLOSE, WM_NULL,
+};
+
 use super::widgets::scroll;
 use crate::gfx::{Icon, ImageData, TextStyle};
 use crate::ui::{ButtonStyle, Ui};
@@ -61,6 +67,8 @@ static SPY: AtomicIsize = AtomicIsize::new(0);
 static ICONS: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 /// Where the icons are on screen right now (window coordinates), so a right-click can be matched to one.
 static TILES: Mutex<Vec<Rect>> = Mutex::new(Vec::new());
+/// The same for the icons Windows lists that never announced themselves: (place, index in FALLBACK).
+static FB_TILES: Mutex<Vec<(Rect, usize)>> = Mutex::new(Vec::new());
 
 /// The pointer is over a tray icon: the right-click belongs to that icon's app.
 pub fn over_tile(x: f32, y: f32) -> bool {
@@ -70,6 +78,78 @@ pub fn over_tile(x: f32, y: f32) -> bool {
 pub fn clear_tiles() {
     if let Ok(mut t) = TILES.lock() {
         t.clear();
+    }
+    if let Ok(mut t) = FB_TILES.lock() {
+        t.clear();
+    }
+}
+
+/// The listed (not announced) icon under the pointer, as its index.
+pub fn fb_at(x: f32, y: f32) -> Option<usize> {
+    FB_TILES.lock().ok().and_then(|t| t.iter().find(|(r, _)| r.contains(x, y)).map(|(_, i)| *i))
+}
+
+/// Such an app gave Windows no way to ask for its own menu, so right-click offers what can be done
+/// from outside: open it, close its windows, end it. Runs outside the app borrow (a menu waits).
+pub fn fb_menu(owner: HWND, idx: usize) {
+    let Some(f) = FALLBACK.lock().ok().and_then(|f| f.get(idx).cloned()) else { return };
+    let name = if f.tip.trim().is_empty() { f.name.clone() } else { f.tip.trim().to_string() };
+    let cmd = unsafe {
+        let menu = CreatePopupMenu().unwrap_or_default();
+        for (id, text) in [
+            (1usize, format!("Open {}", name.replace('&', "&&"))),
+            (2, "Close its windows".to_string()),
+            (3, "End task".to_string()),
+        ] {
+            let t: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(t.as_ptr()));
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(owner);
+        let flags = (TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0;
+        let c = TrackPopupMenuEx(menu, flags, pt.x, pt.y, owner, None);
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        c.0
+    };
+    match cmd {
+        1 => open_fb(&f),
+        2 => close_fb(&f),
+        3 => end_fb(&f),
+        _ => {}
+    }
+}
+
+/// Ask the program's visible windows to close (like the X button).
+fn close_fb(f: &Fb) {
+    struct Find {
+        pids: Vec<u32>,
+    }
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let f = &*(lp.0 as *const Find);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if f.pids.contains(&pid) && IsWindowVisible(h).as_bool() && GetWindowTextLengthW(h) > 0 {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        true.into()
+    }
+    let find = Find { pids: f.pids.clone() };
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&find as *const Find as isize));
+    }
+}
+
+/// Stop the program for good.
+fn end_fb(f: &Fb) {
+    for &pid in &f.pids {
+        unsafe {
+            if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                let _ = TerminateProcess(h, 1);
+                let _ = CloseHandle(h);
+            }
+        }
     }
 }
 
@@ -598,6 +678,7 @@ impl TrayList {
 
         let mut note: Option<String> = None;
         let mut hits: Vec<Rect> = Vec::new();
+        let mut fb_hits: Vec<(Rect, usize)> = Vec::new();
         if all.is_empty() {
             ui.empty_state(area, Icon::Grid, if scanning { "Looking for tray icons..." } else { "No tray icons found" });
         } else {
@@ -610,6 +691,9 @@ impl TrayList {
                     continue;
                 }
                 hits.push(tile);
+                if matches!(t, Tile::Reg(_)) {
+                    fb_hits.push((tile, k - list.len()));
+                }
                 let (hover, press) = ui.touch(tile, "tray");
                 if hover > 0.01 {
                     ui.hot = true;
@@ -637,9 +721,9 @@ impl TrayList {
                     }
                 }
                 if ui.right_clicked(tile) {
-                    match t {
-                        Tile::Live(e) => click(e, true),
-                        Tile::Reg(f) => open_fb(f),
+                    // (the listed icons get their own menu from the window procedure)
+                    if let Tile::Live(e) = t {
+                        click(e, true);
                     }
                 }
             }
@@ -649,6 +733,9 @@ impl TrayList {
         if let Ok(mut t) = TILES.lock() {
             *t = hits;
         }
+        if let Ok(mut t) = FB_TILES.lock() {
+            *t = fb_hits;
+        }
 
         // header: what the pointer is on, else a count
         ui.p.icon(Icon::Grid, Rect::new(head.x + 2.0, head.cy() - 9.0, 18.0, 18.0), palette::TEXT_DIM);
@@ -656,7 +743,7 @@ impl TrayList {
             (Some(n), _) => truncate_chars(n, 44),
             (None, true) => "Looking for tray icons...".to_string(),
             (None, false) if all.is_empty() => "Tray".to_string(),
-            (None, false) => format!("{} tray icons: click to open", all.len()),
+            (None, false) => format!("{} tray icons: click to open, right-click for the menu", all.len()),
         };
         ui.p.text(&text, Rect::new(head.x + 28.0, head.y, (rb.x - head.x - 36.0).max(0.0), head.h), &TextStyle::new(13.0, palette::TEXT).medium());
         if ui.icon_button(rb, Icon::Refresh, ButtonStyle::default().scale(0.6).fg(palette::TEXT_DIM)) {

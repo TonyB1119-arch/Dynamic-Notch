@@ -1767,6 +1767,15 @@ impl App {
         z
     }
 
+    /// A right-click on a listed (not announced) tray icon: its index, for the menu in window.rs.
+    pub fn tray_fb_at(&self, lp: LPARAM) -> Option<usize> {
+        if self.mode != Mode::Expanded || self.page != "control" {
+            return None;
+        }
+        let (x, y) = self.lp_to_logical(lp);
+        crate::modules::traylist::fb_at(x, y)
+    }
+
     /// A right-click on a tray icon of the Wi-Fi & Bluetooth page: true when it was taken.
     pub fn tray_right_click(&mut self, lp: LPARAM) -> bool {
         if self.mode != Mode::Expanded || self.page != "control" {

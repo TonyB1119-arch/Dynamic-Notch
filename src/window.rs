@@ -91,6 +91,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 }
 
 fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // A listed tray icon has no menu of its own to ask for: it gets a small one (a menu waits, so it runs here)
+    if msg == WM_RBUTTONUP {
+        if let Some(Some(i)) = with_app(|a| a.tray_fb_at(lp)) {
+            crate::modules::traylist::fb_menu(hwnd, i);
+            return LRESULT(0);
+        }
+    }
     // A right-click on a tray icon (Tray tab) goes to that icon's app, not to the notch's own menu.
     if msg == WM_RBUTTONUP && with_app(|a| a.tray_right_click(lp)) == Some(true) {
         return LRESULT(0);
