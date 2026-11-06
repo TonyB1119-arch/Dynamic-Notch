@@ -56,7 +56,7 @@ const ITEM_GAP: f32 = 2.0;
 const CC_W: f32 = 332.0;
 
 /// Every item the bar knows: (id, name).
-pub const ALL: [(&str, &str); 9] = [
+pub const ALL: [(&str, &str); 10] = [
     ("weather", "Weather"),
     ("cpu", "Processor"),
     ("ram", "Memory"),
@@ -66,6 +66,7 @@ pub const ALL: [(&str, &str); 9] = [
     ("sound", "Sound"),
     ("control", "Control Center"),
     ("clock", "Date & time"),
+    ("settings", "Settings"),
 ];
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -521,6 +522,7 @@ impl Bar {
             "cpu" | "ram" => self.open(Pop::Page("stats"), anchor),
             "battery" => self.open(Pop::Page("battery"), anchor),
             "clock" => self.open(Pop::Page("calendar"), anchor),
+            "settings" => self.open(Pop::Page("settings"), anchor),
             _ => {}
         }
     }
@@ -658,6 +660,7 @@ fn page_item(page: ModuleId) -> &'static str {
         "battery" => "battery",
         "calendar" => "clock",
         "control" => "wifi",
+        "settings" => "settings",
         _ => "control",
     }
 }
@@ -756,6 +759,7 @@ impl Bar {
                     })
                 }
                 "control" => c.icon = Some(Icon::Control),
+                "settings" => c.icon = Some(Icon::Settings),
                 "clock" => {
                     let (h, m, _, suffix, _) = crate::app::clock_parts();
                     let t = unsafe { GetLocalTime() };
@@ -942,7 +946,7 @@ impl Bar {
                     find_cell(&self.cells, want).unwrap_or(Rect::new(self.win_w - 40.0, 0.0, 24.0, bh))
                 };
                 let (pw, ph) = match pop {
-                    Pop::Control => (CC_W, 372.0),
+                    Pop::Control => (CC_W, 442.0),
                     Pop::Page(id) => {
                         let w = 380.0;
                         let hh =
@@ -1023,7 +1027,21 @@ impl Bar {
                             close_after = true;
                         }
                         let label = TextStyle::new(12.0, ink(0.8)).semibold();
-                        let dl = Rect::new(inner.x + 4.0, focus.bottom() + 10.0, inner.w, 16.0);
+                        let gear = Rect::new(inner.x, focus.bottom() + gap, inner.w, 50.0);
+                        tile(
+                            &mut p,
+                            gear,
+                            Icon::Settings,
+                            "Settings",
+                            "Look, bar, widgets and more",
+                            false,
+                            ctx.accent,
+                            over(gear),
+                        );
+                        if live && clicked(&input, gear) {
+                            next_pop = Some(Pop::Page("settings"));
+                        }
+                        let dl = Rect::new(inner.x + 4.0, gear.bottom() + 10.0, inner.w, 16.0);
                         p.text("Display", dl, &label);
                         let ds = Rect::new(inner.x, dl.bottom() + 2.0, inner.w, 36.0);
                         let bright = crate::modules::osd::brightness_now().unwrap_or(0.5);
