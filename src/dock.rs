@@ -237,7 +237,7 @@ impl Dock {
         }
         self.set_excl(bend);
         unsafe {
-            if bend {
+            if bend && self.glass.is_none() {
                 SetTimer(Some(self.hwnd), T_GLASS, 300, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), T_GLASS);
@@ -818,8 +818,10 @@ impl Dock {
             }
             WM_TIMER if wp.0 == T_GLASS => {
                 self.glass_tick();
-                unsafe {
-                    SetTimer(Some(self.hwnd), T_GLASS, 300, None);
+                if self.glass.is_none() {
+                    unsafe {
+                        SetTimer(Some(self.hwnd), T_GLASS, 300, None);
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -1028,7 +1030,14 @@ impl Dock {
     /// Look at the screen behind the bar again (a few times a second, and soon after the bar changed size) and
     /// make a new glass edge from it, on a thread of its own; nothing is done while the screen looks the same.
     fn glass_tick(&mut self) {
-        if self.glass_busy || !self.excl || !self.shown || self.hide_t > 0.02 || self.win_px.2 == 0 {
+        if self.glass_busy
+            || self.glass.is_some()
+            || self.anim_on
+            || !self.excl
+            || !self.shown
+            || self.hide_t > 0.02
+            || self.win_px.2 == 0
+        {
             return;
         }
         let (base, mag, gap, _) = self.sizes();
@@ -1070,6 +1079,10 @@ impl Dock {
             }
         }
         if redraw {
+            // the one picture is made: no more looking at the screen
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_GLASS);
+            }
             self.draw(gfx);
         }
     }
@@ -1115,7 +1128,7 @@ impl Dock {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_ANIM);
                 // the bar has its resting size: make the glass edge for it soon
-                if self.excl {
+                if self.excl && self.glass.is_none() {
                     SetTimer(Some(self.hwnd), T_GLASS, 60, None);
                 }
             }

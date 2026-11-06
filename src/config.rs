@@ -601,7 +601,7 @@ pub struct DockCfg {
     /// How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur).
     pub blur: f32,
     /// The dock's edge bends the screen behind it like thick glass (the look is Settings -> Glass). It copies the
-    /// screen a few times a second, so the dock is hidden from screenshots while this is on.
+    /// screen once, so the dock is hidden from screenshots while this is on.
     pub refract: bool,
 }
 
@@ -1338,7 +1338,7 @@ opacity = 0.30
 # How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur)
 blur = 0.25
 # The dock's edge bends the screen behind it like thick glass (Settings -> Glass sets the look). It looks at the
-# screen a few times a second and is hidden from screenshots while on.
+# screen once and is hidden from screenshots while on.
 refract = true
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
