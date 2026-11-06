@@ -594,6 +594,7 @@ impl App {
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Release);
         crate::ui::set_white_beams(cfg.appearance.white_beams);
         crate::ui::set_look(&cfg.appearance.look);
+        crate::ui::set_glow(cfg.glass.glow, cfg.glass.glow_amount);
         crate::ui::set_mono_icons(cfg.appearance.mono_icons);
         let anim = Anim::new(cfg.appearance.notch_width, cfg.appearance.notch_height);
         Ok(Box::new(App {
@@ -2034,6 +2035,7 @@ impl App {
                 self.cfg = c;
                 crate::ui::set_white_beams(self.cfg.appearance.white_beams);
                 crate::ui::set_look(&self.cfg.appearance.look);
+                crate::ui::set_glow(self.cfg.glass.glow, self.cfg.glass.glow_amount);
                 crate::ui::set_mono_icons(self.cfg.appearance.mono_icons);
                 self.dock_apply();
                 self.sync_taskbar();

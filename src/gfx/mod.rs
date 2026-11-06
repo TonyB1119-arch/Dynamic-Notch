@@ -687,6 +687,40 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// A rounded rectangle filled with a radial gradient centred on (`cx`, `cy`) and reaching `spread`
+    /// pixels out; `stops` are (position 0..1, color), at most four. Made for short-lived light (the press
+    /// glow), so nothing is cached.
+    pub fn glow_rounded(&self, r: Rect, radius: f32, cx: f32, cy: f32, spread: f32, stops: &[(f32, Color)]) {
+        if stops.len() < 2 || spread < 0.5 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let mut buf = [D2D1_GRADIENT_STOP::default(); 4];
+        let n = stops.len().min(buf.len());
+        for (slot, (pos, c)) in buf.iter_mut().zip(stops) {
+            *slot = D2D1_GRADIENT_STOP { position: *pos, color: d2c(c.alpha(self.alpha)) };
+        }
+        let rad = radius.min(r.w * 0.5).min(r.h * 0.5);
+        let rr = D2D1_ROUNDED_RECT { rect: rf(r), radiusX: rad, radiusY: rad };
+        let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+            center: v2(cx, cy),
+            gradientOriginOffset: v2(0.0, 0.0),
+            radiusX: spread,
+            radiusY: spread,
+        };
+        unsafe {
+            let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+                &self.dc,
+                &buf[..n],
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            ) else {
+                return;
+            };
+            let Ok(brush) = self.dc.CreateRadialGradientBrush(&props, None, &coll) else { return };
+            self.dc.FillRoundedRectangle(&rr, &brush);
+        }
+    }
+
     /// A shape filled with a vertical gradient from `y0` to `y1`; `stops` are (position 0..1, color).
     pub fn fill_geometry_vgrad(&self, g: &ID2D1Geometry, y0: f32, y1: f32, stops: &[(f32, Color)]) {
         if stops.len() < 2 || y1 - y0 < 0.5 {

@@ -220,6 +220,7 @@ pub fn switch(ui: &mut Ui, r: Rect, on: bool, _accent: Color) -> bool {
     let al = crate::ui::look_alcove();
     let on_col = if al { Color::white(0.92) } else { palette::GREEN };
     ui.p.fill_rounded(track, 12.0, Color::white(0.15).lerp(on_col, t));
+    ui.glow(track, 12.0);
     if t < 0.98 {
         ui.p.stroke_rounded(track.inset(0.5), 12.0, 1.0, Color::white(0.08 * (1.0 - t)));
     }

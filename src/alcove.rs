@@ -527,6 +527,7 @@ pub fn tab_chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool)
     if a > 0.01 {
         ui.p.fill_rounded(rr, rr.h * 0.5, Color::white((0.10 + 0.04 * h) * a));
     }
+    ui.glow(rr, rr.h * 0.5);
     let fg = Color::white(0.52 + 0.14 * h * (1.0 - a)).lerp(Color::white(0.97), a);
     let st = TextStyle::new(12.5, fg).semibold();
     let mut x = r.x + 13.0;
@@ -575,6 +576,7 @@ pub fn chip(ui: &mut Ui, r: Rect, label: &str, icon: Option<Icon>, on: bool) -> 
     // a press squeezes the chip a touch
     let rr = r.inset(1.2 * p);
     ui.p.fill_rounded(rr, rr.h * 0.5, bg);
+    ui.glow(rr, rr.h * 0.5);
     let fg = Color::white(0.92).lerp(palette::INK, a);
     let st = TextStyle::new(12.5, fg).semibold();
     let mut x = r.x + 13.0;
@@ -596,6 +598,7 @@ pub fn round_button(ui: &mut Ui, r: Rect, icon: Icon, filled: bool) -> bool {
     let bg = if filled { Color::white(0.94 + 0.06 * h) } else { Color::white(0.10 + 0.08 * h) };
     let d = r.w.min(r.h) * (1.0 + 0.03 * h - 0.07 * p);
     ui.p.fill_circle(r.cx(), r.cy(), d * 0.5, bg);
+    ui.glow(r.center_square(d), d * 0.5);
     let fg = if filled { palette::INK } else { Color::white(0.92) };
     ui.p.icon(icon, r.center_square(d * 0.5), fg);
     ui.clicked(r)

@@ -884,6 +884,10 @@ pub struct GlassCfg {
     pub light_dir: f32,
     /// How wide the bright line along the edge is, in logical pixels.
     pub light_width: f32,
+    /// Alcove: a press makes the control glow from within, from the pointer outwards (off = no glow).
+    pub glow: bool,
+    /// How bright that glow is (0 - 1).
+    pub glow_amount: f32,
     /// A thin bright line along the very edge of the glass, like the light catching it (0 - 1).
     pub edge_light: f32,
     /// A light frost over the glass (0 - 1).
@@ -925,6 +929,8 @@ impl Default for GlassCfg {
             light_angle: 225.0,
             light_dir: 0.7,
             light_width: 1.8,
+            glow: true,
+            glow_amount: 0.5,
             edge_light: 0.35,
             tint: 0.0,
             fan: 0.7,

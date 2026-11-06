@@ -294,7 +294,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 20.0,
-        9 => 32.0,
+        9 => 34.0,
         10 => 14.0,
         11 => 22.0,
         _ => 25.0,
@@ -1158,6 +1158,9 @@ impl Settings {
         let d = crate::config::GlassCfg::default();
         toggle_row(ui, row_rect(body, 23), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
         toggle_row(ui, row_rect(body, 25), "Real glass bend (Snell's law)", g.snell, "glass", "snell");
+        toggle_row(ui, row_rect(body, 32), "Press glow (Alcove)", g.glow, "glass", "glow");
+        let amt = ("Press glow strength", g.glow_amount, (0.0, 1.0), format!("{:.0}%", g.glow_amount * 100.0));
+        slider_row(ui, row_rect(body, 33), amt.0, amt.1, amt.2, amt.3, "glass", "glow_amount");
         let snell_rows: [(&str, f32, (f32, f32), String, &str); 3] = [
             ("Snell: glass index", g.snell_ior, (1.05, 2.4), format!("{:.2}", g.snell_ior), "snell_ior"),
             ("Snell: edge thickness", g.snell_thick, (0.3, 4.0), format!("{:.1}", g.snell_thick), "snell_thick"),
@@ -1207,6 +1210,7 @@ impl Settings {
                 ("light_angle", d.light_angle),
                 ("light_dir", d.light_dir),
                 ("light_width", d.light_width),
+                ("glow_amount", d.glow_amount),
             ] {
                 put(ui, "glass", key, format!("{v:.2}"));
             }

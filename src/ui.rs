@@ -64,6 +64,53 @@ thread_local! {
     static GLIDE: RefCell<HashMap<u64, (f32, Instant)>> = RefCell::new(HashMap::new());
     /// Flip clock digits: slot → (digit shown, previous digit, when it changed, last drawn).
     static FLIP: RefCell<HashMap<u32, (u8, u8, Instant, Instant)>> = RefCell::new(HashMap::new());
+    /// Presses that are glowing from within (see `Ui::glow`): a handful at most, empty when idle.
+    static GLOWS: RefCell<Vec<Glow>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One press of the Alcove "glow from within": a soft light that starts where the pointer went down,
+/// spreads over the control while held and eases away after the release.
+struct Glow {
+    key: u64,
+    x: f32,
+    y: f32,
+    t0: Instant,
+    /// When the button went up (a tap on a quick click: just after the light has come up).
+    rel: Option<Instant>,
+    /// Last frame the control was drawn, so a glow whose control left the screen is dropped.
+    seen: Instant,
+}
+
+/// Seconds for the light to come up, and for it to ease away after the release.
+const GLOW_RAMP: f32 = 0.08;
+const GLOW_FADE: f32 = 0.34;
+
+static GLOW_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The glow's strength (0 - 1) as `f32` bits; 0.5 to begin with.
+static GLOW_AMT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F00_0000);
+
+/// Applies `[glass] glow` and `glow_amount`. Called when the settings load or change.
+pub fn set_glow(on: bool, amount: f32) {
+    GLOW_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+    GLOW_AMT.store(amount.clamp(0.0, 1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+impl Glow {
+    /// How lit it is now (0 - 1), or None once it has faded out.
+    fn level(&self, now: Instant) -> Option<f32> {
+        let up = |s: f32| {
+            let u = (s / GLOW_RAMP).min(1.0);
+            u * (2.0 - u)
+        };
+        match self.rel {
+            None => Some(up(now.saturating_duration_since(self.t0).as_secs_f32())),
+            Some(rel) => {
+                let held = up(rel.saturating_duration_since(self.t0).as_secs_f32());
+                let u = now.saturating_duration_since(rel).as_secs_f32() / GLOW_FADE;
+                (u < 1.0).then(|| held * (1.0 - u) * (1.0 - u))
+            }
+        }
+    }
 }
 
 /// An instant safely in the past (never underflows right after boot).
@@ -304,6 +351,75 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.fx.animate = true;
     }
 
+    /// Alcove's "glow from within": a soft light that starts at the pointer when `r` is pressed, spreads
+    /// over the control and eases away about a third of a second after the release. Call it right after
+    /// the control's background is drawn (`radius` is that background's corner radius). Costs a couple of
+    /// comparisons when nothing is pressed and asks for frames only while the light is changing.
+    pub fn glow(&mut self, r: Rect, radius: f32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.interactive || !look_alcove() || !GLOW_ON.load(Relaxed) {
+            return;
+        }
+        let held = self.pressed(r);
+        let tap = self.input.click.filter(|&((px, py), (ux, uy))| r.contains(px, py) && r.contains(ux, uy));
+        let start = if held { self.input.down } else { tap.map(|(p, _)| p) };
+        if start.is_none() && GLOWS.with(|g| g.borrow().is_empty()) {
+            return;
+        }
+        let key = rect_key(r, "glow");
+        let now = self.now;
+        let amt = f32::from_bits(GLOW_AMT.load(Relaxed));
+        // (x, y, level, seconds since the press began, still changing)
+        let live = GLOWS.with(|g| {
+            let mut g = g.borrow_mut();
+            g.retain(|e| e.key == key || now.saturating_duration_since(e.seen).as_secs_f32() < 0.6);
+            let fresh = |(x, y): (f32, f32), rel: Option<Instant>| Glow { key, x, y, t0: now, rel, seen: now };
+            let tap_rel = Some(now + std::time::Duration::from_secs_f32(GLOW_RAMP));
+            match g.iter().position(|e| e.key == key) {
+                Some(i) => {
+                    let e = &mut g[i];
+                    e.seen = now;
+                    if e.rel.is_none() {
+                        if !held {
+                            e.rel = Some(now);
+                        }
+                    } else if let Some(p) = start {
+                        // pressed again while the last light was still fading
+                        *e = fresh(p, if held { None } else { tap_rel });
+                    }
+                }
+                None => {
+                    if let Some(p) = start {
+                        if g.len() >= 6 {
+                            g.remove(0);
+                        }
+                        g.push(fresh(p, if held { None } else { tap_rel }));
+                    }
+                }
+            }
+            let i = g.iter().position(|e| e.key == key)?;
+            let Some(level) = g[i].level(now) else {
+                g.swap_remove(i);
+                return None;
+            };
+            let e = &g[i];
+            let age = now.saturating_duration_since(e.t0).as_secs_f32();
+            Some((e.x, e.y, level, age, e.rel.is_some() || age < GLOW_RAMP))
+        });
+        let Some((x, y, level, age, changing)) = live else { return };
+        let a = amt * level;
+        if a > 0.003 {
+            // the light spreads from the pointer a little further each frame, easing out
+            let s = (age / 0.38).min(1.0);
+            let spread = (r.w.max(r.h) * (0.35 + 0.75 * s * (2.0 - s))).max(24.0);
+            let white = |k: f32| Color::white(k * a);
+            self.p.glow_rounded(r, radius, x, y, spread, &[(0.0, white(0.55)), (0.5, white(0.22)), (1.0, white(0.06))]);
+        }
+        if changing {
+            self.fx.animate = true;
+        }
+    }
+
     /// Like `animate`, for slow, gentle motion: drawn at about 30 frames a second.
     pub fn animate_slow(&mut self) {
         self.fx.animate_slow = true;
@@ -330,6 +446,7 @@ impl<'p, 'a> Ui<'p, 'a> {
         let bg = style.bg.lerp(style.hover_bg, h);
         let rr = r.inset(r.w * 0.07 * p);
         self.p.fill_rounded(rr, style.radius, bg);
+        self.glow(rr, style.radius);
         let s = r.w.min(r.h) * style.icon_scale * (1.0 - 0.14 * p) * (1.0 + 0.03 * h);
         self.p.icon(icon, r.center_square(s), style.fg);
         self.clicked(r)
@@ -345,6 +462,7 @@ impl<'p, 'a> Ui<'p, 'a> {
         let bg = if hover { style.hover_bg } else { style.bg };
         let rr = if pressed { r.inset(2.0) } else { r };
         self.p.fill_rounded(rr, style.radius.min(r.h * 0.5), bg);
+        self.glow(rr, style.radius.min(r.h * 0.5));
         let ts = TextStyle::new((r.h * 0.42).clamp(10.0, 15.0), style.fg).medium().center();
         match icon {
             Some(ic) => {
@@ -1073,6 +1191,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_alcove() {
             // a soft grey tile, no border
             self.p.fill_rounded(r, 20.0, Color::white(if hover { 0.11 } else { 0.07 }));
+            if interactive {
+                self.glow(r, 20.0);
+            }
             return interactive && self.clicked(r);
         }
         if look_tuna() {
@@ -1103,6 +1224,7 @@ impl<'p, 'a> Ui<'p, 'a> {
                 None => Color::white(if hover { 0.11 } else { 0.07 }),
             };
             self.p.fill_rounded(row, 14.0, fill);
+            self.glow(row, 14.0);
             return;
         }
         if look_tuna() {
