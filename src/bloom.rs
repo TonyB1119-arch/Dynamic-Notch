@@ -32,11 +32,6 @@ pub fn dnd() -> bool {
     DND.load(Ordering::Relaxed)
 }
 
-/// Turn do not disturb on or off (the menu bar's Control Center).
-pub fn set_dnd(on: bool) {
-    DND.store(on, Ordering::Relaxed);
-}
-
 thread_local! {
     /// The page whose pill was last scrolled into view.
     static LAST_PAGE: Cell<u64> = const { Cell::new(0) };

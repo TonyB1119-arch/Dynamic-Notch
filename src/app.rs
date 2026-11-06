@@ -538,7 +538,6 @@ pub struct App {
     /// When to release GPU caches (set when a frame burst ends).
     trim_at: Option<Instant>,
     dock: Option<crate::dock::Dock>,
-    bar: Option<crate::bar::Bar>,
     launcher: Option<crate::launcher::Launcher>,
     radial: Option<crate::radial::Radial>,
     /// The radial menu's option hid the Windows taskbar.
@@ -670,7 +669,6 @@ impl App {
             dirty: true,
             trim_at: None,
             dock: None,
-            bar: None,
             launcher: None,
             radial: None,
             radial_hid: false,
@@ -707,7 +705,6 @@ impl App {
     pub fn start(&mut self) {
         self.place();
         self.dock_apply();
-        self.bar_apply();
         self.sync_taskbar();
         self.tray = Some(Tray::new(self.hwnd));
         self.register_hotkeys();
@@ -1147,7 +1144,7 @@ impl App {
         if let Some(page) = fx.open_page {
             self.expand(Some(page));
         }
-        if fx.expand && (self.mode != Mode::Expanded || self.bar_on()) {
+        if fx.expand && self.mode != Mode::Expanded {
             self.expand(None);
         }
         if fx.collapse {
@@ -1439,10 +1436,6 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn expand(&mut self, page: Option<ModuleId>) {
-        if self.bar_on() {
-            self.bar_open(page);
-            return;
-        }
         let target = page.filter(|p| self.page_available(p)).unwrap_or_else(|| {
             if self.mode == Mode::Expanded {
                 self.page
@@ -1500,16 +1493,6 @@ impl App {
     }
 
     fn toggle(&mut self) {
-        if self.bar_on() {
-            if let Some(b) = self.bar.as_mut() {
-                if b.is_open() {
-                    b.close();
-                } else {
-                    b.open_control();
-                }
-            }
-            return;
-        }
         if self.mode == Mode::Expanded {
             self.collapse();
         } else {
@@ -1526,11 +1509,6 @@ impl App {
         }
         // Do not disturb (the moon in the control center): only volume and brightness still show
         if crate::bloom::dnd() && !p.is_hud() {
-            return;
-        }
-        // the menu bar shows these itself: a pill for volume and brightness, a banner for the rest
-        if self.bar_on() {
-            self.bar_peek(&p);
             return;
         }
         if self.mode == Mode::Expanded {
@@ -2058,7 +2036,6 @@ impl App {
                 crate::ui::set_look(&self.cfg.appearance.look);
                 crate::ui::set_mono_icons(self.cfg.appearance.mono_icons);
                 self.dock_apply();
-                self.bar_apply();
                 self.sync_taskbar();
                 if autostart_changed {
                     sys::set_autostart(self.cfg.general.start_with_windows);
@@ -2149,7 +2126,6 @@ impl App {
             }
         }
         self.dock_relocate();
-        self.bar_relocate();
         self.check_fullscreen();
         self.request_frame();
     }
@@ -2223,9 +2199,6 @@ impl App {
         let hide = self.cfg.general.hide_in_fullscreen && unsafe { is_fullscreen_on(self.monitor, self.hwnd) };
         if hide != self.fs_hidden {
             self.fs_hidden = hide;
-            if let Some(b) = self.bar.as_mut() {
-                b.set_hidden(hide);
-            }
             if hide {
                 self.collapse();
             }
@@ -2265,7 +2238,7 @@ impl App {
             compact: false,
             peek: false,
             exp: false,
-            shown: !(self.user_hidden || self.fs_hidden || self.bar_on()),
+            shown: !(self.user_hidden || self.fs_hidden),
             sec: false,
         };
         match self.mode {
@@ -2621,7 +2594,7 @@ impl App {
         }
         let strip_w = self.cfg.appearance.notch_width;
         let strip = Rect::new(self.win_w * 0.5 - strip_w * 0.5, 0.0, strip_w, 5.0);
-        let want = if self.fs_hidden || self.bar_on() {
+        let want = if self.fs_hidden {
             None
         } else if settled {
             self.region_anim = None;
@@ -3932,127 +3905,6 @@ impl App {
         }
     }
 
-    /// Is the menu bar standing in for the notch?
-    fn bar_on(&self) -> bool {
-        self.bar.is_some() && self.cfg.bar.mode == "bar"
-    }
-
-    /// Messages for the menu bar's own window.
-    pub fn bar_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        let r = self.bar.as_mut()?.handle(msg, wp, lp);
-        if r.is_some() {
-            self.bar_pump();
-        }
-        r
-    }
-
-    /// What a right-click at `lp` landed on in the menu bar, and the items that are not on it.
-    pub fn bar_menu_info(&self, lp: LPARAM) -> (Option<String>, Vec<(usize, &'static str)>) {
-        self.bar.as_ref().map(|b| b.menu_info(lp)).unwrap_or_default()
-    }
-
-    /// A choice from the menu bar's right-click menu.
-    pub fn bar_menu_command(&mut self, cmd: i32, target: Option<String>) {
-        if let Some(b) = self.bar.as_mut() {
-            b.menu_command(cmd, target);
-        }
-        self.bar_pump();
-    }
-
-    fn bar_peek(&mut self, p: &Peek) {
-        if let Some(b) = self.bar.as_mut() {
-            if p.is_hud() {
-                b.show_hud(p);
-            } else if p.key != Some("media") {
-                b.show_banner(p);
-            }
-        }
-    }
-
-    /// The notch's shortcuts (hotkey, tray, tapping the edge) open the Control Center or a page.
-    fn bar_open(&mut self, page: Option<ModuleId>) {
-        if let Some(b) = self.bar.as_mut() {
-            match page {
-                Some(pg) if self.modules.iter().any(|m| m.id() == pg && m.has_page()) => b.open_page(pg),
-                _ => b.open_control(),
-            }
-        }
-    }
-
-    /// Paint the menu bar if it asked for it, and carry out what it asked the app to do.
-    fn bar_pump(&mut self) {
-        let Some(mut b) = self.bar.take() else {
-            return;
-        };
-        let mut fx = Effects::default();
-        if b.wants_draw() {
-            let mut ind = Vec::new();
-            for (i, m) in self.modules.iter().enumerate() {
-                if self.started[i] {
-                    m.indicators(&mut ind);
-                }
-            }
-            let mut ctx = crate::bar::Ctx {
-                modules: &mut self.modules,
-                started: &self.started,
-                cfg: &self.cfg,
-                bus: &self.bus,
-                accent: self.accent,
-                indicators: &ind,
-            };
-            b.draw(&self.gfx, &mut ctx, &mut fx);
-        }
-        let act = b.take_act();
-        self.bar = Some(b);
-        if let Some(crate::bar::Act::Launcher) = act {
-            self.launcher_toggle();
-        }
-        self.apply_effects(fx);
-    }
-
-    /// Start, update or remove the menu bar to match the settings.
-    fn bar_apply(&mut self) {
-        if self.cfg.bar.mode != "bar" {
-            if self.bar.take().is_some() {
-                self.request_frame();
-            }
-            return;
-        }
-        if self.bar.is_none() {
-            match crate::bar::Bar::new(&self.gfx, self.host.compositor.clone()) {
-                Ok(b) => self.bar = Some(b),
-                Err(e) => {
-                    log!("menu bar failed to start: {e}");
-                    return;
-                }
-            }
-            if self.mode == Mode::Expanded {
-                self.collapse();
-            }
-            self.request_frame();
-        }
-        let (mon, scale) = (self.monitor, self.cfg.appearance.scale);
-        if mon.is_invalid() {
-            return;
-        }
-        let cfg = self.cfg.bar.clone();
-        if let Some(b) = self.bar.as_mut() {
-            b.configure(&cfg, mon, scale);
-        }
-        self.bar_pump();
-    }
-
-    /// The screen or the monitor changed: put the menu bar where it belongs.
-    fn bar_relocate(&mut self) {
-        let (mon, scale) = (self.monitor, self.cfg.appearance.scale);
-        if mon.is_invalid() {
-            return;
-        }
-        if let Some(b) = self.bar.as_mut() {
-            b.relocate(mon, scale);
-        }
-    }
-
     /// Messages for the dock's own window.
     pub fn dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hidden = self.fs_hidden;
@@ -4127,9 +3979,6 @@ impl App {
             let _ = self.host.set_rendering_device(&self.gfx);
             if let Some(d) = self.dock.as_mut() {
                 d.recover(&self.gfx);
-            }
-            if let Some(b) = self.bar.as_mut() {
-                b.recover(&self.gfx);
             }
             if let Some(l) = self.launcher.as_mut() {
                 l.recover(&self.gfx);

@@ -39,7 +39,6 @@ pub struct Config {
     pub glass: GlassCfg,
     pub dock: DockCfg,
     pub launcher: LauncherCfg,
-    pub bar: BarCfg,
     pub combos: CombosCfg,
     pub radial: RadialCfg,
 }
@@ -563,54 +562,6 @@ impl LauncherCfg {
     }
 }
 
-/// The menu bar that can take the notch's place.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BarCfg {
-    /// "notch" or "bar".
-    pub mode: String,
-    /// Height of the bar in logical pixels.
-    pub height: f32,
-    /// A tinted glass strip behind the items (off: just the items on the desktop).
-    pub background: bool,
-    /// What is on the bar, left to right; "spacer" splits the left side from the right side.
-    pub items: Vec<String>,
-}
-
-impl Default for BarCfg {
-    fn default() -> Self {
-        Self {
-            mode: "notch".to_string(),
-            height: 28.0,
-            background: true,
-            items: ["spacer", "weather", "cpu", "ram", "battery", "wifi", "bluetooth", "sound", "control", "clock"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        }
-    }
-}
-
-impl BarCfg {
-    fn clamped(&mut self) {
-        self.height = self.height.clamp(22.0, 44.0);
-        if self.mode.trim().to_ascii_lowercase() != "bar" {
-            self.mode = "notch".to_string();
-        } else {
-            self.mode = "bar".to_string();
-        }
-        // only things the bar knows, each once, and a single divider
-        let mut seen: Vec<String> = Vec::new();
-        for s in std::mem::take(&mut self.items) {
-            let s = s.trim().to_ascii_lowercase();
-            if (s == "spacer" || crate::bar::ALL.iter().any(|a| a.0 == s)) && !seen.contains(&s) {
-                seen.push(s);
-            }
-        }
-        self.items = seen;
-    }
-}
-
 /// The dock at the bottom of the screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -1079,7 +1030,6 @@ impl Config {
         self.glass.clamped();
         self.dock.clamped();
         self.launcher.clamped();
-        self.bar.clamped();
         self.combos.items.truncate(24);
         self.radial.fix();
         self.home.widgets.truncate(4);
