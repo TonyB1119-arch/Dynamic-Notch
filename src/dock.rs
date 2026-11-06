@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use std::os::windows::process::CommandExt;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::OnceLock;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -47,6 +48,13 @@ const MOUSELEAVE: u32 = 0x02A3;
 const T_ANIM: usize = 1;
 const T_SCAN: usize = 2;
 const T_HIDE: usize = 3;
+/// The bending glass edge looks at the screen again.
+const T_GLASS: usize = 4;
+/// Posted by the thread that made a new glass edge.
+const WM_DOCK_GLASS: u32 = WM_APP + 8;
+/// A finished glass edge: the rim (None = could not be made), the bar it was made for (logical), where the bar
+/// was in the window (pixels) and its size (pixels).
+type GlassOut = (Option<crate::refract::BarRim>, Rect, i32, i32, (i32, i32));
 /// Posted when another window came to the front: put the dock back on top.
 const WM_RAISE: u32 = WM_APP + 7;
 static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -131,6 +139,17 @@ pub struct Dock {
     press_x: f32,
     drag_x: f32,
     shown: bool,
+    /// The bending glass edge: the Settings -> Glass look, the latest rim picture with the bar it was made for,
+    /// the fingerprint of the screen it was made from, and the thread that makes the next one.
+    tune: crate::refract::Tune,
+    glass: Option<(crate::gfx::RimPic, Rect)>,
+    glass_sum: u64,
+    glass_key: Option<(i32, i32)>,
+    glass_busy: bool,
+    glass_tx: Sender<GlassOut>,
+    glass_rx: Receiver<GlassOut>,
+    /// The dock is hidden from screen copies (needed so the copies show what is behind it).
+    excl: bool,
 }
 
 impl Dock {
@@ -147,6 +166,7 @@ impl Dock {
         let hook = unsafe {
             SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT)
         };
+        let (glass_tx, glass_rx) = channel();
         Ok(Self {
             hwnd,
             host,
@@ -183,14 +203,46 @@ impl Dock {
             press_x: 0.0,
             drag_x: 0.0,
             shown: false,
+            tune: crate::refract::Tune::from(&crate::config::GlassCfg::default()),
+            glass: None,
+            glass_sum: 0,
+            glass_key: None,
+            glass_busy: false,
+            glass_tx,
+            glass_rx,
+            excl: false,
         })
     }
 
     /// New settings (or a first start): re-read the items and icons, then lay the bar out.
-    pub fn configure(&mut self, gfx: &Gfx, cfg: &DockCfg, mon: HMONITOR, ui_scale: f32) {
+    pub fn configure(
+        &mut self,
+        gfx: &Gfx,
+        cfg: &DockCfg,
+        glass: &crate::config::GlassCfg,
+        mon: HMONITOR,
+        ui_scale: f32,
+    ) {
         // Settings reload on every change (a slider drag sends many): only redo what actually changed.
         let old = std::mem::replace(&mut self.cfg, cfg.clone());
         self.cfg.items.retain(|s| !s.trim().is_empty());
+        // the bending glass edge: a new look in Settings -> Glass (or switching it off) makes the rim again
+        let tune = crate::refract::Tune::from(glass);
+        let bend = cfg.glass && cfg.refract;
+        if tune != self.tune || !bend {
+            self.tune = tune;
+            self.glass = None;
+            self.glass_key = None;
+            self.glass_sum = 0;
+        }
+        self.set_excl(bend);
+        unsafe {
+            if bend {
+                SetTimer(Some(self.hwnd), T_GLASS, 300, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), T_GLASS);
+            }
+        }
         if old.auto_hide != cfg.auto_hide {
             self.region_full = None;
             if cfg.auto_hide {
@@ -502,14 +554,27 @@ impl Dock {
                 if wash > 0.004 {
                     p.fill_rounded(bar, radius, Color::rgba(0.02, 0.02, 0.03, wash));
                 }
-                if let Some(g) = p.path(|g| g.rounded_rect(bar, radius, true)) {
-                    let k = 1.0 - wash * 0.6;
-                    let stops =
-                        [(0.0, Color::white(0.16 * k)), (0.45, Color::white(0.04 * k)), (1.0, Color::white(0.0))];
-                    p.fill_geometry_vgrad(&g, bar.y, bar.bottom(), &stops);
+                if let (true, Some((pic, made))) = (self.cfg.refract, &self.glass) {
+                    // the bending edge: the screen behind, pulled in along the rim (a picture made for an earlier
+                    // width of the bar is stretched to the width it has now)
+                    let (sx, sy) = (bar.w / made.w.max(1.0), bar.h / made.h.max(1.0));
+                    let dst = Rect::new(
+                        bar.x + (pic.rect.x - made.x) * sx,
+                        bar.y + (pic.rect.y - made.y) * sy,
+                        pic.rect.w * sx,
+                        pic.rect.h * sy,
+                    );
+                    p.draw_rim_to(pic, dst, 1.0);
+                } else {
+                    if let Some(g) = p.path(|g| g.rounded_rect(bar, radius, true)) {
+                        let k = 1.0 - wash * 0.6;
+                        let stops =
+                            [(0.0, Color::white(0.16 * k)), (0.45, Color::white(0.04 * k)), (1.0, Color::white(0.0))];
+                        p.fill_geometry_vgrad(&g, bar.y, bar.bottom(), &stops);
+                    }
+                    let inner = self.cfg.rim_width + 1.5;
+                    p.stroke_rounded(bar.inset(inner), (radius - inner).max(0.0), 1.0, Color::white(0.09));
                 }
-                let inner = self.cfg.rim_width + 1.5;
-                p.stroke_rounded(bar.inset(inner), (radius - inner).max(0.0), 1.0, Color::white(0.09));
             }
             // the white rim: thickness and brightness come from the settings
             let rw = self.cfg.rim_width;
@@ -751,6 +816,17 @@ impl Dock {
                 self.step(gfx);
                 Some(LRESULT(0))
             }
+            WM_TIMER if wp.0 == T_GLASS => {
+                self.glass_tick();
+                unsafe {
+                    SetTimer(Some(self.hwnd), T_GLASS, 300, None);
+                }
+                Some(LRESULT(0))
+            }
+            WM_DOCK_GLASS => {
+                self.glass_take(gfx);
+                Some(LRESULT(0))
+            }
             WM_TIMER if wp.0 == T_SCAN => {
                 let changed = self.refresh_items();
                 if self.shown {
@@ -932,6 +1008,72 @@ impl Dock {
         hit(&lay, &self.cells, self.bar_rect(&lay), base, mag, x, y)
     }
 
+    /// Hide the dock from screen copies (or show it again): the glass edge copies the screen behind it, and the
+    /// copy must not show the dock itself. Needs Windows 10 version 2004 or newer; when that fails the edge is off.
+    fn set_excl(&mut self, on: bool) {
+        if self.excl == on {
+            return;
+        }
+        let how = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+        match unsafe { SetWindowDisplayAffinity(self.hwnd, how) } {
+            Ok(()) => self.excl = on,
+            Err(e) => {
+                if on {
+                    crate::log!("dock: cannot hide the dock from screen copies here ({e}); the bending edge stays off");
+                }
+            }
+        }
+    }
+
+    /// Look at the screen behind the bar again (a few times a second, and soon after the bar changed size) and
+    /// make a new glass edge from it, on a thread of its own; nothing is done while the screen looks the same.
+    fn glass_tick(&mut self) {
+        if self.glass_busy || !self.excl || !self.shown || self.hide_t > 0.02 || self.win_px.2 == 0 {
+            return;
+        }
+        let (base, mag, gap, _) = self.sizes();
+        let (divider, _) = self.divider_flags();
+        let engage = if self.drag.is_some() { 0.0 } else { self.engage };
+        let lay = layout(&divider, self.win_w, base, mag, gap, self.mx, engage);
+        let bar = self.bar_rect(&lay);
+        let sc = self.scale;
+        let (wx, wy) = ((bar.x * sc).round() as i32, (bar.y * sc).round() as i32);
+        let (bw, bh) = ((bar.w * sc).round() as i32, (bar.h * sc).round() as i32);
+        let prev = if self.glass.is_some() && self.glass_key == Some((bw, bh)) { self.glass_sum } else { 0 };
+        let (sx, sy) = (self.win_px.0 + wx, self.win_px.1 + wy);
+        let (radius, tune) = (bar.h * 0.36 * sc, self.tune);
+        let (tx, hwnd) = (self.glass_tx.clone(), self.hwnd.0 as isize);
+        self.glass_busy = true;
+        std::thread::spawn(move || {
+            let out = crate::refract::bar_rim(sx, sy, bw, bh, radius, sc, tune, prev);
+            let _ = tx.send((out, bar, wx, wy, (bw, bh)));
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_DOCK_GLASS, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+
+    /// A new glass edge is ready: upload it and draw.
+    fn glass_take(&mut self, gfx: &Gfx) {
+        self.glass_busy = false;
+        let mut redraw = false;
+        while let Ok((out, bar, wx, wy, key)) = self.glass_rx.try_recv() {
+            let Some(out) = out else { continue };
+            self.glass_key = Some(key);
+            if let Some(rim) = out.rim {
+                let pic = self.res.rim_pic(wx + rim.x0, wy + rim.y0, rim.w, rim.h, rim.step, &rim.px, self.scale);
+                if let Some(pic) = pic {
+                    self.glass = Some((pic, bar));
+                    self.glass_sum = out.sum;
+                    redraw = true;
+                }
+            }
+        }
+        if redraw {
+            self.draw(gfx);
+        }
+    }
+
     fn start_anim(&mut self) {
         // Only start the timer once: restarting it on every mouse move would keep it from ever firing.
         if !self.anim_on {
@@ -972,6 +1114,10 @@ impl Dock {
             self.anim_on = false;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_ANIM);
+                // the bar has its resting size: make the glass edge for it soon
+                if self.excl {
+                    SetTimer(Some(self.hwnd), T_GLASS, 60, None);
+                }
             }
             if self.engage_to == 0.0 {
                 self.set_region(false);
@@ -999,6 +1145,7 @@ impl Drop for Dock {
             let _ = KillTimer(Some(self.hwnd), T_ANIM);
             let _ = KillTimer(Some(self.hwnd), T_SCAN);
             let _ = KillTimer(Some(self.hwnd), T_HIDE);
+            let _ = KillTimer(Some(self.hwnd), T_GLASS);
             if let Some(h) = self.hook.take() {
                 let _ = UnhookWinEvent(h);
             }

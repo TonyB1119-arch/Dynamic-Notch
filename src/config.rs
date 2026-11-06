@@ -600,6 +600,9 @@ pub struct DockCfg {
     pub glass: bool,
     /// How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur).
     pub blur: f32,
+    /// The dock's edge bends the screen behind it like thick glass (the look is Settings -> Glass). It copies the
+    /// screen a few times a second, so the dock is hidden from screenshots while this is on.
+    pub refract: bool,
 }
 
 impl Default for DockCfg {
@@ -620,6 +623,7 @@ impl Default for DockCfg {
             melt: false,
             glass: true,
             blur: 0.25,
+            refract: true,
         }
     }
 }
@@ -1333,6 +1337,9 @@ hide_taskbar = false
 opacity = 0.30
 # How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur)
 blur = 0.25
+# The dock's edge bends the screen behind it like thick glass (Settings -> Glass sets the look). It looks at the
+# screen a few times a second and is hidden from screenshots while on.
+refract = true
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
 # The white rim around the dock: thickness (pixels, 0 = none) and brightness (0 - 1)

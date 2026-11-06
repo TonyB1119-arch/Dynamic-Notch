@@ -3966,7 +3966,7 @@ impl App {
             return;
         }
         if let Some(d) = self.dock.as_mut() {
-            d.configure(&self.gfx, &self.cfg.dock, mon, scale);
+            d.configure(&self.gfx, &self.cfg.dock, &self.cfg.glass, mon, scale);
         }
     }
 

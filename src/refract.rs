@@ -16,6 +16,9 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, CAPTUREBLT, DIB_RGB_COLORS, HGDIOBJ, ROP_CODE, SRCCOPY,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 /// A piece of the screen as it looked at one moment: opaque BGRA pixels, `w` x `h`.
 pub struct Shot {
@@ -952,4 +955,138 @@ const PAR_MIN: usize = 400_000;
 fn workers() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4))
+}
+
+/// What `bar_rim` brings back: a fingerprint of the screen around the bar and, when that changed, the new rim.
+pub struct BarRim {
+    pub sum: u64,
+    /// Placed relative to the bar's top-left corner (device pixels).
+    pub rim: Option<Rim>,
+}
+
+/// A fingerprint of the part of the copy the rim reads: the rows along the top and bottom and the columns
+/// along the two ends, sampled sparsely.
+fn bar_sum(s: &Shot, bw: i32, bh: i32, reach: i32) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix = |p: u32| h = (h ^ (p & 0x00FF_FFFF) as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    for row in (0..s.h).step_by(2) {
+        let ly = row as i32 + s.oy;
+        let line = &s.px[row * s.w..(row + 1) * s.w];
+        if ly < reach || ly > bh - reach {
+            line.iter().step_by(3).for_each(|&p| mix(p));
+        } else {
+            let left = ((reach - s.ox).max(0) as usize).min(s.w);
+            let right = ((bw - reach - s.ox).max(0) as usize).min(s.w);
+            line[..left].iter().step_by(3).for_each(|&p| mix(p));
+            line[right..].iter().step_by(3).for_each(|&p| mix(p));
+        }
+    }
+    h
+}
+
+/// The glass edge of a rounded bar (the dock): the screen behind it is copied, and along all four edges
+/// each pixel shows what lies further out, pulled in toward the edge like through thick glass, with the
+/// bright line of light on the rim. `x`, `y`, `bw`, `bh` are the bar in screen pixels; the look is the
+/// notch's (`Tune`), made smaller to fit a bar that is only a few dozen pixels tall. When the copy looks
+/// like the one with fingerprint `prev`, no rim is made. Meant for a background thread.
+pub fn bar_rim(x: i32, y: i32, bw: i32, bh: i32, radius: f32, scale: f32, t: Tune, prev: u64) -> Option<BarRim> {
+    if bw < 16 || bh < 16 {
+        return None;
+    }
+    let sc = scale.max(0.5);
+    // the glass reaches in at most a third of the bar's height; a smaller reach pulls less too
+    let k = ((0.36 * bh as f32) / (t.width * sc).max(1.0)).min(1.0);
+    let width = t.width * sc * k;
+    let pull = t.pull * sc * k.max(0.45);
+    let soft = (t.soft * sc).min(width * 0.5);
+    let m = (pull * (1.0 + t.corner) + 6.0).ceil() as i32;
+    // the copy covers the bar and a margin, cut to the desktop
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let (gx0, gy0) = ((x - m).max(vx), (y - m).max(vy));
+    let (gx1, gy1) = ((x + bw + m).min(vx + vw), (y + bh + m).min(vy + vh));
+    let shot = grab_at(gx0, gy0, gx1 - gx0, gy1 - gy0, gx0 - x, gy0 - y)?;
+    let sum = bar_sum(&shot, bw, bh, (width + pull + 4.0).ceil() as i32);
+    if sum == prev {
+        return Some(BarRim { sum, rim: None });
+    }
+    let (x0, y0) = (-2_i32, -2_i32);
+    let (w, h) = ((bw + 4) as usize, (bh + 4) as usize);
+    let mut px = vec![0u32; w * h];
+    let (hx, hy) = (bw as f32 * 0.5, bh as f32 * 0.5);
+    let r = radius.min(hx).min(hy).max(1.0);
+    let (ix, iy) = (hx - r, hy - r);
+    let hw = t.lw * sc;
+    let shade = |fx: f32, fy: f32| -> u32 {
+        let (dx, dy) = (fx - hx, fy - hy);
+        let (qx, qy) = (dx.abs() - ix, dy.abs() - iy);
+        let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+        let out = (ox * ox + oy * oy).sqrt();
+        // distance inside the edge, the direction pointing out of the bar, and the corner weight
+        let d = r - (out + qx.max(qy).min(0.0));
+        if d >= width || d <= -1.0 {
+            return 0;
+        }
+        let (nx, ny, corner) = if qx > 0.0 && qy > 0.0 {
+            let n = out.max(0.001);
+            (dx.signum() * ox / n, dy.signum() * oy / n, (2.0 * ox * oy / (n * n)).clamp(0.0, 1.0))
+        } else if qx > qy {
+            (dx.signum(), 0.0, 0.0)
+        } else {
+            (0.0, dy.signum(), 0.0)
+        };
+        let u = 1.0 - d / width;
+        let fade = u * u * (1.5 - 0.5 * u);
+        let base = (t.strength + 0.1 * corner).min(1.0);
+        let alpha = (base + (1.0 - base) * smooth(soft, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0);
+        if alpha < 0.004 {
+            return 0;
+        }
+        let shift = pull * (1.0 + t.corner * corner) * curve(&t, u);
+        let (sx, sy) = (nx * shift, ny * shift);
+        // red, green and blue look a slightly different distance out, like light through glass
+        let rc = sample(&shot, fx + sx, fy + sy, 16);
+        let gc = sample(&shot, fx + sx * (1.0 - t.fringe), fy + sy * (1.0 - t.fringe), 8);
+        let bc = sample(&shot, fx + sx * (1.0 - 2.0 * t.fringe), fy + sy * (1.0 - 2.0 * t.fringe), 0);
+        let ch = |v: f32| (v * alpha).round().clamp(0.0, 255.0) as u32;
+        let mut c =
+            (((alpha * 255.0).round().clamp(0.0, 255.0) as u32) << 24) | (ch(rc) << 16) | (ch(gc) << 8) | ch(bc);
+        // the light along the edge: bright where the edge faces the light, a softer glint on the far side
+        if t.edge_light > 0.0 && d < hw {
+            let f = 1.0 - d.max(0.0) / hw;
+            let face = nx * t.lx + ny * t.ly;
+            let lit = (0.2 + face.max(0.0) + 0.6 * (-face).max(0.0)).min(1.0);
+            let kk = 1.0 - t.ldir + t.ldir * lit;
+            let hl = (t.edge_light * kk * f * f.sqrt() * (1.0 + 0.6 * corner)).clamp(0.0, 1.0);
+            let (mu, wh) = (1.0 - hl, 255.0 * hl);
+            let lift = |sft: u32| -> u32 { (((c >> sft) & 255) as f32 * mu + wh).round().min(255.0) as u32 };
+            c = (lift(24) << 24) | (lift(16) << 16) | (lift(8) << 8) | lift(0);
+        }
+        c
+    };
+    for row in 0..h {
+        let fy = y0 as f32 + row as f32 + 0.5;
+        let qy = (fy - hy).abs() - iy;
+        // rows well inside the bar only have glass at the two ends
+        let skip = qy <= -width && ix - width > 1.0;
+        let (a, b) = if skip {
+            (
+                ((hx - (ix - width)) - x0 as f32).floor().max(0.0) as usize,
+                ((hx + (ix - width)) - x0 as f32).ceil() as usize,
+            )
+        } else {
+            (w, w)
+        };
+        let line = &mut px[row * w..(row + 1) * w];
+        for col in (0..a.min(w)).chain(b.min(w)..w) {
+            line[col] = shade(x0 as f32 + col as f32 + 0.5, fy);
+        }
+    }
+    Some(BarRim { sum, rim: Some(Rim { x0, y0, w, h, step: 1, px }) })
 }

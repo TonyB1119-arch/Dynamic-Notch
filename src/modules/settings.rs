@@ -293,7 +293,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 23.0,
+        8 => 24.0,
         9 => 34.0,
         10 => 14.0,
         11 => 22.0,
@@ -1117,6 +1117,14 @@ impl Settings {
             format!("{:.0}%", d.blur * 100.0),
             "dock",
             "blur",
+        );
+        toggle_row(
+            ui,
+            row_rect(body, 23),
+            "Dock: bending glass edge (hides it from screenshots)",
+            d.refract,
+            "dock",
+            "refract",
         );
         slider_row(
             ui,
