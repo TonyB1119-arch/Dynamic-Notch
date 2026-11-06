@@ -1634,7 +1634,7 @@ impl Launcher {
     }
 
     fn shows_hit(&self) -> bool {
-        !self.hits.is_empty() && (!self.query.trim().is_empty() || self.list_open)
+        !self.hits.is_empty() && (self.one_box || !self.query.trim().is_empty() || self.list_open)
     }
 
     fn cur(&self) -> Option<&Hit> {
@@ -2673,7 +2673,7 @@ impl Launcher {
             self.icon_gen = ver;
             self.icons.clear();
         }
-        let mut want: Vec<String> = Vec::new();
+        let mut want: Vec<(String, String)> = Vec::new();
         // the file on the left: its picture or its first lines
         let shown = self.pending.as_ref().map(|(_, h)| h).or_else(|| self.cur());
         if let Some(h) = shown.filter(|h| h.kind == Kind::File) {
@@ -2682,34 +2682,34 @@ impl Launcher {
         }
         if let Some((_, h)) = &self.pending {
             if h.kind.has_icon() {
-                want.push(h.path.clone());
+                want.push((h.path.clone(), h.name.clone()));
             }
         }
         if let Some(h) = self.cur() {
             if h.kind.has_icon() {
-                want.push(h.path.clone());
+                want.push((h.path.clone(), h.name.clone()));
             }
         }
         if self.mode == Mode::Kill && !self.query.trim().is_empty() {
             for h in self.hits.iter().skip(self.sel & !1).take(2) {
-                want.push(h.path.clone());
+                want.push((h.path.clone(), h.name.clone()));
             }
         }
         if self.mode == Mode::Windows {
             for w in self.wn.iter().skip(self.wn_x as usize).take(SW_VIS + 2) {
                 if !w.exe.is_empty() {
-                    want.push(w.exe.clone());
+                    want.push((w.exe.clone(), String::new()));
                 }
             }
         }
         if self.list_open && self.focus == Focus::Subject {
             for h in self.hits.iter().skip(self.top).take(VIS) {
                 if h.kind.has_icon() {
-                    want.push(h.path.clone());
+                    want.push((h.path.clone(), h.name.clone()));
                 }
             }
         }
-        want.retain(|k| !self.icons.contains_key(k));
+        want.retain(|(k, _)| !self.icons.contains_key(k));
         if want.is_empty() {
             return false;
         }
@@ -2718,7 +2718,7 @@ impl Launcher {
         }
         let mut loaded = 0;
         let mut missing = false;
-        for k in want {
+        for (k, name) in want {
             if self.icons.contains_key(&k) {
                 continue;
             }
@@ -2727,7 +2727,7 @@ impl Launcher {
                 break;
             }
             loaded += 1;
-            let img = crate::dock::icon_for_path(&k);
+            let img = crate::dock::icon_for_path(&k, &name);
             self.icons.insert(k, img);
         }
         missing

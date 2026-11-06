@@ -1114,13 +1114,18 @@ fn icon_key(it: &Item) -> String {
 
 /// A .png from the dock-icons folder if there is one, else the icon the shell shows for the file.
 fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
+    load_icon_named(it, dir, &[])
+}
+
+/// The same, also looking for a .png named after each of `extra`.
+fn load_icon_named(it: &Item, dir: &Path, extra: &[String]) -> Option<ImageData> {
     let stem = Path::new(&it.path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(p) = &it.png {
         let p = Path::new(p);
         cands.push(if p.is_absolute() { p.to_path_buf() } else { dir.join(p) });
     }
-    for name in [&it.label, &stem] {
+    for name in [&it.label, &stem].into_iter().chain(extra) {
         cands.push(dir.join(format!("{name}.png")));
         cands.push(dir.join(format!("{}.png", name.to_ascii_lowercase())));
     }
@@ -1152,27 +1157,47 @@ fn share_pins(items: &[Item]) {
 
 /// The picture the dock shows for whatever `path` opens: a pinned item's own icon file, a .png named like
 /// it in the dock-icons folder, else the shell's icon (so the launcher matches the dock).
-pub fn icon_for_path(path: &str) -> Option<ImageData> {
+pub fn icon_for_path(path: &str, name: &str) -> Option<ImageData> {
     let low = path.to_ascii_lowercase();
-    let stem = |p: &str| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let want = stem(&low);
+    // Store apps ("shell:AppsFolder, Package!App") have no file name worth comparing
+    let store = low.starts_with("shell:");
+    let target = if low.ends_with(".lnk") { resolve_lnk(path) } else { None };
+    let stem = |p: &str| Path::new(p).file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let own = if store { String::new() } else { stem(&low) };
+    let tstem = target.as_deref().map(stem).unwrap_or_default();
     let pin = PINS.lock().ok().and_then(|v| {
-        v.iter().find(|p| p.0 == low).or_else(|| v.iter().find(|p| !want.is_empty() && stem(&p.0) == want)).cloned()
+        v.iter()
+            .find(|p| {
+                p.0 == low
+                    || (!own.is_empty() && stem(&p.0) == own)
+                    || (!tstem.is_empty() && stem(&p.0) == tstem)
+                    || (!name.is_empty() && p.1.eq_ignore_ascii_case(name))
+            })
+            .cloned()
     });
-    let (label, png) = match pin {
-        Some((_, label, png)) => (label, png),
-        None => (nice_name(path), None),
-    };
+    // the dock saves a chosen picture under the item's name: the pin's, the app's own, its program's
+    let mut names: Vec<String> = Vec::new();
+    if let Some(p) = &pin {
+        names.push(p.1.clone());
+    }
+    names.push(name.to_string());
+    if let Some(t) = &target {
+        names.push(nice_name(t));
+    }
+    if !store {
+        names.push(nice_name(path));
+    }
+    names.retain(|n| !n.is_empty());
     let it = with_key(Item {
-        label,
+        label: names.first().cloned().unwrap_or_default(),
         path: path.to_string(),
         exe: String::new(),
-        png,
+        png: pin.and_then(|p| p.2),
         pinned: false,
         hwnd: 0,
         key: String::new(),
     });
-    load_icon(&it, &icons_dir())
+    load_icon_named(&it, &icons_dir(), &names)
 }
 
 /// The picture the dock shows for an app called `label` that opens `path` (so the radial menu matches).
