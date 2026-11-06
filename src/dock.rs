@@ -214,6 +214,7 @@ impl Dock {
         let items_changed = old.items != cfg.items || old.show_running != cfg.show_running || old.hide_apps != cfg.hide_apps;
         if items_changed || self.items.is_empty() {
             self.pinned = cfg.items.iter().filter(|s| !s.trim().is_empty()).map(|s| parse_item(s)).collect();
+            share_pins(&self.pinned);
         }
         self.mon = mon;
         self.ui_scale = ui_scale;
@@ -898,6 +899,7 @@ impl Dock {
     /// A new icon file was chosen (or removed): load every icon again.
     pub fn reload_icons(&mut self, gfx: &Gfx) {
         self.icons.clear();
+        ICON_GEN.fetch_add(1, Ordering::Relaxed);
         self.draw(gfx);
     }
 
@@ -1130,6 +1132,47 @@ fn load_icon(it: &Item, dir: &Path) -> Option<ImageData> {
         }
     }
     dragdrop::thumbnail(&it.path, 128)
+}
+
+/// The pinned items as (path, label, icon file), lower case paths, for the launcher; and a counter that
+/// moves whenever the icons may look different.
+static PINS: std::sync::Mutex<Vec<(String, String, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+static ICON_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn icon_gen() -> u32 {
+    ICON_GEN.load(Ordering::Relaxed)
+}
+
+fn share_pins(items: &[Item]) {
+    if let Ok(mut v) = PINS.lock() {
+        *v = items.iter().map(|i| (i.path.to_ascii_lowercase(), i.label.clone(), i.png.clone())).collect();
+    }
+    ICON_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The picture the dock shows for whatever `path` opens: a pinned item's own icon file, a .png named like
+/// it in the dock-icons folder, else the shell's icon (so the launcher matches the dock).
+pub fn icon_for_path(path: &str) -> Option<ImageData> {
+    let low = path.to_ascii_lowercase();
+    let stem = |p: &str| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let want = stem(&low);
+    let pin = PINS.lock().ok().and_then(|v| {
+        v.iter().find(|p| p.0 == low).or_else(|| v.iter().find(|p| !want.is_empty() && stem(&p.0) == want)).cloned()
+    });
+    let (label, png) = match pin {
+        Some((_, label, png)) => (label, png),
+        None => (nice_name(path), None),
+    };
+    let it = with_key(Item {
+        label,
+        path: path.to_string(),
+        exe: String::new(),
+        png,
+        pinned: false,
+        hwnd: 0,
+        key: String::new(),
+    });
+    load_icon(&it, &icons_dir())
 }
 
 /// The picture the dock shows for an app called `label` that opens `path` (so the radial menu matches).

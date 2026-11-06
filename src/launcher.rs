@@ -524,6 +524,10 @@ pub struct Launcher {
     flashing: bool,
     /// What to show instead of search results (a combo's target).
     pinned: Option<Hit>,
+    /// A combo's flash is one box with the icon (no search box beside it).
+    one_box: bool,
+    /// Which version of the dock's icons the picture cache holds.
+    icon_gen: u32,
     free_me: bool,
     scale: f32,
     win_px: (i32, i32, i32, i32),
@@ -634,6 +638,8 @@ impl Launcher {
             mode: Mode::Search,
             flashing: false,
             pinned: None,
+            one_box: false,
+            icon_gen: 0,
             free_me: false,
             scale: 1.0,
             win_px: (0, 0, 0, 0),
@@ -868,7 +874,10 @@ impl Launcher {
         let on_disk = Path::new(&expanded);
         let browser = low == "browser" || low == "default browser";
         let (kind, path) = if browser {
-            (Kind::Url, self.cfg.search_url.clone())
+            match default_browser_exe() {
+                Some(exe) => (Kind::App, exe),
+                None => (Kind::Url, self.cfg.search_url.clone()),
+            }
         } else if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("www.") {
             (Kind::Url, expanded.clone())
         } else if on_disk.is_dir() {
@@ -897,6 +906,7 @@ impl Launcher {
     fn show(&mut self, gfx: &Gfx, ui_scale: f32, focus: bool) {
         // asked again while it was still fading out: the window is already there
         let again = self.visible;
+        self.one_box = self.pinned.is_some();
         self.switch = None;
         self.query.clear();
         self.hits.clear();
@@ -1072,7 +1082,7 @@ impl Launcher {
 
     /// The card is one wide box in the Run mode.
     fn rw_target(&self) -> f32 {
-        if self.mode == Mode::Run {
+        if self.mode == Mode::Run || self.one_box {
             1.0
         } else {
             0.0
@@ -2657,6 +2667,12 @@ impl Launcher {
 
     /// Shell icons of what is on screen, a few per frame so typing never stalls. True while more are due.
     fn load_icons(&mut self) -> bool {
+        // the dock's icons changed (a new picture, other pins): look at them again
+        let ver = crate::dock::icon_gen();
+        if ver != self.icon_gen {
+            self.icon_gen = ver;
+            self.icons.clear();
+        }
         let mut want: Vec<String> = Vec::new();
         // the file on the left: its picture or its first lines
         let shown = self.pending.as_ref().map(|(_, h)| h).or_else(|| self.cur());
@@ -2711,7 +2727,7 @@ impl Launcher {
                 break;
             }
             loaded += 1;
-            let img = dragdrop::thumbnail(&k, 96);
+            let img = crate::dock::icon_for_path(&k);
             self.icons.insert(k, img);
         }
         missing
@@ -3004,6 +3020,9 @@ impl Launcher {
                         a: (self.ai.a.sz, self.ai.a.y, self.ai.a.center),
                     };
                     ai_max = draw_ai(&mut p, sub, act, &view);
+                } else if self.one_box && self.mode == Mode::Search && self.pending.is_none() {
+                    // a combo's flash: the app's picture and name in one box
+                    draw_subject(&mut p, sub_box, &subject);
                 } else {
                     draw_subject(&mut p, sub, &subject);
                     match &self.pending {
@@ -3308,6 +3327,38 @@ fn draw_thumb(p: &mut Painter, r: Rect, h: &Hit, img: Option<&ImageData>, wx: Op
             }
         },
     }
+}
+
+/// The program the default web browser starts (read from the registry), so a combo can show its icon.
+fn default_browser_exe() -> Option<String> {
+    use windows::Win32::Foundation::WIN32_ERROR;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let read = |root: HKEY, sub: &str, val: PCWSTR| -> Option<String> {
+        let sub: Vec<u16> = sub.encode_utf16().chain(Some(0)).collect();
+        let mut buf = [0u16; 520];
+        let mut sz = (buf.len() * 2) as u32;
+        let r = unsafe {
+            RegGetValueW(
+                root,
+                PCWSTR(sub.as_ptr()),
+                val,
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr() as *mut _),
+                Some(&mut sz),
+            )
+        };
+        (r == WIN32_ERROR(0)).then(|| crate::util::from_wide(&buf)).filter(|s| !s.is_empty())
+    };
+    let key = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice";
+    let prog = read(HKEY_CURRENT_USER, key, w!("ProgId"))?;
+    let cmd = read(HKEY_CLASSES_ROOT, &format!(r"{prog}\shell\open\command"), PCWSTR::null())?;
+    let cmd = crate::dock::expand_env(cmd.trim());
+    let exe = match cmd.strip_prefix('"') {
+        Some(rest) => rest.split('"').next()?.to_string(),
+        None => cmd[..cmd.to_ascii_lowercase().find(".exe")? + 4].to_string(),
+    };
+    Path::new(&exe).is_file().then_some(exe)
 }
 
 /// What the left box shows right now.
