@@ -2380,23 +2380,19 @@ impl App {
         let split = self.split_media();
         let ap = &self.cfg.appearance;
         let speed = ap.animation_speed;
-        // minimal look: no overshoot anywhere, and a touch more patience in every move
-        let minimal = crate::ui::look_minimal();
         let nothing = crate::ui::look_nothing();
         let alcove = crate::ui::look_alcove();
         let bloom = (crate::ui::look_bloom() && !alcove) || crate::ui::look_tuna();
         // Bloom settles like a smooth ease-out: almost no overshoot
-        let bounce = if minimal || nothing {
+        let bounce = if nothing {
             0.0
         } else if bloom {
             ap.bounce * 0.35
         } else {
             ap.bounce
         };
-        // minimal is a touch slower and softer; Nothing is crisp and mechanical
-        let speed = if minimal {
-            speed * 0.9
-        } else if nothing {
+        // Nothing is crisp and mechanical
+        let speed = if nothing {
             speed * 1.15
         } else if alcove {
             speed * 1.1

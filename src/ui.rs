@@ -82,12 +82,6 @@ const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 /// How quickly gauges and numbers settle on a new value (seconds).
 const GLIDE_TAU: f32 = 0.16;
 
-thread_local! {
-    /// True while a caller has asked for the beam look (see `Ui::beams`). Everywhere else the same
-    /// gauges, sweeps and rings are drawn as plain smooth lines.
-    static BEAMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Overall look: 3 = nothing, 5 = alcove, 6 = tuna (the default; the other numbers are the retired looks).
 static LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(6);
 
@@ -100,11 +94,6 @@ pub fn set_look(name: &str) {
         _ => 6,
     };
     LOOK.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// True in the minimal look: thin plain lines, no glow, no swell.
-pub fn look_minimal() -> bool {
-    LOOK.load(std::sync::atomic::Ordering::Relaxed) == 2
 }
 
 /// True in the Nothing look: monochrome, dot-matrix "glyph" lights with a single red accent.
@@ -172,14 +161,6 @@ pub const BLOOM_BLUE: Color = Color::hex(0x0A84FF);
 /// The one accent colour of the Nothing look.
 pub const NOTHING_RED: Color = Color::hex(0xD71921);
 
-fn look_beams() -> bool {
-    LOOK.load(std::sync::atomic::Ordering::Relaxed) == 0
-}
-
-fn beams_on() -> bool {
-    look_beams() || BEAMS.with(|b| b.get())
-}
-
 /// Stable key for a value that should glide, e.g. `gkey("cpu", 0)`.
 pub fn gkey(tag: &str, i: usize) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -231,22 +212,6 @@ pub fn beam_lead() -> Color {
 
 /// Colour of a tick that is not lit.
 const TICK_DIM: Color = Color::white(0.16);
-
-/// Layout of a tick row: (tick count, distance between ticks, tick width).
-fn tick_geom(w: f32) -> (usize, f32, f32) {
-    let n = ((w / 4.6).round() as usize).max(2);
-    let step = w / n as f32;
-    (n, step, (step * 0.56).max(1.4))
-}
-
-/// Layout of a tick ring: (outer radius, tick length, tick width, tick count).
-fn ring_geom(diameter: f32, stroke: f32) -> (f32, f32, f32, usize) {
-    let outer = diameter * 0.5;
-    let len = (stroke * 1.7).clamp(3.5, 12.0);
-    let tw = (stroke * 0.42).clamp(1.5, 3.0);
-    let n = ((std::f32::consts::TAU * outer) / (tw * 2.1)).round().clamp(18.0, 72.0) as usize;
-    (outer, len, tw, n)
-}
 
 #[derive(Clone, Copy)]
 pub struct ButtonStyle {
@@ -589,77 +554,17 @@ impl<'p, 'a> Ui<'p, 'a> {
         cx - pair_gap - x
     }
 
-    /// Circular gauge made of ticks, filling clockwise from 12 o'clock.
+    /// Circular gauge, filling clockwise from 12 o'clock (each look draws its own).
     pub fn ring(&mut self, cx: f32, cy: f32, diameter: f32, stroke: f32, frac: f32, color: Color) {
-        let (outer, len, tw, n) = ring_geom(diameter, stroke);
         let color = themed(color);
         let key = rect_key(Rect::new(cx, cy, diameter, 0.0), "ring");
         let frac = self.glide2(key, frac.clamp(0.0, 1.0));
-        if !beams_on() {
-            return self.line_ring(cx, cy, diameter, stroke, frac, color);
-        }
-        let pos = frac.clamp(0.0, 1.0) * n as f32;
-        let white = white_beams();
-        let span = (n as f32 * 0.28).max(4.0);
-        for i in 0..n {
-            let behind = pos - i as f32;
-            let t = behind.clamp(0.0, 1.0);
-            let mut c = TICK_DIM.lerp(color, t);
-            let mut s = 0.0;
-            if t > 0.0 {
-                s = Self::shine(behind, span) * t;
-                let tint = if white { palette::BLUE } else { Color::white(1.0) };
-                c = c.lerp(tint.with_a(c.a), s * 0.9);
-            }
-            self.radial_tick(cx, cy, outer, len, tw, i, n, c, s);
-        }
+        self.line_ring(cx, cy, diameter, stroke, frac, color);
     }
 
-    /// The same ring for "working on it": a bright stretch of ticks that circles.
+    /// The same ring for "working on it".
     pub fn ring_spin(&mut self, cx: f32, cy: f32, diameter: f32, stroke: f32, color: Color) {
-        if !beams_on() {
-            return self.line_ring_spin(cx, cy, diameter, stroke, color);
-        }
-        let (outer, len, tw, n) = ring_geom(diameter, stroke);
-        let color = themed(color);
-        let head = (epoch_secs() * 0.9).fract() * n as f32;
-        for i in 0..n {
-            let behind = (head - i as f32).rem_euclid(n as f32);
-            let t = (1.0 - behind / (n as f32 * 0.35)).clamp(0.0, 1.0);
-            let mut c = TICK_DIM.lerp(color, t);
-            let s = t * t;
-            let tint = if white_beams() { palette::BLUE } else { Color::white(1.0) };
-            c = c.lerp(tint.with_a(c.a), s * 0.9);
-            self.radial_tick(cx, cy, outer, len, tw, i, n, c, s);
-        }
-        self.fx.animate = true;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn radial_tick(
-        &mut self,
-        cx: f32,
-        cy: f32,
-        outer: f32,
-        len: f32,
-        tw: f32,
-        i: usize,
-        n: usize,
-        c: Color,
-        shine: f32,
-    ) {
-        let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n as f32;
-        let (s, co) = a.sin_cos();
-        // the whiter a beam shines, the longer and thicker it is
-        let (len, tw) = (len + shine * 3.0, tw + shine * 0.7);
-        self.p.line(
-            cx + co * (outer - len + shine),
-            cy + s * (outer - len + shine),
-            cx + co * (outer + shine),
-            cy + s * (outer + shine),
-            tw,
-            c,
-        );
+        self.line_ring_spin(cx, cy, diameter, stroke, color);
     }
 
     /// A row of thin vertical ticks that fills left to right (the app's gauge look).
@@ -667,64 +572,9 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.ticks_ex(r, frac, color, false);
     }
 
-    /// Run `f` with the beam look switched on (it is on everywhere by default; the non-beam looks
-    /// below are kept for a future "beams: data only" option).
+    /// Kept so callers need no change: every look draws its own gauges.
     pub fn beams<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        if look_minimal() || look_nothing() || look_bloom() || look_tuna() {
-            return f(self);
-        }
-        let old = BEAMS.with(|b| b.replace(true));
-        let r = f(self);
-        BEAMS.with(|b| b.set(old));
-        r
-    }
-
-    // ---- minimal look: thin plain lines, one colour, no glow or swell ----
-
-    /// A thin line from `from` to `to` (0..1) over a faint rail.
-    fn min_bar(&mut self, r: Rect, from: f32, to: f32, color: Color) {
-        let t = 2.0;
-        let y = r.cy() - t * 0.5;
-        self.p.fill_rounded_live(Rect::new(r.x, y, r.w, t), t * 0.5, Color::white(0.14));
-        let (x0, x1) = (r.x + r.w * from.clamp(0.0, 1.0), r.x + r.w * to.clamp(0.0, 1.0));
-        if x1 - x0 > 0.5 {
-            let a = 0.92 * color.a.clamp(0.0, 1.0);
-            self.p.fill_rounded_live(Rect::new(x0, y, (x1 - x0).max(t), t), t * 0.5, Color::white(a));
-        }
-    }
-
-    /// "Working on it": one short line gliding back and forth along the rail with eased ends.
-    fn min_sweep(&mut self, r: Rect) {
-        let t = 2.0;
-        let y = r.cy() - t * 0.5;
-        self.p.fill_rounded_live(Rect::new(r.x, y, r.w, t), t * 0.5, Color::white(0.14));
-        let phase = ((self.now.elapsed().as_secs_f32() + epoch_secs()) % 2.0) / 2.0;
-        let e = 0.5 - 0.5 * (std::f32::consts::PI * phase).cos();
-        let seg = (r.w * 0.28).max(8.0);
-        let x = r.x + (r.w - seg) * e;
-        self.p.fill_rounded_live(Rect::new(x, y, seg, t), t * 0.5, Color::white(0.85));
-        self.fx.animate = true;
-    }
-
-    /// A thin ring that fills clockwise from 12 o'clock.
-    fn min_ring(&mut self, cx: f32, cy: f32, diameter: f32, frac: f32, color: Color) {
-        let w = 1.6;
-        let rad = (diameter * 0.5 - w).max(1.0);
-        self.p.stroke_circle(cx, cy, rad, w, Color::white(0.14));
-        if frac > 0.003 {
-            let a = 0.92 * color.a.clamp(0.0, 1.0);
-            self.p.arc(cx, cy, rad, 0.0, std::f32::consts::TAU * frac.clamp(0.0, 1.0), w, Color::white(a));
-        }
-    }
-
-    /// A thin ring with one short arc turning steadily.
-    fn min_ring_spin(&mut self, cx: f32, cy: f32, diameter: f32) {
-        let w = 1.6;
-        let rad = (diameter * 0.5 - w).max(1.0);
-        self.p.stroke_circle(cx, cy, rad, w, Color::white(0.14));
-        let start = (epoch_secs() * 0.8).fract() * std::f32::consts::TAU;
-        self.p.arc(cx, cy, rad, start, 1.3, w, Color::white(0.85));
-        self.fx.animate = true;
+        f(self)
     }
 
     // ---- Bloom look: soft capsules, thick rounded rings, white on a faint track ----
@@ -913,11 +763,8 @@ impl<'p, 'a> Ui<'p, 'a> {
     pub fn underline(&mut self, r: Rect, c: Color) {
         if look_nothing() {
             self.p.fill_circle(r.cx(), r.cy(), 2.0, NOTHING_RED.with_a(c.a));
-        } else if beams_on() {
-            self.ticks(r, 1.0, c);
         } else {
-            let h = if look_minimal() { 2.0 } else { r.h };
-            self.p.fill_rounded_live(Rect::new(r.x, r.y + (r.h - h) * 0.5, r.w, h), h * 0.5, c);
+            self.p.fill_rounded_live(r, r.h * 0.5, c);
         }
     }
 
@@ -927,88 +774,11 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_nothing() {
             return self.glyph_bar(r, 0.0, frac, color);
         }
-        if look_minimal() {
-            return self.min_bar(r, 0.0, frac, color);
-        }
         if look_tuna() {
             return self.tube_bar(r, 0.0, frac, color);
         }
         if look_bloom() {
             return self.bloom_bar(r, 0.0, frac, color);
-        }
-        let frac = frac.clamp(0.0, 1.0);
-        if r.w <= 80.0 {
-            let n = ((r.w / 10.0).round() as usize).clamp(3, 8);
-            self.draw_pills(r, frac, color, n);
-        } else {
-            self.glow_span(r, 0.0, frac, color);
-        }
-    }
-
-    /// A row of pill segments that fill in; the leading ones shine white and stand taller.
-    fn draw_pills(&mut self, r: Rect, frac: f32, color: Color, n: usize) {
-        let lit = themed(color);
-        let dim = Color::white(0.13);
-        let gap = 3.0;
-        let sw = (r.w - gap * (n as f32 - 1.0)) / n as f32;
-        let h = (r.h * 0.55).clamp(4.0, 7.0);
-        for i in 0..n {
-            let behind = frac * n as f32 - i as f32;
-            let t = smooth01(behind);
-            let s = Self::lead(behind, 3.5);
-            let c = dim.lerp(lit, t).lerp(Color::white(1.0).with_a(lit.a), s);
-            let ph = h + 5.0 * s;
-            self.p.fill_rounded_live(Rect::new(r.x + i as f32 * (sw + gap), r.cy() - ph * 0.5, sw, ph), ph * 0.5, c);
-        }
-    }
-
-    /// Pill segments with a chosen count (used where a bar should read as chunky steps).
-    pub fn pills(&mut self, r: Rect, frac: f32, color: Color, n: usize) {
-        self.draw_pills(r, frac.clamp(0.0, 1.0), color, n.max(2));
-    }
-
-    /// A soft glow bar: a rail, the lit stretch from `from` to `to` (0..1 of the width) with a faint
-    /// halo, and a leading end that shines white and swells.
-    fn glow_span(&mut self, r: Rect, from: f32, to: f32, color: Color) {
-        let t = (r.h * 0.5).clamp(3.5, 6.0);
-        let y = r.cy() - t * 0.5;
-        self.p.fill_rounded_live(Rect::new(r.x, y, r.w, t), t * 0.5, Color::white(0.10));
-        let (x0, x1) = (r.x + r.w * from.clamp(0.0, 1.0), r.x + r.w * to.clamp(0.0, 1.0));
-        if x1 - x0 > 0.5 {
-            let fw = (x1 - x0).max(t);
-            let end = x0 + fw;
-            let lit = themed(color);
-            self.p.fill_rounded_live(
-                Rect::new(x0 - 1.0, y - 2.0, fw + 2.0, t + 4.0),
-                (t + 4.0) * 0.5,
-                lit.with_a(lit.a * 0.16),
-            );
-            self.p.fill_rounded_live(Rect::new(x0, y, fw, t), t * 0.5, lit);
-            // the leading end: one tapered shape with a round cap, shaded by a real gradient from
-            // the bar colour to white, so it is perfectly smooth
-            let hmax = t + 3.0;
-            let reach = (fw * 0.85).min(90.0).max(hmax * 1.4);
-            let (xs, rc) = (end - reach, hmax * 0.5);
-            let xc = end - rc;
-            let mut pts = PolyBuf::new();
-            for i in 0..=14 {
-                let u = i as f32 / 14.0;
-                let e = u.powf(2.6);
-                pts.push((xs + (xc - xs) * u, r.cy() - (t + (hmax - t) * e) * 0.5));
-            }
-            for i in 1..10 {
-                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 10.0;
-                pts.push((xc + rc * a.cos(), r.cy() + rc * a.sin()));
-            }
-            for i in (0..=14).rev() {
-                let u = i as f32 / 14.0;
-                let e = u.powf(2.6);
-                pts.push((xs + (xc - xs) * u, r.cy() + (t + (hmax - t) * e) * 0.5));
-            }
-            let white = Color::white(1.0).with_a(lit.a);
-            let stops =
-                [(0.0, lit.with_a(0.0)), (0.45, lit.lerp(white, 0.25)), (0.8, lit.lerp(white, 0.75)), (1.0, white)];
-            self.p.fill_gradient_poly(pts.get(), &stops, xs, end);
         }
     }
 
@@ -1018,51 +788,12 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_nothing() {
             return self.glyph_sweep(r);
         }
-        if look_minimal() {
-            return self.min_sweep(r);
-        }
         if look_tuna() {
             return self.tube_sweep(r);
         }
         if look_bloom() {
             return self.bloom_sweep(r);
         }
-        let t = (r.h * 0.3).clamp(2.5, 3.5);
-        let y = r.cy() - t * 0.5;
-        self.p.fill_rounded_live(Rect::new(r.x, y, r.w, t), t * 0.5, Color::white(0.12));
-        let phase = (self.now.elapsed().as_secs_f32() + epoch_secs()) % 1.6 / 1.6;
-        let seg = r.w * 0.34;
-        let mid = r.x - seg * 0.5 + phase * (r.w + seg);
-        let base = themed(color);
-        // a soft lens-shaped glow with a gradient from the bar colour to white at its centre
-        let half = seg * 0.5;
-        let (lo, hi) = ((mid - half).max(r.x), (mid + half).min(r.right()));
-        if hi - lo > 1.0 {
-            let n = 16;
-            let bell = |x: f32| {
-                let k = (1.0 - (x - mid).abs() / half).clamp(0.0, 1.0);
-                (t + 3.0 * k * k * (3.0 - 2.0 * k)) * 0.5
-            };
-            let mut pts = PolyBuf::new();
-            for i in 0..=n {
-                let x = lo + (hi - lo) * i as f32 / n as f32;
-                pts.push((x, r.cy() - bell(x)));
-            }
-            for i in (0..=n).rev() {
-                let x = lo + (hi - lo) * i as f32 / n as f32;
-                pts.push((x, r.cy() + bell(x)));
-            }
-            let white = Color::white(1.0).with_a(base.a);
-            let stops = [
-                (0.0, base.with_a(0.0)),
-                (0.25, base.with_a(base.a * 0.75)),
-                (0.5, base.lerp(white, 0.9)),
-                (0.75, base.with_a(base.a * 0.75)),
-                (1.0, base.with_a(0.0)),
-            ];
-            self.p.fill_gradient_poly(pts.get(), &stops, mid - half, mid + half);
-        }
-        self.fx.animate = true;
     }
 
     /// A range without beams: a glow range with a white, swollen leading end.
@@ -1070,16 +801,12 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_nothing() {
             return self.glyph_bar(r, from, to, color);
         }
-        if look_minimal() {
-            return self.min_bar(r, from, to, color);
-        }
         if look_tuna() {
             return self.tube_bar(r, from, to, color);
         }
         if look_bloom() {
             return self.bloom_bar(r, from, to, color);
         }
-        self.glow_span(r, from, to, color);
     }
 
     /// Ring without beams: a circle of dots that light up clockwise from 12 o'clock. The leading
@@ -1088,26 +815,11 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_nothing() {
             return self.glyph_ring(cx, cy, diameter, frac, color);
         }
-        if look_minimal() {
-            return self.min_ring(cx, cy, diameter, frac, color);
-        }
         if look_tuna() {
             return self.tube_ring(cx, cy, diameter, frac, color);
         }
         if look_bloom() {
             return self.bloom_ring(cx, cy, diameter, frac, color);
-        }
-        let frac = frac.clamp(0.0, 1.0);
-        let (n, rad, dot) = Self::dot_ring_geom(diameter);
-        let lit = themed(color);
-        let dim = Color::white(0.13);
-        for i in 0..n {
-            let behind = frac * n as f32 - i as f32;
-            let t = smooth01(behind);
-            let s = Self::lead(behind, 5.0);
-            let c = dim.lerp(lit, t).lerp(Color::white(1.0).with_a(lit.a), s);
-            let a = std::f32::consts::TAU * i as f32 / n as f32;
-            self.p.fill_circle(cx + rad * a.sin(), cy - rad * a.cos(), dot, c);
         }
     }
 
@@ -1125,28 +837,12 @@ impl<'p, 'a> Ui<'p, 'a> {
         if look_nothing() {
             return self.glyph_ring_spin(cx, cy, diameter);
         }
-        if look_minimal() {
-            return self.min_ring_spin(cx, cy, diameter);
-        }
         if look_tuna() {
             return self.tube_ring_spin(cx, cy, diameter);
         }
         if look_bloom() {
             return self.bloom_ring_spin(cx, cy, diameter);
         }
-        let turn = (epoch_secs() * 0.9).fract();
-        let (n, rad, dot) = Self::dot_ring_geom(diameter);
-        let lit = themed(color);
-        let dim = Color::white(0.13);
-        for i in 0..n {
-            // distance of this dot behind the head, in dots
-            let behind = (turn * n as f32 - i as f32).rem_euclid(n as f32);
-            let t = (1.0 - behind / (n as f32 * 0.35)).clamp(0.0, 1.0);
-            let c = dim.lerp(lit, t).lerp(Color::white(1.0).with_a(lit.a), t * t);
-            let a = std::f32::consts::TAU * i as f32 / n as f32;
-            self.p.fill_circle(cx + rad * a.sin(), cy - rad * a.cos(), dot, c);
-        }
-        self.fx.animate = true;
     }
 
     /// A value that eases in and out: two gentle glides in a row, so it starts and stops softly.
@@ -1155,35 +851,10 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.glide(key ^ 0x9E37_79B9, first)
     }
 
-    /// One vertical beam. It sits on whole device pixels with a whole-pixel width, so every beam
-    /// in a row is equally crisp and bright, and it grows by `shine` (0..1): the whiter a beam
-    /// shines, the larger it is.
-    fn beam(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color, shine: f32) {
-        let sc = self.p.scale.max(0.5);
-        let px = |v: f32| (v * sc).round() / sc;
-        let bw = ((w * sc).round().max(2.0)) / sc;
-        let bx = px(x + (w - bw) * 0.5);
-        let grow = shine * 2.2;
-        self.p.fill_rounded(Rect::new(bx, px(y) - grow, bw, h + 2.0 * grow), bw * 0.5, c);
-    }
-
-    /// How brightly a beam shines, 0..1: strongest at the leading edge, fading over `span` beams.
-    /// Shine for an element `behind` steps behind the moving edge: full on the newest lit one,
-    /// fading smoothly over `span` steps, and zero for anything not lit yet.
-    fn lead(behind: f32, span: f32) -> f32 {
-        let k = (1.0 - (behind - 1.0).max(0.0) / span).clamp(0.0, 1.0);
-        k * k * smooth01(behind)
-    }
-
-    fn shine(behind: f32, span: f32) -> f32 {
-        let k = (1.0 - behind / span).clamp(0.0, 1.0);
-        k * k
-    }
-
     /// `warm` is kept for callers; every gauge now shines white at its leading edge.
     pub fn ticks_ex(&mut self, r: Rect, frac: f32, color: Color, _warm: bool) {
         let frac = self.glide2(rect_key(r, "ticks"), frac.clamp(0.0, 1.0));
-        self.ticks_raw(r, frac, color, false);
+        self.line_bar(r, frac, color);
     }
 
     /// The volume / brightness bar (the same look as every gauge).
@@ -1191,73 +862,14 @@ impl<'p, 'a> Ui<'p, 'a> {
         self.beams(|ui| ui.ticks_ex(r, frac, Color::white(1.0), true));
     }
 
-    /// Like `ticks_ex` but draws `frac` exactly as given (the caller smooths it).
-    fn ticks_raw(&mut self, r: Rect, frac: f32, color: Color, _warm: bool) {
-        if !beams_on() {
-            return self.line_bar(r, frac, color);
-        }
-        let (n, step, w) = tick_geom(r.w);
-        let color = themed(color);
-        let pos = frac.clamp(0.0, 1.0) * n as f32;
-        let white = white_beams();
-        for i in 0..n {
-            let behind = pos - i as f32; // how far this tick is behind the leading edge
-            let t = behind.clamp(0.0, 1.0);
-            let mut c = TICK_DIM.lerp(color, t);
-            let mut s = 0.0;
-            if t > 0.0 {
-                s = Self::shine(behind, 7.0) * t;
-                let tint = if white { palette::BLUE } else { Color::white(1.0) };
-                c = c.lerp(tint.with_a(c.a), s * 0.9);
-            }
-            self.beam(r.x + i as f32 * step + (step - w) * 0.5, r.y, w, r.h, c, s);
-        }
-    }
-
-    /// A row of ticks with only the stretch from `from` to `to` (0..1 of the width) lit,
-    /// like a temperature range.
+    /// A gauge with only the stretch from `from` to `to` (0..1 of the width) lit, like a temperature range.
     pub fn tick_range(&mut self, r: Rect, from: f32, to: f32, color: Color) {
-        if !beams_on() {
-            return self.line_range(r, from, to, color);
-        }
-        let (n, step, w) = tick_geom(r.w);
-        let color = themed(color);
-        let (from, to) = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0).max(from));
-        let white = white_beams();
-        for i in 0..n {
-            let pos = (i as f32 + 0.5) / n as f32;
-            let lit = pos >= from - 0.5 / n as f32 && pos <= to + 0.5 / n as f32;
-            let mut c = if lit { color } else { TICK_DIM };
-            let mut s = 0.0;
-            if lit {
-                // the middle of the lit stretch shines white and stands a little taller
-                let t = if to > from { ((pos - from) / (to - from)).clamp(0.0, 1.0) } else { 0.5 };
-                s = (1.0 - (2.0 * t - 1.0).abs()).powi(2);
-                let tint = if white { palette::BLUE } else { Color::white(1.0) };
-                c = c.lerp(tint.with_a(c.a), s * 0.9);
-            }
-            self.beam(r.x + i as f32 * step + (step - w) * 0.5, r.y, w, r.h, c, s);
-        }
+        self.line_range(r, from, to, color);
     }
 
-    /// Ticks with a bright stretch sliding along them ("working on it").
+    /// A bright stretch sliding along a rail ("working on it").
     pub fn ticks_sweep(&mut self, r: Rect, color: Color) {
-        if !beams_on() {
-            return self.line_sweep(r, color);
-        }
-        let (n, step, w) = tick_geom(r.w);
-        let color = themed(color);
-        let phase = (self.now.elapsed().as_secs_f32() + epoch_secs()) % 1.6 / 1.6;
-        let head = phase * (n as f32 + 8.0) - 4.0;
-        for i in 0..n {
-            let t = (1.0 - (head - i as f32).abs() / 4.0).clamp(0.0, 1.0);
-            let mut c = TICK_DIM.lerp(color, t);
-            let shine = t * t;
-            let tint = if white_beams() { palette::BLUE } else { Color::white(1.0) };
-            c = c.lerp(tint.with_a(c.a), shine * 0.9);
-            self.beam(r.x + i as f32 * step + (step - w) * 0.5, r.y, w, r.h, c, shine);
-        }
-        self.fx.animate = true;
+        self.line_sweep(r, color);
     }
 
     /// Mini bar graph of recent values (0..1, oldest first): one tick per
@@ -1328,21 +940,18 @@ impl<'p, 'a> Ui<'p, 'a> {
         }
         let n = values.len().max(1);
         let step = r.w / n as f32;
-        let minimal = look_minimal();
-        let w = if minimal { (step * 0.3).max(1.2) } else { (step * 0.56).max(1.4) };
+        let w = (step * 0.56).max(1.4);
         let color = themed(color);
         for (i, v) in values.iter().enumerate() {
             let v = self.glide(rect_key(r, "graph") ^ gkey("g", i), v.clamp(0.0, 1.0));
             let h = (v * r.h).max(2.0);
             let age = (i + 1) as f32 / n as f32;
             let mut c = TICK_DIM.lerp(color, 0.25 + 0.75 * age);
-            if minimal {
-                c = Color::white(0.2 + 0.7 * age);
-            } else if white_beams() {
+            if white_beams() {
                 // white style: the newest samples are blue
                 c = c.lerp(palette::BLUE.with_a(c.a), ((age - 0.55) / 0.45).clamp(0.0, 1.0));
             }
-            if !minimal && !white_beams() {
+            if !white_beams() {
                 // the newest samples shine white, like the leading edge of a gauge
                 c = c.lerp(Color::white(1.0).with_a(c.a), ((age - 0.8) / 0.2).clamp(0.0, 1.0).powi(2) * 0.8);
             }
@@ -1359,15 +968,7 @@ impl<'p, 'a> Ui<'p, 'a> {
             }
             return;
         }
-        if !beams_on() {
-            self.p.fill_rounded(r, r.h * 0.5, Color::white(alpha));
-            return;
-        }
-        let (n, step, w) = tick_geom(r.w);
-        let c = Color::white(alpha);
-        for i in 0..n {
-            self.p.fill_rounded(Rect::new(r.x + i as f32 * step + (step - w) * 0.5, r.y, w, r.h), w * 0.5, c);
-        }
+        self.p.fill_rounded(r, r.h * 0.5, Color::white(alpha));
     }
 
     /// Progress bar, drawn as ticks (the rect's height only sets how tall they are).
@@ -1377,31 +978,14 @@ impl<'p, 'a> Ui<'p, 'a> {
     }
 
     /// Indeterminate progress: a bright stretch of ticks sliding along.
-    pub fn progress_indeterminate(&mut self, r: Rect, color: Color) {
+    pub fn progress_indeterminate(&mut self, r: Rect, _color: Color) {
         if look_nothing() {
             return self.glyph_sweep(r);
-        }
-        if look_minimal() && !beams_on() {
-            return self.min_sweep(r);
         }
         if look_tuna() {
             return self.tube_sweep(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0));
         }
-        if look_bloom() {
-            return self.bloom_sweep(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0));
-        }
-        if !beams_on() {
-            // a single dot that breathes
-            let pulse = 0.5 + 0.5 * (epoch_secs() * std::f32::consts::TAU / 1.4).sin();
-            let base = themed(color);
-            self.p.fill_circle(r.cx(), r.cy(), 4.5 + 2.0 * pulse, base.with_a(base.a * 0.18));
-            self.p.fill_circle(r.cx(), r.cy(), 3.0 + 1.0 * pulse, base.with_a(base.a * (0.55 + 0.45 * pulse)));
-            self.p.fill_circle(r.cx(), r.cy(), 1.4 + 0.8 * pulse, Color::white(0.4 + 0.5 * pulse));
-            self.fx.animate = true;
-            return;
-        }
-        let h = (r.h * 2.6).clamp(8.0, 14.0);
-        self.ticks_sweep(Rect::new(r.x, r.cy() - h * 0.5, r.w, h), color);
+        self.bloom_sweep(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0));
     }
 
     /// A record: dark disc, faint grooves, two sheen arcs that turn with it
@@ -1452,16 +1036,6 @@ impl<'p, 'a> Ui<'p, 'a> {
             }
             return;
         }
-        if look_minimal() {
-            let frac = self.glide(rect_key(r, "scrub"), frac.clamp(0.0, 1.0));
-            let grow = self.glide(rect_key(r, "scrub-hover"), if hover { 1.0 } else { 0.0 });
-            self.min_bar(Rect::new(r.x, r.cy() - 3.0, r.w, 6.0), 0.0, frac, Color::white(1.0));
-            if grow > 0.02 {
-                let px = r.x + r.w * frac;
-                self.p.fill_circle(px, r.cy(), 2.0 + 2.5 * grow, Color::white(grow));
-            }
-            return;
-        }
         if look_tuna() {
             let frac = self.glide(rect_key(r, "scrub"), frac.clamp(0.0, 1.0));
             let grow = self.glide(rect_key(r, "scrub-hover"), if hover { 1.0 } else { 0.0 });
@@ -1488,13 +1062,6 @@ impl<'p, 'a> Ui<'p, 'a> {
             }
             return;
         }
-        let h = if hover { 16.0 } else { 14.0 };
-        let frac = self.glide(rect_key(r, "scrub"), frac.clamp(0.0, 1.0));
-        self.ticks_raw(Rect::new(r.x, r.cy() - h * 0.5, r.w, h), frac, Color::white(0.92), true);
-        let px = r.x + 2.0 + (r.w - 4.0) * frac.clamp(0.0, 1.0);
-        let ph = h + 8.0;
-        self.p.fill_rounded(Rect::new(px - 2.2, r.cy() - ph * 0.5 + 1.0, 4.4, ph), 2.2, Color::black(0.35));
-        self.p.fill_rounded(Rect::new(px - 1.8, r.cy() - ph * 0.5, 3.6, ph), 1.8, Color::white(0.97));
     }
 
     /// Rounded card background, highlighted on hover when `interactive`.
@@ -1605,25 +1172,4 @@ pub fn epoch_secs() -> f32 {
 fn smooth01(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
-}
-
-/// Fixed-size point list for the glow shapes, so drawing them never touches the heap.
-struct PolyBuf {
-    p: [(f32, f32); 48],
-    n: usize,
-}
-
-impl PolyBuf {
-    fn new() -> Self {
-        Self { p: [(0.0, 0.0); 48], n: 0 }
-    }
-    fn push(&mut self, pt: (f32, f32)) {
-        if self.n < self.p.len() {
-            self.p[self.n] = pt;
-            self.n += 1;
-        }
-    }
-    fn get(&self) -> &[(f32, f32)] {
-        &self.p[..self.n]
-    }
 }
