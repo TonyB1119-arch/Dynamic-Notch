@@ -30,12 +30,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
-    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_BLURREGION, DWM_BB_ENABLE,
-    DWM_BLURBEHIND,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_HOSTBACKDROPBRUSH,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, HRGN,
+    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -955,10 +954,17 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // live: Windows' own blur behind the card, switched on by the first frame (nothing is copied,
-            // so a playing video or anything else behind it keeps moving and the window stays in
-            // screenshots); with `live = false` the blur is one picture taken now
+            // live: Windows' own acrylic blur behind the card (nothing is copied, so a playing video or
+            // anything else behind it keeps moving and the window stays in screenshots); with
+            // `live = false` the blur is one picture taken now
             self.live = self.cfg.glass && self.cfg.live;
+            if self.live {
+                // until the first frame has shaped the blur to the card, nothing of the window is shown
+                native_blur(self.hwnd, Some(self.cfg.light));
+                unsafe {
+                    SetWindowRgn(self.hwnd, Some(CreateRectRgn(0, 0, 0, 0)), false);
+                }
+            }
             self.live_key = [i32::MIN; 10];
             self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
@@ -1241,7 +1247,7 @@ impl Launcher {
         }
     }
 
-    /// With Windows' own blur the blurred area is the glass: the card (and the list under it) as rounded
+    /// With Windows' own blur the window's shape is the glass: the card (and the list under it) as rounded
     /// outlines, so the blur never shows outside them. Remade only when an outline moves a pixel.
     fn live_region(&mut self, card: Rect, card_r: f32, list: Option<(Rect, f32)>) {
         let px = |v: f32| v.round() as i32;
@@ -1273,10 +1279,8 @@ impl Launcher {
                 let _ = DeleteObject(second.into());
             }
         }
-        native_blur(self.hwnd, Some(rgn));
-        // Windows keeps its own copy of the shape
         unsafe {
-            let _ = DeleteObject(rgn.into());
+            SetWindowRgn(self.hwnd, Some(rgn), false);
         }
     }
 
@@ -2784,12 +2788,14 @@ impl Launcher {
         let open_s = self.open_scale();
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
+        if !self.live {
+            self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
+        }
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
-        // Windows blurs what is behind the glass: its blur region follows the card and the list
+        // Windows blurs what is behind the window, shaped by the window's region: that follows the glass
         if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
             let s0 = self.open_scale();
@@ -4129,16 +4135,47 @@ fn draw_list(p: &mut Painter, v: &ListView) {
 
 // -- window and background work --------------------------------------------------------------------------
 
-/// Windows' own blur behind the part of the window inside `area` (window pixels), or off with `None`.
-/// Nothing outside the area is blurred, so the corners and the gaps stay clear.
-fn native_blur(hwnd: HWND, area: Option<HRGN>) -> bool {
-    let bb = DWM_BLURBEHIND {
-        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-        fEnable: BOOL(area.is_some() as i32),
-        hRgnBlur: area.unwrap_or_default(),
-        fTransitionOnMaximized: BOOL(0),
+#[repr(C)]
+struct AccentPolicy {
+    state: u32,
+    flags: u32,
+    /// Tint as 0xAABBGGRR.
+    color: u32,
+    animation: u32,
+}
+
+#[repr(C)]
+struct CompositionAttrib {
+    attrib: u32,
+    data: *mut core::ffi::c_void,
+    size: usize,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    /// Not in the public headers, but the call every blur-behind effect on Windows 10 and 11 goes through.
+    fn SetWindowCompositionAttribute(hwnd: HWND, data: *mut CompositionAttrib) -> BOOL;
+}
+
+/// Windows' own acrylic blur behind the whole window (its region shapes it): on with a light or a dark
+/// tint (`Some(light)`), or off with `None`.
+fn native_blur(hwnd: HWND, tint: Option<bool>) {
+    // 4 = acrylic blur behind, 0 = off
+    let mut policy = AccentPolicy {
+        state: if tint.is_some() { 4 } else { 0 },
+        flags: 0,
+        color: if tint == Some(true) { 0x60FA_F5F2 } else { 0x4008_0505 },
+        animation: 0,
     };
-    unsafe { DwmEnableBlurBehindWindow(hwnd, &bb).is_ok() }
+    // 19 = WCA_ACCENT_POLICY
+    let mut data = CompositionAttrib {
+        attrib: 19,
+        data: &mut policy as *mut AccentPolicy as *mut core::ffi::c_void,
+        size: size_of::<AccentPolicy>(),
+    };
+    unsafe {
+        let _ = SetWindowCompositionAttribute(hwnd, &mut data);
+    }
 }
 
 fn create_window() -> windows::core::Result<HWND> {
