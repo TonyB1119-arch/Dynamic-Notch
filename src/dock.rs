@@ -474,7 +474,7 @@ impl Dock {
         self.host.set_backdrop_rounded(
             Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, (bar.h + if self.cfg.melt { radius } else { 0.0 }) * sc),
             radius * sc,
-            if self.hide_t > 0.98 || !self.cfg.glass { 0.0 } else { 1.0 },
+            if self.hide_t > 0.98 || !self.cfg.glass { 0.0 } else { self.cfg.blur },
         );
         let hover =
             if self.engage_to > 0.5 && self.hide_t < 0.3 && self.drag.is_none() { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };

@@ -598,6 +598,8 @@ pub struct DockCfg {
     pub melt: bool,
     /// The liquid glass edge, the same glass as the notch (see Settings → Glass).
     pub glass: bool,
+    /// How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur).
+    pub blur: f32,
 }
 
 impl Default for DockCfg {
@@ -617,6 +619,7 @@ impl Default for DockCfg {
             rim_bright: 0.35,
             melt: false,
             glass: true,
+            blur: 0.25,
         }
     }
 }
@@ -627,6 +630,7 @@ impl DockCfg {
         self.magnify = self.magnify.clamp(1.0, 2.2);
         self.bottom_margin = self.bottom_margin.clamp(0.0, 80.0);
         self.opacity = self.opacity.clamp(0.1, 1.0);
+        self.blur = self.blur.clamp(0.0, 1.0);
         self.hide_apps.truncate(60);
         self.rim_width = self.rim_width.clamp(0.0, 4.0);
         self.rim_bright = self.rim_bright.clamp(0.0, 1.0);
@@ -1325,8 +1329,10 @@ bottom_margin = 6.0
 auto_hide = false
 # Hide the Windows taskbar while the dock is running (it comes back when the app closes)
 hide_taskbar = false
-# 0.1 = nearly clear, 1.0 = solid
+# How dark the glass is: a black wash (0.1 = none, 1.0 = nearly black)
 opacity = 0.30
+# How frosted the glass is: Windows' blur behind the dock (0 = clear glass, 1 = full blur)
+blur = 0.25
 # Programs that never appear in the dock
 hide_apps = ['raycast.exe']
 # The white rim around the dock: thickness (pixels, 0 = none) and brightness (0 - 1)

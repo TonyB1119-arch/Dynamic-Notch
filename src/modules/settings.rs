@@ -293,7 +293,7 @@ fn tab_rows(tab: usize) -> f32 {
         5 => 4.0,
         6 => 5.6,
         7 => 5.9,
-        8 => 22.0,
+        8 => 23.0,
         9 => 34.0,
         10 => 14.0,
         11 => 22.0,
@@ -1108,6 +1108,16 @@ impl Settings {
         toggle_row(ui, row_rect(body, 18), "Launcher: live blur (hides it from screenshots)", l.live, "launcher", "live");
         toggle_row(ui, row_rect(body, 20), "Launcher: one box (off = two boxes)", l.single_box, "launcher", "single_box");
         toggle_row(ui, row_rect(body, 21), "Launcher: the single box is a square", l.square_box, "launcher", "square_box");
+        slider_row(
+            ui,
+            row_rect(body, 22),
+            "Dock blur (0 = clear glass)",
+            d.blur,
+            (0.0, 1.0),
+            format!("{:.0}%", d.blur * 100.0),
+            "dock",
+            "blur",
+        );
         slider_row(
             ui,
             row_rect(body, 19),
