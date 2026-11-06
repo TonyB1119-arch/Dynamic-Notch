@@ -1096,6 +1096,24 @@ impl Launcher {
         }
     }
 
+    /// The left box when it is alone: the whole card, or a square in the middle of it.
+    fn solo_rect(&self) -> Rect {
+        if self.cfg.square_box && self.mode != Mode::Run {
+            Rect::new(PAD + (BOX + GAP) * 0.5, PAD, BOX, BOX)
+        } else {
+            Rect::new(PAD, PAD, W - 2.0 * PAD, BOX)
+        }
+    }
+
+    /// How far the glass closes in on each side while the lone box is a square (it opens up again with the second box).
+    fn card_inset(&self) -> f32 {
+        if self.cfg.square_box && self.mode != Mode::Run {
+            (BOX + GAP) * 0.5 * self.rw.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     /// What the processor and memory gauges are heading for (0 to 1).
     fn gauge_goal(&self) -> (f32, f32) {
         match &self.snap {
@@ -2466,7 +2484,7 @@ impl Launcher {
                     return Some(LRESULT(0));
                 }
                 let (sub, act) = if self.rw_target() > 0.5 {
-                    (Rect::new(PAD, PAD, W - 2.0 * PAD, BOX), Rect::new(0.0, 0.0, 0.0, 0.0))
+                    (self.solo_rect(), Rect::new(0.0, 0.0, 0.0, 0.0))
                 } else {
                     (Rect::new(PAD, PAD, BOX, BOX), Rect::new(PAD + BOX + GAP, PAD, BOX, BOX))
                 };
@@ -2769,6 +2787,8 @@ impl Launcher {
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
+        let cins = self.card_inset();
+        let solo = self.solo_rect();
         // the system's backdrop is never used by the launcher: the blur is drawn from the screen copy
         if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
@@ -2783,7 +2803,8 @@ impl Launcher {
                 )
             };
             let grown = E * self.kw.clamp(0.0, 1.0);
-            self.host.set_backdrop_rounded(map(Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H)), CARD_R * s0 * sc, e);
+            let live_card = Rect::new(-grown + cins, 0.0, W + 2.0 * grown - 2.0 * cins, FRAME_H);
+            self.host.set_backdrop_rounded(map(live_card), CARD_R * s0 * sc, e);
             let lh = self.lh.max(0.0);
             if lh > 8.0 {
                 let r = LIST_R.min(lh * 0.5) * s0 * sc;
@@ -2832,7 +2853,7 @@ impl Launcher {
             card_xf(&mut p, &tr);
             // with three boxes the card is wider than the two-box card, by the same amount on each side
             let grown = E * self.kw.clamp(0.0, 1.0);
-            let card = Rect::new(-grown, 0.0, W + 2.0 * grown, FRAME_H);
+            let card = Rect::new(-grown + cins, 0.0, W + 2.0 * grown - 2.0 * cins, FRAME_H);
             // the list is a second piece of glass that floats below the boxes
             let panel = Rect::new(0.0, LIST_Y, W, self.lh.max(0.0));
             let dark = self.cfg.dark;
@@ -2856,7 +2877,6 @@ impl Launcher {
             let act = Rect::new(PAD + BOX + GAP - grown, PAD, BOX, BOX);
             // the Run box: the left box stretches over the whole card while the right one fades away
             let rw = self.rw.clamp(0.0, 1.0);
-            let solo = Rect::new(PAD, PAD, W - 2.0 * PAD, BOX);
             let sub_box = Rect::new(sub.x + (solo.x - sub.x) * rw, sub.y, sub.w + (solo.w - sub.w) * rw, BOX);
             // the third box (Kill mode) comes in on the right as the card grows
             let third = Rect::new(PAD + 2.0 * (BOX + GAP) - grown, PAD, BOX, BOX);
@@ -3040,10 +3060,12 @@ impl Launcher {
                             cur.as_ref().filter(|h| !matches!(h.kind, Kind::Clip | Kind::Weather | Kind::Day))
                         {
                             let acts = actions(h);
+                            let (g1, g2) =
+                                if sub_box.w < 250.0 { (" ", "  \u{b7}  ") } else { ("  ", "    \u{b7}    ") };
                             let line = if acts.len() > 1 {
-                                format!("Enter  {}    \u{b7}    Ctrl+K  more", acts[0].label())
+                                format!("Enter{g1}{}{g2}Ctrl+K{g1}more", acts[0].label())
                             } else {
-                                format!("Enter  {}", acts[0].label())
+                                format!("Enter{g1}{}", acts[0].label())
                             };
                             let a_in = p.alpha;
                             p.alpha = a_in * ((rw - 0.5) * 2.0);

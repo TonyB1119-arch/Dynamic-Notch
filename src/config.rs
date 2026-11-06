@@ -516,6 +516,8 @@ pub struct LauncherCfg {
     pub live: bool,
     /// One wide box until the box with the things to do with a match is asked for (off = always two boxes).
     pub single_box: bool,
+    /// The single box is a square in the middle of a narrower card (off = one wide box).
+    pub square_box: bool,
     /// Handed over by the app, not stored here: the Gemini settings, whether media is playing, and
     /// the dock's rim (the launcher's rim follows it).
     #[serde(skip)]
@@ -542,6 +544,7 @@ impl Default for LauncherCfg {
             glass: true,
             live: true,
             single_box: true,
+            square_box: false,
             search_url: "https://www.google.com/search?q=".to_string(),
             gemini: GeminiCfg::default(),
             media_playing: false,
@@ -1361,6 +1364,8 @@ live = true
 # One wide box until the box with the things to do with a match is asked for (Right arrow, Ctrl+K);
 # false = always two boxes
 single_box = true
+# The single box is a square (false = one wide box); it still splits into two boxes when asked for
+square_box = false
 # How big the launcher is (0.5 = half, 1.0 = the original size)
 size = 0.8
 # Where a web search goes; what you typed is added at the end
