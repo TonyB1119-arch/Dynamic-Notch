@@ -30,15 +30,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
-    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
+    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
+    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_BLURREGION, DWM_BB_ENABLE,
+    DWM_BLURBEHIND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn,
+    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, HRGN,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -955,10 +955,10 @@ impl Launcher {
             if let Some(old) = self.blur_img.take() {
                 self.res.forget(old.id);
             }
-            // live: Windows' own acrylic blur behind the card (nothing is copied, so a playing video or
-            // anything else behind it keeps moving and the window stays in screenshots). Where Windows
-            // cannot do that (before Windows 11 22H2) or with `live = false`, it is one picture taken now
-            self.live = self.cfg.glass && self.cfg.live && native_blur(self.hwnd, true);
+            // live: Windows' own blur behind the card, switched on by the first frame (nothing is copied,
+            // so a playing video or anything else behind it keeps moving and the window stays in
+            // screenshots); with `live = false` the blur is one picture taken now
+            self.live = self.cfg.glass && self.cfg.live;
             self.live_key = [i32::MIN; 10];
             self.blur_img = if self.cfg.glass && !self.live { capture_blur(x, y, w, h, self.cfg.blur) } else { None };
             self.anim = 0.0;
@@ -1025,7 +1025,7 @@ impl Launcher {
             self.live = false;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), T_LIVE);
-                native_blur(self.hwnd, false);
+                native_blur(self.hwnd, None);
             }
             // the next time, the plain region is made again
             self.region_h = -1;
@@ -1241,7 +1241,7 @@ impl Launcher {
         }
     }
 
-    /// With Windows' own blur the window's shape is the glass: the card (and the list under it) as rounded
+    /// With Windows' own blur the blurred area is the glass: the card (and the list under it) as rounded
     /// outlines, so the blur never shows outside them. Remade only when an outline moves a pixel.
     fn live_region(&mut self, card: Rect, card_r: f32, list: Option<(Rect, f32)>) {
         let px = |v: f32| v.round() as i32;
@@ -1273,8 +1273,10 @@ impl Launcher {
                 let _ = DeleteObject(second.into());
             }
         }
+        native_blur(self.hwnd, Some(rgn));
+        // Windows keeps its own copy of the shape
         unsafe {
-            SetWindowRgn(self.hwnd, Some(rgn), false);
+            let _ = DeleteObject(rgn.into());
         }
     }
 
@@ -2782,14 +2784,12 @@ impl Launcher {
         let open_s = self.open_scale();
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        if !self.live {
-            self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
-        }
+        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
         let mut ai_max = self.ai.max_scroll;
-        // Windows blurs what is behind the window, shaped by the window's region: that follows the glass
+        // Windows blurs what is behind the glass: its blur region follows the card and the list
         if self.live {
             // the glass grows from 95% around its middle while it opens; the blur follows it
             let s0 = self.open_scale();
@@ -4129,18 +4129,16 @@ fn draw_list(p: &mut Painter, v: &ListView) {
 
 // -- window and background work --------------------------------------------------------------------------
 
-/// Turns Windows' own acrylic blur behind the whole window on or off (the window's region shapes it).
-/// False where Windows cannot do it (before Windows 11 22H2).
-fn native_blur(hwnd: HWND, on: bool) -> bool {
-    unsafe {
-        if on {
-            let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
-        }
-        // DWMWA_SYSTEMBACKDROP_TYPE: 3 = acrylic for short-lived windows, 1 = none
-        let kind: i32 = if on { 3 } else { 1 };
-        DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(38), &kind as *const _ as _, 4).is_ok()
-    }
+/// Windows' own blur behind the part of the window inside `area` (window pixels), or off with `None`.
+/// Nothing outside the area is blurred, so the corners and the gaps stay clear.
+fn native_blur(hwnd: HWND, area: Option<HRGN>) -> bool {
+    let bb = DWM_BLURBEHIND {
+        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+        fEnable: BOOL(area.is_some() as i32),
+        hRgnBlur: area.unwrap_or_default(),
+        fTransitionOnMaximized: BOOL(0),
+    };
+    unsafe { DwmEnableBlurBehindWindow(hwnd, &bb).is_ok() }
 }
 
 fn create_window() -> windows::core::Result<HWND> {
