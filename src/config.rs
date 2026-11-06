@@ -868,6 +868,9 @@ pub struct GlassCfg {
     /// Stretch the glass edge like iOS Liquid Glass: the picture under the glass is pulled out toward
     /// the edge (it can fold over right at the rim) instead of the picture outside being pulled in.
     pub stretch: bool,
+    /// Bend the picture the way real glass does (Snell's law on a rounded edge: strongest right at the
+    /// rim, then easing away). Off: the older smooth curve. The bend curve setting sets the glass's thickness.
+    pub snell: bool,
     /// A thin bright line along the very edge of the glass, like the light catching it (0 - 1).
     pub edge_light: f32,
     /// A light frost over the glass (0 - 1).
@@ -902,6 +905,7 @@ impl Default for GlassCfg {
             sharpen_at: 0.12,
             sharp_zone: 4.0,
             stretch: false,
+            snell: true,
             edge_light: 0.35,
             tint: 0.0,
             fan: 0.7,

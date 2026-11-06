@@ -294,6 +294,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 20.0,
+        9 => 26.0,
         10 => 14.0,
         11 => 22.0,
         _ => 25.0,
@@ -1156,6 +1157,7 @@ impl Settings {
         }
         let d = crate::config::GlassCfg::default();
         toggle_row(ui, row_rect(body, 23), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
+        toggle_row(ui, row_rect(body, 25), "Real glass bend (Snell's law)", g.snell, "glass", "snell");
         let b = row_rect(body, 24);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {

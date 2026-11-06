@@ -125,6 +125,8 @@ pub struct Tune {
     pub fan: f32,
     pub len: f32,
     pub readable: f32,
+    /// How far the picture is bent at each step in from the edge (see `snell_lut`); None = the old curve.
+    pub lut: Option<[f32; 65]>,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -148,6 +150,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             fan: g.fan.clamp(0.0, 1.2),
             len: g.stretch_len.clamp(0.5, 1.6),
             readable: g.readable.clamp(0.0, 1.0),
+            lut: g.snell.then(|| snell_lut(g.bend.clamp(0.8, 3.0))),
         }
     }
 }
@@ -259,6 +262,41 @@ fn crop_for(sh: Shape, w: i32, h: i32) -> (i32, i32, i32, i32) {
     let y0 = ((top - m).floor() as i32).clamp(0, h);
     let y1 = ((sh.bottom + m).ceil() as i32).clamp(0, h);
     (x0, y0, x1, y1)
+}
+
+/// How far a ray is shifted by a glass edge, for 65 steps from the inner end of the rim (0) to the very
+/// edge (1), as a share of the shift at the edge. The edge is a rounded bevel (height `thickness` times its
+/// width); a ray coming straight down meets the surface at the angle of its slope, bends toward the normal
+/// as it enters glass (Snell's law, index 1.5) and so lands `tan(angle - bent angle)` sideways for every
+/// unit of glass it crosses. Worked out once per setting, so drawing only reads the table.
+fn snell_lut(thickness: f32) -> [f32; 65] {
+    const N: f32 = 1.5;
+    const P: f32 = 3.0; // how square the bevel is: 2 is a quarter circle, higher is flatter on top
+    let edge = (std::f32::consts::FRAC_PI_2 - (1.0 / N).asin()).tan();
+    let mut out = [0.0_f32; 65];
+    for (i, o) in out.iter_mut().enumerate().take(64) {
+        let u = i as f32 / 64.0;
+        let slope = u.powf(P - 1.0) / (1.0 - u.powf(P)).powf((P - 1.0) / P);
+        let a = (thickness * slope).atan();
+        let b = (a.sin() / N).asin();
+        *o = ((a - b).tan() / edge).clamp(0.0, 1.0);
+    }
+    out[64] = 1.0;
+    out
+}
+
+/// The bend at `u` (1 at the edge of the glass, 0 at the inner end of the rim).
+#[inline]
+fn curve(t: &Tune, u: f32) -> f32 {
+    match &t.lut {
+        Some(l) => {
+            let x = u.clamp(0.0, 1.0) * 64.0;
+            let i = (x as usize).min(63);
+            l[i] + (l[i + 1] - l[i]) * (x - i as f32)
+        }
+        None if (t.bend - 1.5).abs() < 0.001 => u * u.sqrt(),
+        None => u.powf(t.bend),
+    }
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {
@@ -419,7 +457,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
             let fade = u * u * (1.5 - 0.5 * u);
             let base = (t.strength + 0.1 * corner).min(1.0);
             alpha = (base + (1.0 - base) * smooth(soft, 0.0, d)) * fade * (d + 1.0).clamp(0.0, 1.0) * up;
-            let k = if even_bend { u * u.sqrt() } else { u.powf(t.bend) };
+            let k = curve(&t, u);
             // stretch mode: the straight edges stretch nearly as much as the corners do
             // (corner = 0 along them, so they used to get no boost at all)
             let cw = if t.dir < 0.0 { corner.max(0.85) } else { corner };
@@ -471,7 +509,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
                 if t.mid_warp > 0.0 {
                     let wi = smooth(width, width * 1.8, d);
                     let u2 = (1.0 - dm / w2).clamp(0.0, 1.0);
-                    let k2 = if even_bend { u2 * u2.sqrt() } else { u2.powf(t.bend) };
+                    let k2 = curve(&t, u2);
                     let m = pull * t.mid_warp * k2 * wi;
                     ox += dirx * m;
                     oy += diry * m;
