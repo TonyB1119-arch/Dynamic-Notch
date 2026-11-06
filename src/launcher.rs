@@ -30,12 +30,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_USE_HOSTBACKDROPBRUSH,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_EXCLUDED_FROM_PEEK,
+    DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_BLURREGION, DWM_BB_ENABLE,
+    DWM_BLURBEHIND,
 };
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, GetStockObject, MonitorFromPoint,
-    SetWindowRgn, BLACK_BRUSH, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
+    SetWindowRgn, BLACK_BRUSH, HBRUSH, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -1301,16 +1302,20 @@ impl Launcher {
                     px(rad * 2.0),
                 )
             };
-            let rgn = round(card, card_r);
-            if list.is_some() {
-                let second = round(lr, lrad);
-                CombineRgn(Some(rgn), Some(rgn), Some(second), RGN_OR);
-                let _ = DeleteObject(second.into());
-            }
-            SetWindowRgn(blur, Some(rgn), false);
-            if !self.blur_shown {
-                native_blur(blur, self.cfg.light);
-            }
+            let shape = || {
+                let rgn = round(card, card_r);
+                if list.is_some() {
+                    let second = round(lr, lrad);
+                    CombineRgn(Some(rgn), Some(rgn), Some(second), RGN_OR);
+                    let _ = DeleteObject(second.into());
+                }
+                rgn
+            };
+            // the window is cut to the glass, and Windows blurs only inside that same shape
+            SetWindowRgn(blur, Some(shape()), false);
+            let area = shape();
+            blur_behind(blur, area);
+            let _ = DeleteObject(area.into());
             // just below the launcher itself
             let _ = SetWindowPos(
                 blur,
@@ -4212,41 +4217,17 @@ fn create_blur_window() -> Option<HWND> {
     }
 }
 
-#[repr(C)]
-struct AccentPolicy {
-    state: u32,
-    flags: u32,
-    /// Tint as 0xAABBGGRR.
-    color: u32,
-    animation: u32,
-}
-
-#[repr(C)]
-struct CompositionAttrib {
-    attrib: u32,
-    data: *mut core::ffi::c_void,
-    size: usize,
-}
-
-#[link(name = "user32")]
-extern "system" {
-    /// Not in the public headers, but the call every blur-behind effect on Windows 10 and 11 goes through.
-    fn SetWindowCompositionAttribute(hwnd: HWND, data: *mut CompositionAttrib) -> BOOL;
-}
-
-/// Windows' own acrylic blur behind a whole window (its region shapes it), tinted light or dark.
-fn native_blur(hwnd: HWND, light: bool) {
-    // state 4 = acrylic blur behind
-    let mut policy =
-        AccentPolicy { state: 4, flags: 0, color: if light { 0x60FA_F5F2 } else { 0x4008_0505 }, animation: 0 };
-    // 19 = WCA_ACCENT_POLICY
-    let mut data = CompositionAttrib {
-        attrib: 19,
-        data: &mut policy as *mut AccentPolicy as *mut core::ffi::c_void,
-        size: size_of::<AccentPolicy>(),
+/// Windows' own blur behind the part of a window inside `area` (the glass shape), so the corners and the
+/// gap between the card and the list stay clear.
+fn blur_behind(hwnd: HWND, area: HRGN) {
+    let bb = DWM_BLURBEHIND {
+        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+        fEnable: BOOL(1),
+        hRgnBlur: area,
+        fTransitionOnMaximized: BOOL(0),
     };
     unsafe {
-        let _ = SetWindowCompositionAttribute(hwnd, &mut data);
+        let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
     }
 }
 
