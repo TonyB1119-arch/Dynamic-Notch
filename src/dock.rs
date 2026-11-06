@@ -565,15 +565,6 @@ impl Dock {
                         pic.rect.h * sy,
                     );
                     p.draw_rim_to(pic, dst, 1.0);
-                } else {
-                    if let Some(g) = p.path(|g| g.rounded_rect(bar, radius, true)) {
-                        let k = 1.0 - wash * 0.6;
-                        let stops =
-                            [(0.0, Color::white(0.16 * k)), (0.45, Color::white(0.04 * k)), (1.0, Color::white(0.0))];
-                        p.fill_geometry_vgrad(&g, bar.y, bar.bottom(), &stops);
-                    }
-                    let inner = self.cfg.rim_width + 1.5;
-                    p.stroke_rounded(bar.inset(inner), (radius - inner).max(0.0), 1.0, Color::white(0.09));
                 }
             }
             // the white rim: thickness and brightness come from the settings
