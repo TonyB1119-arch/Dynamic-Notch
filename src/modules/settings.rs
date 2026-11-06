@@ -286,7 +286,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 18.0,
+        1 => 21.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -850,6 +850,27 @@ impl Settings {
             "lite_motion",
         );
         toggle_row(ui, row_rect(body, 17), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
+
+        // the top of the screen: the notch, or a menu bar like the Mac's
+        let row = row_rect(body, 18);
+        label(ui, row, "Top of the screen");
+        let sel = usize::from(self.cfg.bar.mode == "bar");
+        let seg = Rect::new(row.right() - 232.0, row.y + 3.0, 224.0, row.h - 6.0);
+        if let Some(i) = segmented(ui, seg, &["Notch", "Menu bar"], Some(sel), accent) {
+            put(ui, "bar", "mode", toml_str(["notch", "bar"][i]));
+        }
+        let b = &self.cfg.bar;
+        toggle_row(ui, row_rect(body, 19), "Menu bar: glass strip", b.background, "bar", "background");
+        slider_row(
+            ui,
+            row_rect(body, 20),
+            "Menu bar height",
+            b.height,
+            (22.0, 44.0),
+            format!("{:.0}", b.height),
+            "bar",
+            "height",
+        );
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {

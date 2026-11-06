@@ -5,6 +5,7 @@
 mod alcove;
 mod anim;
 mod app;
+mod bar;
 mod bloom;
 mod bus;
 mod claude;
