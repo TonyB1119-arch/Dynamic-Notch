@@ -127,6 +127,12 @@ pub struct Tune {
     pub readable: f32,
     /// How far the picture is bent at each step in from the edge (see `snell_lut`); None = the old curve.
     pub lut: Option<[f32; 65]>,
+    /// The rim light: the direction it comes from (a unit vector, y down), how much the highlight
+    /// follows it, and the width of the line.
+    pub lx: f32,
+    pub ly: f32,
+    pub ldir: f32,
+    pub lw: f32,
 }
 
 impl From<&crate::config::GlassCfg> for Tune {
@@ -153,6 +159,10 @@ impl From<&crate::config::GlassCfg> for Tune {
             lut: g.snell.then(|| {
                 snell_lut(g.snell_ior.clamp(1.05, 2.4), g.snell_thick.clamp(0.3, 4.0), g.snell_round.clamp(2.0, 6.0))
             }),
+            lx: g.light_angle.to_radians().cos(),
+            ly: g.light_angle.to_radians().sin(),
+            ldir: g.light_dir.clamp(0.0, 1.0),
+            lw: g.light_width.clamp(0.8, 6.0),
         }
     }
 }
@@ -526,18 +536,22 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     };
     // The light along the edge: a thin bright line right at the outer boundary, stronger in the
     // corners, fading out up the sides with the glass. `lift` lays that white over a finished pixel.
-    let hw = 1.8 * sc;
+    let hw = t.lw * sc;
     let light = |x: f32, y: f32| -> f32 {
         if t.edge_light <= 0.0 {
             return 0.0;
         }
-        let (d, _, _, corner) = geom(x, y);
+        let (d, nx, ny, corner) = geom(x, y);
         if d >= hw || d <= -1.0 {
             return 0.0;
         }
         let f = 1.0 - d.max(0.0) / hw;
         let up = smooth(0.0, 0.5, (y - top) / reach);
-        (t.edge_light * f * f.sqrt() * (1.0 + 0.6 * corner) * up).clamp(0.0, 1.0)
+        // like Apple's glass: bright where the edge faces the light, a softer glint on the far side
+        let face = nx * t.lx + ny * t.ly;
+        let lit = (0.2 + face.max(0.0) + 0.6 * (-face).max(0.0)).min(1.0);
+        let k = 1.0 - t.ldir + t.ldir * lit;
+        (t.edge_light * k * f * f.sqrt() * (1.0 + 0.6 * corner) * up).clamp(0.0, 1.0)
     };
     let lift = |p: u32, h: f32| -> u32 {
         let (m, w) = (1.0 - h, 255.0 * h);

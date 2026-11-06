@@ -294,7 +294,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 20.0,
-        9 => 29.0,
+        9 => 32.0,
         10 => 14.0,
         11 => 22.0,
         _ => 25.0,
@@ -1166,6 +1166,14 @@ impl Settings {
         for (i, (text, val, range, shown, key)) in snell_rows.into_iter().enumerate() {
             slider_row(ui, row_rect(body, 26 + i), text, val, range, shown, "glass", key);
         }
+        let light_rows: [(&str, f32, (f32, f32), String, &str); 3] = [
+            ("Rim light direction", g.light_angle, (0.0, 360.0), format!("{:.0}°", g.light_angle), "light_angle"),
+            ("Follows the light", g.light_dir, (0.0, 1.0), format!("{:.0}%", g.light_dir * 100.0), "light_dir"),
+            ("Rim light width", g.light_width, (0.8, 6.0), format!("{:.1}", g.light_width), "light_width"),
+        ];
+        for (i, (text, val, range, shown, key)) in light_rows.into_iter().enumerate() {
+            slider_row(ui, row_rect(body, 29 + i), text, val, range, shown, "glass", key);
+        }
         let b = row_rect(body, 24);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
@@ -1196,6 +1204,9 @@ impl Settings {
                 ("snell_ior", d.snell_ior),
                 ("snell_thick", d.snell_thick),
                 ("snell_round", d.snell_round),
+                ("light_angle", d.light_angle),
+                ("light_dir", d.light_dir),
+                ("light_width", d.light_width),
             ] {
                 put(ui, "glass", key, format!("{v:.2}"));
             }

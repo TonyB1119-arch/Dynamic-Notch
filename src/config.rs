@@ -877,6 +877,13 @@ pub struct GlassCfg {
     pub snell_thick: f32,
     /// Snell's law: how square the edge's profile is (2 = quarter circle, higher = flatter on top, sharper at the rim).
     pub snell_round: f32,
+    /// Where the rim light comes from, in degrees (0 = right, 90 = below, 180 = left, 225 = upper left).
+    pub light_angle: f32,
+    /// How much the edge highlight follows that light (0 = the same all the way round, 1 = only the lit
+    /// side and a softer glint on the far side, like Apple's glass).
+    pub light_dir: f32,
+    /// How wide the bright line along the edge is, in logical pixels.
+    pub light_width: f32,
     /// A thin bright line along the very edge of the glass, like the light catching it (0 - 1).
     pub edge_light: f32,
     /// A light frost over the glass (0 - 1).
@@ -915,6 +922,9 @@ impl Default for GlassCfg {
             snell_ior: 1.5,
             snell_thick: 1.5,
             snell_round: 3.0,
+            light_angle: 225.0,
+            light_dir: 0.7,
+            light_width: 1.8,
             edge_light: 0.35,
             tint: 0.0,
             fan: 0.7,
