@@ -871,6 +871,12 @@ pub struct GlassCfg {
     /// Bend the picture the way real glass does (Snell's law on a rounded edge: strongest right at the
     /// rim, then easing away). Off: the older smooth curve. The bend curve setting sets the glass's thickness.
     pub snell: bool,
+    /// Snell's law: the glass's index of refraction (1 = air, 1.5 = glass, 2.4 = diamond).
+    pub snell_ior: f32,
+    /// Snell's law: how thick the rounded edge is, as a multiple of its width (thicker bends more, further in).
+    pub snell_thick: f32,
+    /// Snell's law: how square the edge's profile is (2 = quarter circle, higher = flatter on top, sharper at the rim).
+    pub snell_round: f32,
     /// A thin bright line along the very edge of the glass, like the light catching it (0 - 1).
     pub edge_light: f32,
     /// A light frost over the glass (0 - 1).
@@ -906,6 +912,9 @@ impl Default for GlassCfg {
             sharp_zone: 4.0,
             stretch: false,
             snell: true,
+            snell_ior: 1.5,
+            snell_thick: 1.5,
+            snell_round: 3.0,
             edge_light: 0.35,
             tint: 0.0,
             fan: 0.7,

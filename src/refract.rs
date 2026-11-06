@@ -150,7 +150,9 @@ impl From<&crate::config::GlassCfg> for Tune {
             fan: g.fan.clamp(0.0, 1.2),
             len: g.stretch_len.clamp(0.5, 1.6),
             readable: g.readable.clamp(0.0, 1.0),
-            lut: g.snell.then(|| snell_lut(g.bend.clamp(0.8, 3.0))),
+            lut: g.snell.then(|| {
+                snell_lut(g.snell_ior.clamp(1.05, 2.4), g.snell_thick.clamp(0.3, 4.0), g.snell_round.clamp(2.0, 6.0))
+            }),
         }
     }
 }
@@ -267,18 +269,17 @@ fn crop_for(sh: Shape, w: i32, h: i32) -> (i32, i32, i32, i32) {
 /// How far a ray is shifted by a glass edge, for 65 steps from the inner end of the rim (0) to the very
 /// edge (1), as a share of the shift at the edge. The edge is a rounded bevel (height `thickness` times its
 /// width); a ray coming straight down meets the surface at the angle of its slope, bends toward the normal
-/// as it enters glass (Snell's law, index 1.5) and so lands `tan(angle - bent angle)` sideways for every
+/// as it enters glass (Snell's law, index `n`) and so lands `tan(angle - bent angle)` sideways for every
 /// unit of glass it crosses. Worked out once per setting, so drawing only reads the table.
-fn snell_lut(thickness: f32) -> [f32; 65] {
-    const N: f32 = 1.5;
-    const P: f32 = 3.0; // how square the bevel is: 2 is a quarter circle, higher is flatter on top
-    let edge = (std::f32::consts::FRAC_PI_2 - (1.0 / N).asin()).tan();
+fn snell_lut(n: f32, thickness: f32, p: f32) -> [f32; 65] {
+    // `p` is how square the bevel is: 2 is a quarter circle, higher is flatter on top
+    let edge = (std::f32::consts::FRAC_PI_2 - (1.0 / n).asin()).tan();
     let mut out = [0.0_f32; 65];
     for (i, o) in out.iter_mut().enumerate().take(64) {
         let u = i as f32 / 64.0;
-        let slope = u.powf(P - 1.0) / (1.0 - u.powf(P)).powf((P - 1.0) / P);
+        let slope = u.powf(p - 1.0) / (1.0 - u.powf(p)).powf((p - 1.0) / p);
         let a = (thickness * slope).atan();
-        let b = (a.sin() / N).asin();
+        let b = (a.sin() / n).asin();
         *o = ((a - b).tan() / edge).clamp(0.0, 1.0);
     }
     out[64] = 1.0;

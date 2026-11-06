@@ -294,7 +294,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 20.0,
-        9 => 26.0,
+        9 => 29.0,
         10 => 14.0,
         11 => 22.0,
         _ => 25.0,
@@ -1158,6 +1158,14 @@ impl Settings {
         let d = crate::config::GlassCfg::default();
         toggle_row(ui, row_rect(body, 23), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
         toggle_row(ui, row_rect(body, 25), "Real glass bend (Snell's law)", g.snell, "glass", "snell");
+        let snell_rows: [(&str, f32, (f32, f32), String, &str); 3] = [
+            ("Snell: glass index", g.snell_ior, (1.05, 2.4), format!("{:.2}", g.snell_ior), "snell_ior"),
+            ("Snell: edge thickness", g.snell_thick, (0.3, 4.0), format!("{:.1}", g.snell_thick), "snell_thick"),
+            ("Snell: edge roundness", g.snell_round, (2.0, 6.0), format!("{:.1}", g.snell_round), "snell_round"),
+        ];
+        for (i, (text, val, range, shown, key)) in snell_rows.into_iter().enumerate() {
+            slider_row(ui, row_rect(body, 26 + i), text, val, range, shown, "glass", key);
+        }
         let b = row_rect(body, 24);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
@@ -1185,6 +1193,9 @@ impl Settings {
                 ("readable", d.readable),
                 ("fan", d.fan),
                 ("stretch_len", d.stretch_len),
+                ("snell_ior", d.snell_ior),
+                ("snell_thick", d.snell_thick),
+                ("snell_round", d.snell_round),
             ] {
                 put(ui, "glass", key, format!("{v:.2}"));
             }
