@@ -474,7 +474,7 @@ impl Dock {
         self.host.set_backdrop_rounded(
             Rect::new(bar.x * sc, (bar.y + dy) * sc, bar.w * sc, (bar.h + if self.cfg.melt { radius } else { 0.0 }) * sc),
             radius * sc,
-            if self.hide_t > 0.98 || !self.cfg.glass { 0.0 } else { op },
+            if self.hide_t > 0.98 || !self.cfg.glass { 0.0 } else { 1.0 },
         );
         let hover =
             if self.engage_to > 0.5 && self.hide_t < 0.3 && self.drag.is_none() { hit(&lay, &self.cells, bar, base, mag, self.mx_to, self.my) } else { None };
@@ -495,8 +495,22 @@ impl Dock {
                 // liquid glass off: a plain solid bar
                 p.fill_rounded(bar, radius, Color::rgba(0.06, 0.06, 0.08, 0.94));
             }
-            // plain blur: the blurred screen behind it plus one flat tint (the slider sets its strength)
-            // no tint: the clear blur behind it is the whole background, `op` sets how strong it is
+            if self.cfg.glass {
+                // cheap liquid glass: Windows' own blur behind, a black wash (the slider), a soft light along the
+                // top and a thin highlight just inside the edge (no screen copy, so it costs next to nothing)
+                let wash = ((op - 0.1) / 0.9).clamp(0.0, 1.0) * 0.9;
+                if wash > 0.004 {
+                    p.fill_rounded(bar, radius, Color::rgba(0.02, 0.02, 0.03, wash));
+                }
+                if let Some(g) = p.path(|g| g.rounded_rect(bar, radius, true)) {
+                    let k = 1.0 - wash * 0.6;
+                    let stops =
+                        [(0.0, Color::white(0.16 * k)), (0.45, Color::white(0.04 * k)), (1.0, Color::white(0.0))];
+                    p.fill_geometry_vgrad(&g, bar.y, bar.bottom(), &stops);
+                }
+                let inner = self.cfg.rim_width + 1.5;
+                p.stroke_rounded(bar.inset(inner), (radius - inner).max(0.0), 1.0, Color::white(0.09));
+            }
             // the white rim: thickness and brightness come from the settings
             let rw = self.cfg.rim_width;
             if self.cfg.glass && rw > 0.05 && self.cfg.rim_bright > 0.005 {

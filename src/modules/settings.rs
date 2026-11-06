@@ -1032,7 +1032,7 @@ impl Settings {
         slider_row(
             ui,
             row_rect(body, 6),
-            "Transparency (higher = more solid)",
+            "Dock darkness (higher = darker, more solid)",
             d.opacity,
             (0.1, 1.0),
             format!("{:.0}%", d.opacity * 100.0),

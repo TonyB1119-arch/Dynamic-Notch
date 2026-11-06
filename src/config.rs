@@ -587,7 +587,7 @@ pub struct DockCfg {
     pub auto_hide: bool,
     /// Hide the Windows taskbar while the dock runs.
     pub hide_taskbar: bool,
-    /// How solid the dock is (0.1 = nearly clear, 1.0 = solid).
+    /// How dark the glass is: a black wash over the blur (0.1 = clear glass, 1.0 = nearly black).
     pub opacity: f32,
     /// Programs that never show up in the dock.
     pub hide_apps: Vec<String>,
