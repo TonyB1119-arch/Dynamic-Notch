@@ -2243,7 +2243,8 @@ impl App {
         let mut t = Targets {
             w: base_w,
             h: base_h,
-            r: (base_h * 0.56).min(18.0),
+            // collapsed and hovering: only a gentle curve at the bottom corners
+            r: (base_h * 0.28).clamp(6.0, 10.0),
             ear: (base_h * 0.26).clamp(5.0, 9.0),
             glass: 0.0,
             compact: false,

@@ -1129,9 +1129,12 @@ impl Launcher {
     /// closes (it drifts out to 102% as it fades).
     fn open_scale(&self) -> f32 {
         if self.open {
-            0.85 + 0.15 * logic::ease_spring(self.anim)
+            // it arrives from outside: big and soft at first, settling into place
+            1.0 + 0.26 * (1.0 - logic::ease_out(self.anim))
         } else {
-            1.0 + 0.02 * (1.0 - logic::ease_out(self.anim))
+            // the pieces fly outward from the middle, faster and faster, as they fade
+            let t = 1.0 - self.anim;
+            1.0 + 0.40 * t * (0.35 + 0.65 * t)
         }
     }
 
@@ -1178,7 +1181,7 @@ impl Launcher {
         self.last_tick = now;
         let snap = !self.cfg.animate;
         let open_to = if self.open { 1.0 } else { 0.0 };
-        let dur = if self.open { 0.17 } else { 0.14 };
+        let dur = if self.open { 0.22 } else { 0.17 };
         self.anim = if snap { open_to } else { logic::toward(self.anim, open_to, dt / dur) };
         let lt = self.list_target();
         self.lh = if snap { lt } else { logic::follow(self.lh, lt, dt, 15.0, 0.3) };
@@ -1249,8 +1252,21 @@ impl Launcher {
 
     /// Only the glass takes clicks (the boxes and, while it shows, the list below them); the rest of the
     /// window is empty. `list_h` is how tall the floating list is (0 = none).
-    fn set_region(&mut self, list_h: f32, wide: f32) {
+    fn set_region(&mut self, list_h: f32, wide: f32, burst: bool) {
         let (_, _, wpx, hpx) = self.win_px;
+        if burst {
+            // while the card flies in or out it reaches past its resting shape: let the whole window show
+            if self.region_h == -2 || wpx == 0 {
+                return;
+            }
+            self.region_h = -2;
+            self.region_x = -2;
+            unsafe {
+                let rgn = CreateRectRgn(0, 0, wpx, hpx);
+                SetWindowRgn(self.hwnd, Some(rgn), false);
+            }
+            return;
+        }
         let bottom = if list_h > 0.5 { LIST_Y + list_h } else { FRAME_H };
         let h = ((bottom * self.scale).ceil() as i32).min(hpx);
         // the card sits in the middle of the window; with three boxes it reaches both edges
@@ -2782,7 +2798,7 @@ impl Launcher {
         let open_s = self.open_scale();
         let shown = self.rows_len().min(self.vis());
         // clicks land on the glass only: the region reaches as far down as the list is (or is about to be)
-        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()));
+        self.set_region(self.lh.max(self.list_target()), self.kw.max(self.kw_target()), self.anim < 1.0);
         let cur = self.cur().cloned();
         let vtop = self.view_top();
         let wx = self.wx.clone();
